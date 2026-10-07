@@ -31,10 +31,9 @@ afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
 const harnessQuery = graphql`
-  query TicketThreadHarnessQuery($id: ID!, $isOwner: Boolean!)
-  @throwOnFieldError {
+  query TicketThreadHarnessQuery($id: ID!) @throwOnFieldError {
     ticket(id: $id) {
-      ...TicketThread_ticket @arguments(isOwner: $isOwner)
+      ...TicketThread_ticket
     }
   }
 `;
@@ -51,7 +50,28 @@ function baseTicket() {
     assignee: null,
     requesterEmails: ["customer@example.com"],
     ccEmails: [],
-    instance: { __typename: "Instance", id: "inst-1" },
+    instance: {
+      __typename: "Instance",
+      id: "inst-1",
+      members: [
+        {
+          user: {
+            __typename: "User",
+            id: "user-agent",
+            name: "Adrian Agent",
+            email: "agent@example.com",
+          },
+        },
+        {
+          user: {
+            __typename: "User",
+            id: "user-colleague",
+            name: "Casey Colleague",
+            email: "casey@example.com",
+          },
+        },
+      ],
+    },
     messages: [
       {
         __typename: "TicketMessage",
@@ -89,7 +109,6 @@ function baseTicket() {
 function Harness({ id }: { id: string }) {
   const data = useLazyLoadQuery<TicketThreadHarnessQuery>(harnessQuery, {
     id,
-    isOwner: false,
   });
   if (!data.ticket) return <p>not found</p>;
   return <TicketThread ticket={data.ticket} />;
@@ -192,5 +211,43 @@ describe("TicketThread — reply mutation", () => {
     // mutation's own updater (appending onto `ticket.messages`), not a
     // second round trip through the ticket query.
     expect(harnessCalls).toBe(1);
+  });
+});
+
+describe("TicketThread — assignment", () => {
+  it("lets an agent hand the ticket to a colleague", async () => {
+    let assignedTo: unknown = undefined;
+    server.use(
+      relayEndpoint.query("TicketThreadHarnessQuery", () =>
+        HttpResponse.json({ data: { ticket: baseTicket() } }),
+      ),
+      relayEndpoint.mutation("AssigneeControlMutation", ({ variables }) => {
+        assignedTo = variables.userId;
+        return HttpResponse.json({
+          data: {
+            assignTicket: {
+              __typename: "Ticket",
+              id: "ticket-1",
+              assigneeUserId: "user-colleague",
+              assignee: {
+                __typename: "User",
+                id: "user-colleague",
+                name: "Casey Colleague",
+                email: "casey@example.com",
+              },
+            },
+          },
+        });
+      }),
+    );
+
+    const user = UserEvent.setup();
+    renderHarness();
+
+    const picker = await screen.findByLabelText("Assignee");
+    await user.selectOptions(picker, "user-colleague");
+
+    await waitFor(() => expect(assignedTo).toBe("user-colleague"));
+    expect(picker).toHaveValue("user-colleague");
   });
 });

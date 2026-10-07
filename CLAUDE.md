@@ -146,6 +146,12 @@ local setup, and `SCHEMA.md` for the data model.
   `bin/cli.rs`'s `user set-superuser`. Don't widen this — a future "superuser can see all tickets"
   feature needs its own explicit guard, not a loosening of `Superuser`/`InstanceOwnerOrSuperuser`.
 
+- **Members see each other; nobody sees a colleague's other instances.** `Instance.members` is
+  `MemberOrSuperuser` — any agent, not just an owner, can list the team so tickets can be handed
+  between colleagues (issue #2: names/emails within an instance aren't sensitive). The flip side is
+  that `User.memberships` is **self-or-superuser** (`FORBIDDEN` otherwise): a colleague's `User`,
+  reached via `members` or `Ticket.assignee`, must not reveal which other tenants they belong to.
+
 - **API tokens (`mta_`) authorise `submitVerifiedTicket` and nothing else.** `AuthInfo::ApiToken`
   is a third principal, instance-scoped, minted only by that instance's owner or a superuser
   (`createApiToken`, guarded `InstanceOwnerOrSuperuser` like `addInboundAddress` — an integration

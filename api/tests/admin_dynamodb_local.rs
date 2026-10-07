@@ -384,6 +384,112 @@ async fn deleting_an_instance_hides_it_from_slug_resolution_and_member_membershi
     assert!(!expect_data(&restored_slug, "instance").is_null());
 }
 
+const INSTANCE_MEMBERS_QUERY: &str = r#"
+    query($slug: String!) { instance(slug: $slug) { members { role user { id name } } } }
+"#;
+
+const INSTANCE_MEMBERS_WITH_THEIR_MEMBERSHIPS_QUERY: &str = r#"
+    query($slug: String!) {
+        instance(slug: $slug) { members { user { id memberships { instance { id } } } } }
+    }
+"#;
+
+/// Any member — an agent as well as an owner — can list their instance's
+/// members (agents hand tickets to each other), but a colleague's `User`
+/// reached that way never reveals which *other* instances they belong to.
+#[tokio::test]
+async fn an_agent_can_list_members_but_not_a_colleagues_memberships() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let slug = unique_id("team");
+    let instance = db
+        .create_instance(
+            "Team Co",
+            &slug,
+            "Team Co",
+            "",
+            false,
+            db::InstanceKind::Support,
+        )
+        .await
+        .expect("create_instance");
+    let other = db
+        .create_instance(
+            "Elsewhere Co",
+            &unique_id("elsewhere"),
+            "Elsewhere Co",
+            "",
+            false,
+            db::InstanceKind::Support,
+        )
+        .await
+        .expect("create_instance");
+    let agent = db
+        .create_user(&unique_email("agent"), "Agent")
+        .await
+        .expect("create_user");
+    let owner = db
+        .create_user(&unique_email("owner"), "Owner")
+        .await
+        .expect("create_user");
+    db.create_membership(&agent.id, &instance.id, db::MembershipRole::Agent)
+        .await
+        .expect("create_membership");
+    db.create_membership(&owner.id, &instance.id, db::MembershipRole::Owner)
+        .await
+        .expect("create_membership");
+    db.create_membership(&owner.id, &other.id, db::MembershipRole::Owner)
+        .await
+        .expect("create_membership");
+    let outsider = db
+        .create_user(&unique_email("outsider"), "Outsider")
+        .await
+        .expect("create_user");
+    db.create_membership(&outsider.id, &other.id, db::MembershipRole::Owner)
+        .await
+        .expect("create_membership");
+    let (_my_app, schema) = build_app_and_schema(db);
+
+    let listed = schema
+        .execute(
+            Request::new(INSTANCE_MEMBERS_QUERY)
+                .variables(Variables::from_json(json!({"slug": slug})))
+                .data(member_auth(&agent.id, &instance.id, false)),
+        )
+        .await;
+    let members = expect_data(&listed, "instance.members");
+    let ids: Vec<&str> = members
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["user"]["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2, "{members:?}");
+    assert!(ids.contains(&agent.id.as_str()) && ids.contains(&owner.id.as_str()));
+
+    // The colleague's other instance stays hidden: FORBIDDEN, not an empty
+    // list that would look like "no other memberships".
+    let probed = schema
+        .execute(
+            Request::new(INSTANCE_MEMBERS_WITH_THEIR_MEMBERSHIPS_QUERY)
+                .variables(Variables::from_json(json!({"slug": slug})))
+                .data(member_auth(&agent.id, &instance.id, false)),
+        )
+        .await;
+    assert_eq!(expect_error_code(&probed), "FORBIDDEN");
+
+    // A member of some other instance gets nothing: `instance(slug)` is null
+    // for them.
+    let outside = schema
+        .execute(
+            Request::new(INSTANCE_MEMBERS_QUERY)
+                .variables(Variables::from_json(json!({"slug": slug})))
+                .data(member_auth(&outsider.id, &other.id, true)),
+        )
+        .await;
+    assert!(expect_data(&outside, "instance").is_null());
+}
+
 const CREATE_USER_MUTATION: &str = r#"
     mutation($email: String!, $name: String!) {
         createUser(email: $email, name: $name) { id email isSuperuser }
