@@ -32,7 +32,7 @@ describe("AuthenticatedSession", () => {
   });
 
   it("renders the authenticated tree when a token is present and the session query succeeds", async () => {
-    setSessionToken("mtu_test-token");
+    setSessionToken("mtu_testid.test-token");
     server.use(
       relayEndpoint.query("CurrentUserProviderQuery", () =>
         HttpResponse.json({
@@ -62,7 +62,7 @@ describe("AuthenticatedSession", () => {
   });
 
   it("clears the token and flips to the login page on a definitive 401", async () => {
-    setSessionToken("mtu_expired-token");
+    setSessionToken("mtu_testid.expired-token");
     server.use(
       relayEndpoint.query("CurrentUserProviderQuery", () =>
         HttpResponse.json({}, { status: 401 }),

@@ -30,7 +30,7 @@ cd web && npm i
 Copy `web/.env.local.example` to `web/.env.local`. The repo-root `.env` (committed, non-secret)
 sets sane local defaults (`DB_PREFIX`, WebAuthn RP id/origin, `TURNSTILE_DISABLED=1`).
 
-Toolbox has no application secret to speak of — sessions are opaque `mtu_` tokens whose sha256
+Toolbox has no application secret to speak of — sessions are opaque `mtu_{id}.{secret}` tokens whose sha256
 is stored in DynamoDB, so there's no signing key anywhere. The one optional value, Cloudflare
 Turnstile's `TURNSTILE_SECRET_KEY`, goes in `.env.secret` (copied from `.env.secret.example`, never
 committed) and is only needed if you want to exercise the CAPTCHA path locally instead of relying
@@ -89,15 +89,15 @@ Seeded accounts (only ever valid against a `local`-prefixed database — never r
 
 | Role  | Email                     | Instance(s)                     | Ready-made token                        |
 | ----- | ------------------------- | -------------------------------- | ---------------------------------------- |
-| owner | `owner@toolbox.test`  | `acme`, `ridgeline`, `ledger`    | `mtu_localdev0000000000000000000owner`  |
-| agent | `agent@toolbox.test`  | `acme`                           | `mtu_localdev0000000000000000000agent`  |
+| owner | `owner@toolbox.test`  | `acme`, `ridgeline`, `ledger`    | `mtu_SeedTokOwner.localdev0000000000000000000owner`  |
+| agent | `agent@toolbox.test`  | `acme`                           | `mtu_SeedTokAgent.localdev0000000000000000000agent`  |
 
 `ledger` is the seeded **invoicing** instance (`kind: invoicing`) — fictional business/GST/payment
 details and two fictional projects with some billable items, so the invoicing pages have something to look at without a
 manual `instance create --kind invoicing` first. `acme`/`ridgeline` are plain support instances
 (`kind` absent, per the omit-optional-attributes house rule).
 
-Use a token directly (`Authorization: Bearer mtu_localdev...`) to skip the email-code flow entirely
+Use a token directly (`Authorization: Bearer mtu_SeedTokOwner.localdev...`) to skip the email-code flow entirely
 when poking at the API by hand (`curl`, GraphiQL at `http://localhost:8000/`), or log in normally
 with the seeded emails — `poem-local`'s mocked mailer prints the 6-digit code to the API's own log.
 

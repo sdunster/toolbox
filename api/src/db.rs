@@ -149,9 +149,11 @@ pub struct LoginCode {
     pub last_sent_at: u64,
 }
 
-/// An opaque `mtu_` session token. Only `token_hash` (sha256 of the secret) is
-/// ever stored — the secret itself exists only at issuance, as the string
-/// returned by `auth::issue_user_token`.
+/// A `mtu_{id}.{secret}` session token. Only `token_hash` (sha256 of the full
+/// token string) is ever stored — the token itself exists only at issuance, as
+/// the string returned by `auth::issue_user_token`. Like [`ApiToken`], `id` is
+/// embedded in the token, so [`crate::db::Handler::get_user_token`] is always a
+/// strongly consistent `GetItem` by id, never a GSI lookup.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserToken {
     pub id: String,
@@ -226,8 +228,8 @@ pub enum OAuthGrantUpdateShape {
 /// `auth::AuthInfo::ApiToken`'s doc comment for what it authorises (exactly
 /// `submitVerifiedTicket`, for `instance_id`, and nothing else) and
 /// `auth::issue_api_token`/`auth::verify_token`'s `mta_` branch for how it's
-/// minted and checked. Unlike [`UserToken`], `id` is not an opaque row key
-/// the caller never sees — it's embedded in the token string itself (the
+/// minted and checked. As with [`UserToken`], `id` is embedded in the token
+/// string itself (the
 /// house rule in `CLAUDE.md`'s "API tokens" entry: same id-in-token,
 /// no-hash-GSI shape as the `+t{ticket_id}.{reply_token}` reply tag), so
 /// [`crate::db::Handler::get_api_token`] is always a `GetItem` by id, never a
@@ -1513,14 +1515,12 @@ pub trait Handler: Sync {
     // ── user_token ────────────────────────────────────────────────────────
     fn create_user_token(
         &self,
+        id: &str,
         token_hash: &str,
         user_id: &str,
         expires_at: u64,
     ) -> impl Future<Output = Result<UserToken>> + Send;
-    fn get_user_token_by_hash(
-        &self,
-        token_hash: &str,
-    ) -> impl Future<Output = Result<Option<UserToken>>> + Send;
+    fn get_user_token(&self, id: &str) -> impl Future<Output = Result<Option<UserToken>>> + Send;
     fn update_user_token(
         &self,
         id: &str,

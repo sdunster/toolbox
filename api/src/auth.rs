@@ -99,9 +99,13 @@ pub enum AuthInfo {
     },
 }
 
-/// Prefix of an opaque user session token, sha256-hashed and stored in
-/// `user_token`. No JWTs in this project — every credential is an opaque secret
-/// whose hash is looked up in DynamoDB, per `CLAUDE.md`/the build plan.
+/// Prefix of an opaque user session token, stored in `user_token`. Format:
+/// `mtu_{id}.{secret}` — the same id-in-token shape as [`API_TOKEN_PREFIX`],
+/// so verification is a strongly consistent `GetItem` on `id` (no `token_hash`
+/// GSI, no eventual-consistency window for a just-issued token) followed by a
+/// constant-time compare of the full token's sha256 against the stored
+/// `token_hash`. No JWTs in this project — every credential is an opaque secret
+/// whose hash is checked in DynamoDB, per `CLAUDE.md`/the build plan.
 pub const USER_TOKEN_PREFIX: &str = "mtu_";
 
 /// Prefix of the public submit form's opaque capability token, sha256-hashed
@@ -311,18 +315,24 @@ pub(crate) fn hash_token(secret: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Issue a fresh opaque `mtu_` token for `user_id`. Only its sha256 hash is
-/// stored; the secret returned here is the only time it ever exists in full —
-/// callers (`verifyAuthCode`, `finishPasskeyLogin`) hand it straight back to the
-/// client and keep nothing.
+/// Issue a fresh `mtu_{id}.{secret}` session token for `user_id`. Only the
+/// sha256 hash of the full token is stored; the string returned here is the
+/// only time it ever exists in full — callers (`verifyAuthCode`,
+/// `finishPasskeyLogin`) hand it straight back to the client and keep nothing.
+/// The id is minted here, before the row is written, so it can be embedded in
+/// the token — see [`USER_TOKEN_PREFIX`] and [`issue_api_token`].
 pub async fn issue_user_token<A: App + HasDb>(app: &A, user_id: &str) -> anyhow::Result<String> {
-    let secret = format!("{}{}", USER_TOKEN_PREFIX, crate::nonce::generate_nonce(32));
-    let hash = hash_token(&secret);
+    let id = crate::dynamodb::new_id();
+    let full_token = format!(
+        "{USER_TOKEN_PREFIX}{id}.{}",
+        crate::nonce::generate_nonce(32)
+    );
+    let hash = hash_token(&full_token);
     let expires_at = crate::expire::ExpirePolicy::UserToken.from_now();
     app.db()
-        .create_user_token(&hash, user_id, expires_at)
+        .create_user_token(&id, &hash, user_id, expires_at)
         .await?;
-    Ok(secret)
+    Ok(full_token)
 }
 
 /// Mint a fresh `mta_{id}.{secret}` integration token for `instance_id` and
@@ -436,13 +446,24 @@ async fn verify_token_with_user_token<A: App + HasDb>(
     app: &A,
     token: &str,
 ) -> Result<AuthInfo, AuthError> {
-    let token_hash = hash_token(token);
+    let Some((id, _secret)) = parse_id_token(USER_TOKEN_PREFIX, token) else {
+        return Err(AuthError::Permanent("Invalid user token".into()));
+    };
     let user_token = app
         .db()
-        .get_user_token_by_hash(&token_hash)
+        .get_user_token(id)
         .await
-        .map_err(|e| classify_db_err("fetch user token by hash", e))?
+        .map_err(|e| classify_db_err("fetch user token", e))?
         .ok_or_else(|| AuthError::Permanent("Invalid user token".into()))?;
+
+    // Same message as a missing row — see `verify_token_with_api_token`.
+    let hash = hash_token(token);
+    if !crate::inbound::resolution::constant_time_eq(
+        hash.as_bytes(),
+        user_token.token_hash.as_bytes(),
+    ) {
+        return Err(AuthError::Permanent("Invalid user token".into()));
+    }
 
     let now = crate::clock::now_sec();
     if now >= user_token.expires_at {
@@ -510,16 +531,16 @@ async fn verify_token_with_requester_token<A: App + HasDb>(
     })
 }
 
-/// Split a presented `mta_{id}.{secret}` token into `(id, secret)`, or
-/// `None` if it isn't shaped like one — the prefix is missing, there's no
-/// `.` separator, or either half is empty. Splitting on the *first* `.` is
-/// unambiguous because neither the nanoid alphabet (`id`) nor the base64url
-/// alphabet ([`crate::nonce::generate_nonce`], `secret`) contains `.` — see
-/// [`API_TOKEN_PREFIX`]'s doc comment. A free function, not inlined into
-/// [`verify_token_with_api_token`], so the malformed-input cases are
+/// Split a presented `{prefix}{id}.{secret}` token (`mtu_` or `mta_`) into
+/// `(id, secret)`, or `None` if it isn't shaped like one — the prefix is
+/// missing, there's no `.` separator, or either half is empty. Splitting on
+/// the *first* `.` is unambiguous because neither the nanoid alphabet (`id`)
+/// nor the base64url alphabet ([`crate::nonce::generate_nonce`], `secret`)
+/// contains `.` — see [`API_TOKEN_PREFIX`]'s doc comment. A free function,
+/// not inlined into the verifiers, so the malformed-input cases are
 /// unit-testable without a database.
-fn parse_api_token(token: &str) -> Option<(&str, &str)> {
-    let rest = token.strip_prefix(API_TOKEN_PREFIX)?;
+fn parse_id_token<'a>(prefix: &str, token: &'a str) -> Option<(&'a str, &'a str)> {
+    let rest = token.strip_prefix(prefix)?;
     let (id, secret) = rest.split_once('.')?;
     if id.is_empty() || secret.is_empty() {
         return None;
@@ -539,7 +560,7 @@ async fn verify_token_with_api_token<A: App + HasDb>(
     app: &A,
     token: &str,
 ) -> Result<AuthInfo, AuthError> {
-    let Some((id, _secret)) = parse_api_token(token) else {
+    let Some((id, _secret)) = parse_id_token(API_TOKEN_PREFIX, token) else {
         return Err(AuthError::Permanent("Invalid API token".into()));
     };
     let api_token = app
@@ -672,31 +693,64 @@ mod tests {
     }
 
     #[test]
-    fn parse_api_token_accepts_a_well_formed_token() {
+    fn parse_id_token_accepts_a_well_formed_token() {
         assert_eq!(
-            parse_api_token("mta_abc123.def456"),
+            parse_id_token(API_TOKEN_PREFIX, "mta_abc123.def456"),
             Some(("abc123", "def456"))
         );
     }
 
     #[test]
-    fn parse_api_token_rejects_missing_separator() {
-        assert_eq!(parse_api_token("mta_abc123def456"), None);
+    fn parse_id_token_rejects_missing_separator() {
+        assert_eq!(parse_id_token(API_TOKEN_PREFIX, "mta_abc123def456"), None);
     }
 
     #[test]
-    fn parse_api_token_rejects_empty_id() {
-        assert_eq!(parse_api_token("mta_.def456"), None);
+    fn parse_id_token_rejects_empty_id() {
+        assert_eq!(parse_id_token(API_TOKEN_PREFIX, "mta_.def456"), None);
     }
 
     #[test]
-    fn parse_api_token_rejects_empty_secret() {
-        assert_eq!(parse_api_token("mta_abc123."), None);
+    fn parse_id_token_rejects_empty_secret() {
+        assert_eq!(parse_id_token(API_TOKEN_PREFIX, "mta_abc123."), None);
     }
 
     #[test]
-    fn parse_api_token_rejects_the_wrong_prefix() {
-        assert_eq!(parse_api_token("mtu_abc123.def456"), None);
+    fn parse_id_token_rejects_the_wrong_prefix() {
+        assert_eq!(parse_id_token(API_TOKEN_PREFIX, "mtu_abc123.def456"), None);
+        assert_eq!(parse_id_token(USER_TOKEN_PREFIX, "mta_abc123.def456"), None);
+    }
+
+    #[test]
+    fn parse_id_token_accepts_a_user_token() {
+        assert_eq!(
+            parse_id_token(USER_TOKEN_PREFIX, "mtu_abc123.def456"),
+            Some(("abc123", "def456"))
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_token_rejects_a_malformed_user_token() {
+        use crate::app;
+        use crate::mockdb;
+        use crate::mockmail;
+        use crate::mockstorage;
+
+        let my_app = app::new(
+            mockdb::Handler::new(),
+            mockmail::Handler::new(),
+            mockstorage::Storage::new(),
+            0,
+        );
+        // `mtu_opaquesecret` is the old, pre-id format: rejected outright, not
+        // looked up.
+        for bad in ["mtu_opaquesecret", "mtu_.secret", "mtu_id.", "mtu_."] {
+            let result = verify_token(&my_app, bad).await;
+            assert!(
+                matches!(result, Err(AuthError::Permanent(_))),
+                "{bad:?} should be rejected as a malformed user token"
+            );
+        }
     }
 
     #[tokio::test]

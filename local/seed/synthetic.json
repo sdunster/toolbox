@@ -245,12 +245,12 @@
     ],
     "user_token": [
       {
-        "_comment": "Ready-made session token for the owner. Plaintext (only ever valid against a local database \u2014 see DEVELOPMENT.md) is mtu_localdev0000000000000000000owner; only its sha256 is stored here, exactly as a real token would be.",
+        "_comment": "Ready-made session token for the owner. Plaintext (only ever valid against a local database \u2014 see DEVELOPMENT.md) is mtu_SeedTokOwner.localdev0000000000000000000owner; only its sha256 is stored here, exactly as a real token would be.",
         "id": {
           "S": "SeedTokOwner"
         },
         "token_hash": {
-          "S": "eab21068f56c2dbe2be85a12f243d944fd01e2d249232c4ba368b54233d277bb"
+          "S": "8f8f2b2fbdfcd578ebfa2d90937b8e22fa636383e1c3c033f0bc9e5dafde1b6b"
         },
         "user_id": {
           "S": "SeedOwnerUsr"
@@ -263,12 +263,12 @@
         }
       },
       {
-        "_comment": "Ready-made session token for the agent. Plaintext is mtu_localdev0000000000000000000agent.",
+        "_comment": "Ready-made session token for the agent. Plaintext is mtu_SeedTokAgent.localdev0000000000000000000agent.",
         "id": {
           "S": "SeedTokAgent"
         },
         "token_hash": {
-          "S": "302a13886374dc5da954f2f694cda897fa0e1b1738fe446a2667e8102ebac0b6"
+          "S": "ce01ac997205ac99e0f380c07ff2b942a5afe7b64c0b505fbccde28bf3be0597"
         },
         "user_id": {
           "S": "SeedAgentUsr"

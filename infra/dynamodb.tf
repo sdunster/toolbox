@@ -417,22 +417,10 @@ resource "aws_dynamodb_table" "user_token" {
     name = "id"
     type = "S"
   }
-  attribute {
-    name = "token_hash"
-    type = "S"
-  }
 
-  # Used on every authenticated request that presents an mtu_ bearer token.
-  # KEYS_ONLY: the resolved id drives a follow-up GetItem for the rest of the
-  # token record (user_id, expiry).
-  global_secondary_index {
-    name = "token_hash-index"
-    key_schema {
-      attribute_name = "token_hash"
-      key_type       = "HASH"
-    }
-    projection_type = "KEYS_ONLY"
-  }
+  # No token_hash GSI: an mtu_{id}.{secret} token carries its own row id, so
+  # verification is a strongly consistent GetItem on id (same shape as
+  # api_token below).
 }
 
 # ── oauth_grant ───────────────────────────────────────────────────────────────
@@ -482,7 +470,7 @@ resource "aws_dynamodb_table" "oauth_grant" {
 
 # ── api_token ─────────────────────────────────────────────────────────────────
 # Instance-scoped integration credentials (mta_{id}.{secret}) authorising
-# submitVerifiedTicket. Deliberately no token_hash GSI, unlike user_token
+# submitVerifiedTicket. No token_hash GSI, same as user_token
 # above — see SCHEMA.md for why: the token carries its own row id, so
 # verification is a GetItem by id, never a GSI lookup with an eventual-
 # consistency window.

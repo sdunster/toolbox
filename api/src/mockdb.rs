@@ -182,6 +182,7 @@ impl db::Handler for Handler {
 
     async fn create_user_token(
         &self,
+        _id: &str,
         _token_hash: &str,
         _user_id: &str,
         _expires_at: u64,
@@ -189,7 +190,7 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
-    async fn get_user_token_by_hash(&self, _token_hash: &str) -> db::Result<Option<db::UserToken>> {
+    async fn get_user_token(&self, _id: &str) -> db::Result<Option<db::UserToken>> {
         Self::unsupported()
     }
 
