@@ -343,22 +343,17 @@ on this table, so a login code requested as `Bob@Example.com` is found again by
 | Attribute    | Type | Role                  |
 | ------------ | ---- | --------------------- |
 | `id`         | S    | Hash key (PK) — nanoid |
-| `token_hash` | S    | GSI hash key           |
 
-**GSIs:**
-
-| GSI                 | Hash key      | Sort key | Projection | Purpose                                                           |
-| ------------------- | ------------- | -------- | ---------- | -------------------------------------------------------------------- |
-| `token_hash-index`  | `token_hash`  | —        | KEYS_ONLY  | Used on every authenticated request that presents an `mtu_` bearer token |
-
-`KEYS_ONLY`: the resolved id drives a follow-up `GetItem` for the rest of the token record
-(`user_id`, expiry) — this table is on the hot path of every authenticated request, so keeping
-the index small matters more here than on most tables.
+**No GSIs.** The token string carries its own row id (`mtu_{id}.{secret}`), so verification
+(`auth::verify_token`'s `mtu_` branch) is a strongly consistent `GetItem` on `id` followed by a
+constant-time comparison of the full presented token's sha256 against the stored `token_hash` —
+the same shape as `api_token` below, so a just-issued session authenticates on its very first
+request with no GSI eventual-consistency window.
 
 **Non-obvious attributes:**
 
 - `user_id` (S)
-- `token_hash` (S) — sha256 of the opaque `mtu_`-prefixed token; the token itself is never stored
+- `token_hash` (S) — sha256 of the full `mtu_{id}.{secret}` token; the token itself is never stored
 - `expires_at` (N) — 8 hours from issuance. Not the table's TTL attribute — `user_token` is a
   durable table with deletion protection + PITR, not one of the three ephemeral tables, so expiry
   is enforced by application-layer comparison against `expires_at`, not by DynamoDB TTL
@@ -417,7 +412,7 @@ CLAUDE.md's "API tokens" house rule.
 | ------------------- | ------------- | -------- | ---------- | ------------------------------------- |
 | `instance_id-index` | `instance_id` | —        | ALL        | The token management page's list      |
 
-**Deliberately no `token_hash` GSI, unlike `user_token` above.** The token string carries its own
+**No `token_hash` GSI, same as `user_token` above.** The token string carries its own
 row id (`mta_{id}.{secret}`, not just an opaque secret), so verification (`auth::verify_token`'s
 `mta_` branch) is a `GetItem` on `id` — no GSI, no eventual-consistency window — followed by a
 constant-time comparison of the full presented token against the stored `token_hash`. This is the
@@ -684,9 +679,9 @@ client, or a value the caller can recompute), never a scan or query by kind. Bac
   limit a single-row read, mirroring `login_code`.
 - The requester submit-token flow's short-lived, single-purpose capability token (`kind:
   "submit_token"`), scoped to `{email, instance_id}` and only usable for `submitTicket`. `id` is
-  likewise deterministic, derived from the token's own sha256 hash (mirroring `user_token`'s
-  `token_hash`, folded into the row id here instead of a separate GSI since there is no listing
-  access pattern to support).
+  likewise deterministic, derived from the token's own sha256 hash (folded into the row id rather
+  than embedding a separate id in the token, since there is no listing access pattern to
+  support).
 
 **Non-obvious attributes:**
 

@@ -163,7 +163,8 @@ local setup, and `SCHEMA.md` for the data model.
     `+t{ticket_id}.{reply_token}` reply tag two entries below: `mta_{id}.{secret}`, verified by a
     `GetItem` on `id` (no GSI, no eventual-consistency window) followed by a constant-time compare
     of the full token against the stored `token_hash`. A token must authenticate on its very first
-    use, which a GSI lookup cannot promise.
+    use, which a GSI lookup cannot promise. `mtu_` session tokens use the same `mtu_{id}.{secret}` shape
+    (`auth::parse_id_token`), for the same reason.
   - `submitVerifiedTicket(subject, body, to, cc)` takes the instance from the token, never an
     argument, and takes `to`/`cc` **on the caller's word** — no email-verification code, unlike the
     public submit form's `Requester` token. That trust is the entire point of an owner/superuser-

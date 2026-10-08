@@ -20,8 +20,14 @@ use sha2::{Digest, Sha256};
 /// stores only their sha256 hashes, exactly as production does, so this is
 /// the only place the two can be compared.
 const USER_TOKENS: &[(&str, &str)] = &[
-    ("SeedOwnerUsr", "mtu_localdev0000000000000000000owner"),
-    ("SeedAgentUsr", "mtu_localdev0000000000000000000agent"),
+    (
+        "SeedOwnerUsr",
+        "mtu_SeedTokOwner.localdev0000000000000000000owner",
+    ),
+    (
+        "SeedAgentUsr",
+        "mtu_SeedTokAgent.localdev0000000000000000000agent",
+    ),
 ];
 
 /// Human-facing identifiers DEVELOPMENT.md hands out as things to type or
@@ -463,9 +469,17 @@ fn user_token_hashes_match_their_documented_plaintexts() {
             want,
             "user_token for {user_id} does not hash the plaintext DEVELOPMENT.md documents"
         );
-        assert!(
-            plaintext.starts_with(toolbox::auth::USER_TOKEN_PREFIX),
-            "documented plaintext for {user_id} does not carry the mtu_ prefix"
+        let token_id = plaintext
+            .strip_prefix(toolbox::auth::USER_TOKEN_PREFIX)
+            .and_then(|rest| rest.split_once('.'))
+            .map(|(id, _)| id)
+            .unwrap_or_else(|| {
+                panic!("documented plaintext for {user_id} is not shaped mtu_{{id}}.{{secret}}")
+            });
+        assert_eq!(
+            s(token, "id").as_deref(),
+            Some(token_id),
+            "documented plaintext for {user_id} does not embed its user_token row id"
         );
     }
 }

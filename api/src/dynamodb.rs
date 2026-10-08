@@ -2058,22 +2058,23 @@ impl db::Handler for Handler {
 
     async fn create_user_token(
         &self,
+        id: &str,
         token_hash: &str,
         user_id: &str,
         expires_at: u64,
     ) -> db::Result<db::UserToken> {
         self.ensure_writable()?;
-        let id = new_id();
         let now = crate::clock::now_sec();
         let resp = self
             .client
             .put_item()
             .table_name(self.table_name("user_token"))
-            .item("id", AttributeValue::S(id.clone()))
+            .item("id", AttributeValue::S(id.to_string()))
             .item("token_hash", AttributeValue::S(token_hash.to_string()))
             .item("user_id", AttributeValue::S(user_id.to_string()))
             .item("created_at", AttributeValue::N(now.to_string()))
             .item("expires_at", AttributeValue::N(expires_at.to_string()))
+            .condition_expression("attribute_not_exists(id)")
             .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
             .await
@@ -2084,7 +2085,7 @@ impl db::Handler for Handler {
             CapKind::Write,
         );
         Ok(db::UserToken {
-            id,
+            id: id.to_string(),
             token_hash: token_hash.to_string(),
             user_id: user_id.to_string(),
             created_at: now,
@@ -2093,51 +2094,22 @@ impl db::Handler for Handler {
         })
     }
 
-    async fn get_user_token_by_hash(&self, token_hash: &str) -> db::Result<Option<db::UserToken>> {
+    async fn get_user_token(&self, id: &str) -> db::Result<Option<db::UserToken>> {
+        // Strongly consistent GetItem by the id embedded in the token, same
+        // reasoning as get_api_token: a just-issued session must authenticate
+        // on its very first request.
         let resp = self
-            .client
-            .query()
-            .table_name(self.table_name("user_token"))
-            .index_name("token_hash-index")
-            .key_condition_expression("token_hash = :token_hash")
-            .expression_attribute_values(":token_hash", AttributeValue::S(token_hash.to_string()))
-            .return_consumed_capacity(ReturnConsumedCapacity::Total)
-            .send()
-            .await
-            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
-        record_capacity(
-            "get_user_token_by_hash",
-            resp.consumed_capacity(),
-            CapKind::Read,
-        );
-        let ids = resp
-            .items
-            .unwrap_or_default()
-            .into_iter()
-            .map(|item| Item(item).id())
-            .collect::<HydrationResult<Vec<String>>>()?;
-        let Some(id) = db::at_most_one(ids, || {
-            "Multiple user tokens share the same hash".to_string()
-        })?
-        else {
-            return Ok(None);
-        };
-
-        let full = self
             .client
             .get_item()
             .table_name(self.table_name("user_token"))
-            .key("id", AttributeValue::S(id))
+            .key("id", AttributeValue::S(id.to_string()))
+            .consistent_read(true)
             .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
             .await
             .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
-        record_capacity(
-            "get_user_token_by_hash_fetch",
-            full.consumed_capacity(),
-            CapKind::Read,
-        );
-        match full.item {
+        record_capacity("get_user_token", resp.consumed_capacity(), CapKind::Read);
+        match resp.item {
             Some(item) => Ok(Some(hydrate_item(item)?)),
             None => Ok(None),
         }

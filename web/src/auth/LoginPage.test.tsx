@@ -88,7 +88,7 @@ describe("LoginPage — email code flow", () => {
         HttpResponse.json({ data: { requestAuthCode: true } }),
       ),
       relayEndpoint.mutation("VerifyAuthCode", () =>
-        HttpResponse.json({ data: { verifyAuthCode: "mtu_abc123" } }),
+        HttpResponse.json({ data: { verifyAuthCode: "mtu_abc123.secret" } }),
       ),
     );
 
@@ -107,7 +107,7 @@ describe("LoginPage — email code flow", () => {
     await user.click(screen.getByRole("button", { name: "Verify code" }));
 
     await waitFor(() =>
-      expect(onNewTokenReceived).toHaveBeenCalledWith("mtu_abc123"),
+      expect(onNewTokenReceived).toHaveBeenCalledWith("mtu_abc123.secret"),
     );
   });
 });
