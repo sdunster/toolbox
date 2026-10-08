@@ -21,6 +21,18 @@ locals {
   # created as Route53 alias records rather than plain CNAMEs.
   cloudfront_alias_zone_id = "Z2FDTNDATAQYW2"
 
+  # One DMARC policy for every sending domain. Started at p=none with rua
+  # reports to alert_email; the reports came back clean (SES's Easy DKIM
+  # aligns on the header From domain), so this is now p=reject with no rua --
+  # aggregate reports were only needed to confirm that, and are noise
+  # thereafter. To investigate a deliverability problem, temporarily add
+  # "; rua=mailto:<address>" here and re-create the records.
+  dmarc_record = "v=DMARC1; p=reject"
+
+  # SPF for every sending domain and custom MAIL FROM subdomain. All mail goes
+  # out through SES, so -all (hard fail) excludes nothing legitimate.
+  spf_record = "v=spf1 include:amazonses.com -all"
+
   dns_records_required = concat(
     [
       {
@@ -38,14 +50,14 @@ locals {
       {
         name    = var.support_domain
         type    = "TXT"
-        value   = "v=spf1 include:amazonses.com ~all"
+        value   = local.spf_record
         purpose = "SPF: authorises SES to send as this domain."
       },
       {
         name    = "_dmarc.${var.support_domain}"
         type    = "TXT"
-        value   = var.alert_email == "" ? "v=DMARC1; p=none" : "v=DMARC1; p=none; rua=mailto:${var.alert_email}"
-        purpose = "DMARC. p=none to start -- tighten once you have seen the reports."
+        value   = local.dmarc_record
+        purpose = "DMARC: reject mail that fails both SPF and DKIM alignment."
       },
       {
         name    = aws_sesv2_email_identity_mail_from_attributes.main.mail_from_domain
@@ -56,7 +68,7 @@ locals {
       {
         name    = aws_sesv2_email_identity_mail_from_attributes.main.mail_from_domain
         type    = "TXT"
-        value   = "v=spf1 include:amazonses.com ~all"
+        value   = local.spf_record
         purpose = "SPF for the custom MAIL FROM subdomain."
       },
     ],
@@ -69,13 +81,13 @@ locals {
         {
           name    = var.web_domain
           type    = "TXT"
-          value   = "v=spf1 include:amazonses.com ~all"
+          value   = local.spf_record
           purpose = "SPF: authorises SES to send system mail (login codes) as this domain."
         },
         {
           name    = "_dmarc.${var.web_domain}"
           type    = "TXT"
-          value   = var.alert_email == "" ? "v=DMARC1; p=none" : "v=DMARC1; p=none; rua=mailto:${var.alert_email}"
+          value   = local.dmarc_record
           purpose = "DMARC for the web domain's system mail."
         },
         {
@@ -87,7 +99,7 @@ locals {
         {
           name    = aws_sesv2_email_identity_mail_from_attributes.system[0].mail_from_domain
           type    = "TXT"
-          value   = "v=spf1 include:amazonses.com ~all"
+          value   = local.spf_record
           purpose = "SPF for the custom MAIL FROM subdomain."
         },
       ],
@@ -115,13 +127,13 @@ locals {
           {
             name    = d
             type    = "TXT"
-            value   = "v=spf1 include:amazonses.com ~all"
+            value   = local.spf_record
             purpose = "SPF for ${d}."
           },
           {
             name    = "_dmarc.${d}"
             type    = "TXT"
-            value   = var.alert_email == "" ? "v=DMARC1; p=none" : "v=DMARC1; p=none; rua=mailto:${var.alert_email}"
+            value   = local.dmarc_record
             purpose = "DMARC for ${d}."
           },
           {
@@ -133,7 +145,7 @@ locals {
           {
             name    = aws_sesv2_email_identity_mail_from_attributes.additional[d].mail_from_domain
             type    = "TXT"
-            value   = "v=spf1 include:amazonses.com ~all"
+            value   = local.spf_record
             purpose = "SPF for the custom MAIL FROM subdomain of ${d}."
           },
         ],
