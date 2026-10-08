@@ -59,12 +59,19 @@ pub enum AuthRequirement {
     Superuser,
     /// A `User` who is either an owner of this instance *or* a superuser —
     /// the combined guard for instance-settings fields/mutations
-    /// (`inboundAddresses`, `members`, `addInboundAddress`,
+    /// (`inboundAddresses`, `apiTokens`, `addInboundAddress`,
     /// `removeInboundAddress`) that an owner already manages day to day and
     /// that a superuser must also be able to reach for support/admin
     /// purposes. Every *ticket*-facing guard stays plain `Member`/
     /// `InstanceOwner` — see [`Self::Superuser`]'s doc comment.
     InstanceOwnerOrSuperuser(String),
+    /// A `User` who belongs (in any role) to this instance *or* is a
+    /// superuser. Guards exactly `Instance.members`: any member needs the
+    /// team list to hand a ticket to a colleague, and a superuser's admin UI
+    /// manages membership. The member list is not ticket access, so this
+    /// does not widen the superuser boundary — a superuser still fails plain
+    /// `Member`.
+    MemberOrSuperuser(String),
     /// The instance-scoped `mta_` integration token: satisfied only by
     /// `AuthInfo::ApiToken`, never by a `User` (however privileged) or a
     /// `Requester`. Guards exactly `submitVerifiedTicket` — see
@@ -165,6 +172,24 @@ impl Guard for AuthGuard {
                     ))
                 }
             }
+            AuthRequirement::MemberOrSuperuser(instance_id) => {
+                if match auth {
+                    Some(AuthInfo::User {
+                        memberships,
+                        is_superuser,
+                        ..
+                    }) => *is_superuser || is_member(memberships, instance_id),
+                    Some(AuthInfo::Requester { .. }) => false,
+                    Some(AuthInfo::ApiToken { .. }) => false,
+                    None => false,
+                } {
+                    Ok(())
+                } else {
+                    Err(unauthenticated(
+                        "Must be a member of this instance, or a superuser",
+                    ))
+                }
+            }
             AuthRequirement::ApiToken => {
                 if match auth {
                     Some(AuthInfo::ApiToken { .. }) => true,
@@ -225,6 +250,12 @@ mod tests {
         async fn instance_owner_or_superuser(&self) -> bool {
             true
         }
+        #[graphql(
+            guard = "AuthGuard::new(AuthRequirement::MemberOrSuperuser(\"inst1\".to_string()))"
+        )]
+        async fn member_or_superuser(&self) -> bool {
+            true
+        }
         #[graphql(guard = "AuthGuard::new(AuthRequirement::ApiToken)")]
         async fn api_token(&self) -> bool {
             true
@@ -262,6 +293,19 @@ mod tests {
             memberships: vec![Membership {
                 instance_id: "inst1".into(),
                 is_owner: false,
+            }],
+            is_superuser: false,
+            token_id: None,
+            grant_id: None,
+        }
+    }
+
+    fn member_of_other_instance() -> AuthInfo {
+        AuthInfo::User {
+            id: "u2".into(),
+            memberships: vec![Membership {
+                instance_id: "inst2".into(),
+                is_owner: true,
             }],
             is_superuser: false,
             token_id: None,
@@ -362,5 +406,19 @@ mod tests {
         assert!(!field_ok(Some(owner_of_inst1()), "apiToken").await);
         assert!(!field_ok(Some(superuser_no_memberships()), "apiToken").await);
         assert!(!field_ok(Some(requester()), "apiToken").await);
+        assert!(!field_ok(Some(api_token()), "memberOrSuperuser").await);
+    }
+
+    /// `MemberOrSuperuser` (the `Instance.members` guard): any member of the
+    /// instance, owner or agent, or a superuser — never a member of some
+    /// other instance, a requester, or no credentials at all.
+    #[tokio::test]
+    async fn member_or_superuser_guard_truth_table() {
+        assert!(field_ok(Some(agent_of_inst1()), "memberOrSuperuser").await);
+        assert!(field_ok(Some(owner_of_inst1()), "memberOrSuperuser").await);
+        assert!(field_ok(Some(superuser_no_memberships()), "memberOrSuperuser").await);
+        assert!(!field_ok(Some(member_of_other_instance()), "memberOrSuperuser").await);
+        assert!(!field_ok(Some(requester()), "memberOrSuperuser").await);
+        assert!(!field_ok(None, "memberOrSuperuser").await);
     }
 }

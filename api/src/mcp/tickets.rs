@@ -211,8 +211,8 @@ pub fn catalogue() -> Vec<Value> {
             "description": "Assign a ticket to a member of its instance, or unassign it by \
                 omitting `userId`. Sends no customer email; the new (and any previous) \
                 assignee may get a staff notification per their settings. To assign to \
-                yourself, use your own id from `whoami`; `list_instance_members` (owners \
-                only) finds others.",
+                yourself, use your own id from `whoami`; `list_instance_members` finds \
+                your colleagues.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -246,10 +246,9 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "list_instance_members",
             "title": "List instance members",
-            "description": "List the members of an instance you OWN (id, email, name, role) — \
-                for finding a user id to assign a ticket to. Only an owner of the instance \
-                (or a superuser who is also a member) can list members; an agent gets an \
-                error and can still assign to themselves using their id from `whoami`.",
+            "description": "List the members of an instance you belong to (id, email, name, \
+                role) — for finding a user id to assign a ticket to. Any member, owner or \
+                agent, can list their own instance's members.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "instanceId": { "type": "string" } },

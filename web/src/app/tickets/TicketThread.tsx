@@ -9,8 +9,7 @@ import { ReplyForm } from "./ReplyForm";
 import { NoteForm } from "./NoteForm";
 
 const ticketThreadFragment = graphql`
-  fragment TicketThread_ticket on Ticket
-  @argumentDefinitions(isOwner: { type: "Boolean!" }) {
+  fragment TicketThread_ticket on Ticket {
     id
     number
     subject
@@ -20,7 +19,7 @@ const ticketThreadFragment = graphql`
       ...MessageItem_message
     }
     ...StatusControl_ticket
-    ...AssigneeControl_ticket @arguments(isOwner: $isOwner)
+    ...AssigneeControl_ticket
     ...RequesterCcEditor_ticket
   }
 `;

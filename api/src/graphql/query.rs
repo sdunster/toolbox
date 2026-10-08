@@ -414,15 +414,17 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
         Ok(addrs.into_iter().map(InboundAddressInfo::from).collect())
     }
 
-    /// Every member of this instance and their role. Owner-or-superuser —
-    /// see [`Self::inbound_addresses`]'s doc comment. Member invites
-    /// themselves now also flow through `addMember`/`removeMember`/
-    /// `setMemberRole` (superuser-only, `graphql::mutations`), which is how
-    /// the web admin UI manages membership; `bin/cli.rs`'s `member add`
-    /// remains available for operators working outside the web UI.
-    #[graphql(
-        guard = "AuthGuard::new(AuthRequirement::InstanceOwnerOrSuperuser(self.rec.id.clone()))"
-    )]
+    /// Every member of this instance and their role. Readable by any member
+    /// (owner or agent) — agents hand tickets to each other, so the
+    /// assignee picker needs the team list, and colleague names/emails are
+    /// not sensitive within an instance — and by a superuser, whose admin UI
+    /// manages membership through `addMember`/`removeMember`/`setMemberRole`
+    /// (superuser-only, `graphql::mutations`); `bin/cli.rs`'s `member add`
+    /// remains available for operators working outside the web UI. A
+    /// colleague's `User` reached through here can't be used to see which
+    /// *other* instances they belong to: `User.memberships` is
+    /// self-or-superuser.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::MemberOrSuperuser(self.rec.id.clone()))")]
     async fn members(&self, ctx: &Context<'_>) -> Result<Vec<MemberInfo<A>>> {
         let app = ctx.data_unchecked::<Arc<A>>();
         let memberships = app.db().list_memberships_by_instance(&self.rec.id).await?;
@@ -776,12 +778,23 @@ impl<A: App + HasDb + Send + Sync + 'static> User<A> {
     /// filtered out — see `SCHEMA.md`'s instance soft-delete section for why
     /// this, not a DB-level filter, is where that happens. Same
     /// defence-in-depth guard as [`Self::passkeys`] used to be — unlike
-    /// passkeys, this is *not* self-only: reading who belongs to which
+    /// passkeys, a superuser may read it too: reading who belongs to which
     /// instance (not the credentials themselves) is the thing a superuser
-    /// legitimately needs `adminUser` for, and this field's own doc comment
-    /// already anticipated that before superusers existed.
+    /// legitimately needs `adminUser` for. Anyone else gets `FORBIDDEN` —
+    /// `Instance.members` and `Ticket.assignee` hand any member a colleague's
+    /// `User`, and which *other* instances (other tenants) that colleague
+    /// belongs to is none of their business.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Authenticated)")]
     async fn memberships(&self, ctx: &Context<'_>) -> Result<Vec<MembershipInfo<A>>> {
+        let Some(AuthInfo::User {
+            id, is_superuser, ..
+        }) = ctx.data_opt::<AuthInfo>()
+        else {
+            return Err(ApiError::forbidden("Must be authenticated as a user").into());
+        };
+        if id != &self.rec.id && !*is_superuser {
+            return Err(ApiError::forbidden("Cannot view another user's memberships").into());
+        }
         let app = ctx.data_unchecked::<Arc<A>>();
         let memberships = app.db().list_memberships_by_user(&self.rec.id).await?;
         if memberships.is_empty() {

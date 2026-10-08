@@ -7,7 +7,7 @@
 //!   - `reply_to_ticket` and a close/reopen email the customer; notes, deletes,
 //!     no-op status changes, assignment and recipient edits do not;
 //!   - assignment and recipient rules (members only, a ticket keeps a requester);
-//!   - `list_instance_members` is owner-only.
+//!   - `list_instance_members` is open to any member, owner or agent, and no one else.
 //!
 //! # Running this test
 //!
@@ -415,34 +415,26 @@ async fn recipient_edits_keep_a_requester_and_send_nothing() {
 }
 
 #[tokio::test]
-async fn member_listing_is_owner_only() {
+async fn member_listing_is_open_to_any_member_only() {
     let Some(w) = world().await else { return };
-    let owner_view = call_tool(
-        &w.f,
-        &w.owner_token,
-        "list_instance_members",
-        json!({"instanceId": w.instance}),
-    )
-    .await
-    .unwrap();
-    let members: Vec<&str> = owner_view["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["user"]["id"].as_str().unwrap())
-        .collect();
-    assert!(members.contains(&w.owner.as_str()) && members.contains(&w.agent.as_str()));
-
-    assert!(
-        call_tool(
+    for token in [&w.owner_token, &w.agent_token] {
+        let view = call_tool(
             &w.f,
-            &w.agent_token,
+            token,
             "list_instance_members",
-            json!({"instanceId": w.instance})
+            json!({"instanceId": w.instance}),
         )
         .await
-        .is_err()
-    );
+        .unwrap();
+        let members: Vec<&str> = view["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["user"]["id"].as_str().unwrap())
+            .collect();
+        assert!(members.contains(&w.owner.as_str()) && members.contains(&w.agent.as_str()));
+    }
+
     assert!(
         call_tool(
             &w.f,
