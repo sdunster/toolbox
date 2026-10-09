@@ -322,8 +322,10 @@ const DELETE_INVOICE_MUTATION: &str =
 
 fn finalize_invoice_mutation() -> String {
     format!(
-        "mutation($invoiceId: ID!, $issueDate: String!) {{
-            finalizeInvoice(invoiceId: $invoiceId, issueDate: $issueDate) {{ {INVOICE_FIELDS} }}
+        "mutation($invoiceId: ID!, $issueDate: String!, $number: Int) {{
+            finalizeInvoice(invoiceId: $invoiceId, issueDate: $issueDate, number: $number) {{
+                {INVOICE_FIELDS}
+            }}
         }}"
     )
 }
@@ -1144,6 +1146,157 @@ async fn next_invoice_number_is_forward_only() {
     assert!(set10.errors.is_empty(), "{:?}", set10.errors);
 }
 
+/// The ids `setup` returns, for the explicit-number test's helpers.
+struct ClaimWorld {
+    db: dynamodb::Handler,
+    schema: TestSchema,
+    instance_id: String,
+    owner_id: String,
+    agent_id: String,
+    project_id: String,
+}
+
+impl ClaimWorld {
+    async fn new_draft(&self) -> String {
+        let items = create_items(
+            &self.db,
+            &self.instance_id,
+            &self.project_id,
+            &self.agent_id,
+            1,
+        )
+        .await;
+        let created = create_invoice(
+            &self.schema,
+            &self.project_id,
+            &items,
+            member_auth(&self.agent_id, &self.instance_id),
+        )
+        .await;
+        expect_data(&created, "createInvoice")["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    async fn finalize_numbered(&self, invoice_id: &str, number: i32, auth: AuthInfo) -> Response {
+        self.schema
+            .execute(
+                Request::new(finalize_invoice_mutation())
+                    .variables(Variables::from_json(json!({
+                        "invoiceId": invoice_id,
+                        "issueDate": "2019-03-04",
+                        "number": number,
+                    })))
+                    .data(auth),
+            )
+            .await
+    }
+
+    fn owner(&self) -> AuthInfo {
+        owner_auth(&self.owner_id, &self.instance_id)
+    }
+
+    /// Finalize a fresh draft as the owner with `number`, expecting it to
+    /// be refused as used and the draft left a draft.
+    async fn assert_number_refused(&self, number: i32) {
+        let draft = self.new_draft().await;
+        let refused = self.finalize_numbered(&draft, number, self.owner()).await;
+        assert_eq!(expect_error_code(&refused), "CONFLICT", "{number}");
+        assert!(
+            expect_error_message(&refused).contains("already used"),
+            "{refused:?}"
+        );
+        let still = self
+            .schema
+            .execute(
+                Request::new(invoice_query())
+                    .variables(Variables::from_json(json!({ "id": draft })))
+                    .data(member_auth(&self.agent_id, &self.instance_id)),
+            )
+            .await;
+        assert_eq!(expect_data(&still, "invoice")["status"], "DRAFT");
+    }
+}
+
+/// Importing an existing invoice: `finalizeInvoice(number:)` takes exactly
+/// that number with a backdated issue date — owner-only; any number no
+/// invoice already has, lower than the counter included; a used one (claimed,
+/// counter-assigned, or finalized before reservation rows existed) is refused
+/// and leaves the draft untouched; and the counter skips past a claim above it.
+#[tokio::test]
+async fn finalize_with_explicit_number_takes_any_unused_number() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance_id, owner_id, agent_id, project_id) = setup(&db, "claimnum").await;
+    let w = ClaimWorld {
+        schema: build_schema(db.clone()),
+        db,
+        instance_id,
+        owner_id,
+        agent_id,
+        project_id,
+    };
+
+    // A plain agent can't choose a number; nor can anyone choose zero.
+    let first = w.new_draft().await;
+    let by_agent = w
+        .finalize_numbered(&first, 42, member_auth(&w.agent_id, &w.instance_id))
+        .await;
+    assert_eq!(expect_error_code(&by_agent), "FORBIDDEN");
+    let zero = w.finalize_numbered(&first, 0, w.owner()).await;
+    assert!(!zero.errors.is_empty());
+
+    // Above the counter: taken, and the counter moves up to it.
+    let imported = w.finalize_numbered(&first, 42, w.owner()).await;
+    let invoice = expect_data(&imported, "finalizeInvoice");
+    assert_eq!(invoice["number"], 42);
+    assert_eq!(invoice["displayNumber"], "042");
+    assert_eq!(invoice["issueDate"], "2019-03-04");
+    w.assert_number_refused(42).await;
+
+    // Below the counter: fine while unused.
+    let lower = w
+        .finalize_numbered(&w.new_draft().await, 7, w.owner())
+        .await;
+    assert_eq!(expect_data(&lower, "finalizeInvoice")["number"], 7);
+    w.assert_number_refused(7).await;
+
+    // The automatic sequence carries on after the highest claim, and a
+    // counter-assigned number is just as used.
+    let auto = finalize(
+        &w.schema,
+        &w.new_draft().await,
+        "2026-08-19",
+        member_auth(&w.agent_id, &w.instance_id),
+    )
+    .await;
+    assert_eq!(expect_data(&auto, "finalizeInvoice")["number"], 43);
+    w.assert_number_refused(43).await;
+
+    // An invoice finalized before reservation rows existed has none; its
+    // number is found on the invoice itself.
+    let legacy = w
+        .finalize_numbered(&w.new_draft().await, 5, w.owner())
+        .await;
+    assert_eq!(expect_data(&legacy, "finalizeInvoice")["number"], 5);
+    toolbox::local_dev::dynamodb_client()
+        .await
+        .delete_item()
+        .table_name(format!("{prefix}_counter"))
+        .key(
+            "id",
+            aws_sdk_dynamodb::types::AttributeValue::S(db::invoice_number_reservation_id(
+                &w.instance_id,
+                5,
+            )),
+        )
+        .send()
+        .await
+        .unwrap();
+    w.assert_number_refused(5).await;
+}
+
 #[tokio::test]
 async fn finalize_requires_business_name_to_be_set_first() {
     let prefix = require_local_db!();
@@ -1217,6 +1370,7 @@ async fn invoice_list_filters_and_paginates() {
         let number = db.increment_invoice_counter(&instance_id).await.unwrap();
         let ok = db
             .finalize_invoice(
+                &instance_id,
                 &inv.id,
                 inv.version,
                 number as u32,
@@ -1477,6 +1631,7 @@ mod db_level_conflicts {
         // A finalize using the *stale* (pre-edit) version must be refused.
         let stale = db
             .finalize_invoice(
+                &instance_id,
                 &invoice.id,
                 invoice.version,
                 1,
@@ -1498,6 +1653,7 @@ mod db_level_conflicts {
         assert_eq!(current.version, invoice.version + 1);
         let ok = db
             .finalize_invoice(
+                &instance_id,
                 &invoice.id,
                 current.version,
                 1,
@@ -1541,6 +1697,7 @@ mod db_level_conflicts {
         );
         assert!(
             !db.finalize_invoice(
+                &instance_id,
                 &invoice.id,
                 wrong_version,
                 1,

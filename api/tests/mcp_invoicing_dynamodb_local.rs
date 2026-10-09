@@ -574,6 +574,7 @@ async fn invoicing_tools_are_listed_and_finalize_warns() {
             .contains("IRREVERSIBLE")
     );
     assert_eq!(finalize["annotations"]["destructiveHint"], true);
+    assert!(finalize["inputSchema"]["properties"]["number"].is_object());
     // Owner-level settings are deliberately not tools.
     assert!(
         !tools
@@ -697,5 +698,124 @@ async fn expenses_and_vehicle_km() {
         )
         .await
         .is_err()
+    );
+}
+
+/// Importing an existing invoice exactly as issued: a backdated item, the
+/// original number and issue date (owner-only), and a backdated paid date.
+#[tokio::test]
+async fn owner_can_import_an_invoice_with_its_original_number_and_dates() {
+    let Some(w) = world().await else { return };
+    set_business_name(&w).await;
+    let owner = make_user(&w.f, "mcp-inv-owner", false).await;
+    add_member(&w.f, &owner, &w.instance, true).await;
+    let owner_token = access_token_for(&w.f, &owner).await;
+
+    let pid = project(&w, "Imported").await;
+    let it = call_tool(
+        &w.f,
+        &owner_token,
+        "create_billable_item",
+        json!({"projectId": pid, "date": "2019-02-11", "description": "Old work",
+               "quantity": "3", "unitPriceCents": 5_000}),
+    )
+    .await
+    .unwrap()["item"]
+        .clone();
+    let inv = call_tool(
+        &w.f,
+        &owner_token,
+        "create_invoice",
+        json!({"projectId": pid, "itemIds": [id(&it)]}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+
+    // A plain member can't choose a number.
+    let denied = call_tool(
+        &w.f,
+        &w.member_token,
+        "finalize_invoice",
+        json!({"invoiceId": id(&inv), "issueDate": "2019-02-28", "number": 1017}),
+    )
+    .await
+    .unwrap_err();
+    assert!(denied.contains("owner"), "{denied}");
+
+    let fin = call_tool(
+        &w.f,
+        &owner_token,
+        "finalize_invoice",
+        json!({"invoiceId": id(&inv), "issueDate": "2019-02-28", "number": 1017}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert_eq!(fin["number"], 1017);
+    assert_eq!(fin["displayNumber"], "1017");
+    assert_eq!(fin["issueDate"], "2019-02-28");
+    assert_eq!(fin["lines"][0]["date"], "2019-02-11");
+
+    // A lower number is fine while unused; a used one is refused.
+    let older = call_tool(
+        &w.f,
+        &owner_token,
+        "create_billable_item",
+        json!({"projectId": pid, "date": "2018-06-01", "description": "Older work",
+               "quantity": "1", "unitPriceCents": 9_900}),
+    )
+    .await
+    .unwrap()["item"]
+        .clone();
+    let older_inv = call_tool(
+        &w.f,
+        &owner_token,
+        "create_invoice",
+        json!({"projectId": pid, "itemIds": [id(&older)]}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    let reused = call_tool(
+        &w.f,
+        &owner_token,
+        "finalize_invoice",
+        json!({"invoiceId": id(&older_inv), "issueDate": "2018-06-30", "number": 1017}),
+    )
+    .await
+    .unwrap_err();
+    assert!(reused.contains("already used"), "{reused}");
+    let older_fin = call_tool(
+        &w.f,
+        &owner_token,
+        "finalize_invoice",
+        json!({"invoiceId": id(&older_inv), "issueDate": "2018-06-30", "number": 998}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert_eq!(older_fin["displayNumber"], "998");
+
+    let paid = call_tool(
+        &w.f,
+        &owner_token,
+        "set_invoice_paid",
+        json!({"invoiceId": id(&inv), "paidDate": "2019-03-15"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(paid["invoice"]["paidDate"], "2019-03-15");
+
+    assert!(
+        call_tool(
+            &w.f,
+            &owner_token,
+            "finalize_invoice",
+            json!({"invoiceId": "x", "issueDate": "2019-02-28", "number": "seven"}),
+        )
+        .await
+        .unwrap_err()
+        .contains("whole number")
     );
 }

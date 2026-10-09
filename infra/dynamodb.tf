@@ -364,6 +364,8 @@ resource "aws_dynamodb_table" "ticket_message" {
 # per-instance sequential ticket numbers. See SCHEMA.md "Known issues and
 # risks" for the read-then-write race this table's *misuse* would create —
 # the number must come from an atomic UpdateItem ADD, never a read-modify-write.
+# Also holds one `{instance_id}#invoice#{number}` reservation row per finalized
+# invoice, created in the finalize transaction — see SCHEMA.md.
 
 resource "aws_dynamodb_table" "counter" {
   name                        = "${var.db_prefix}_counter"
@@ -686,7 +688,8 @@ resource "aws_dynamodb_table" "expense" {
 # GSIs, newest first. `status`, `number`, and `version` are DynamoDB
 # reserved words, so every expression that names one aliases it.
 # Attach/detach/finalize use TransactWriteItems (Update/Put/Delete items
-# only, no ConditionCheck) against this table and `billable_item` together;
+# only, no ConditionCheck) against this table and `billable_item` (finalize:
+# `counter`) together;
 # IAM authorises each item via the existing PutItem/UpdateItem/DeleteItem grants.
 
 resource "aws_dynamodb_table" "invoice" {

@@ -388,6 +388,14 @@ async fn require_invoice_member<A: App + HasDb + Send + Sync>(
     Ok(invoice)
 }
 
+/// `finalizeInvoice`'s `CONFLICT` for a number another invoice in the
+/// instance already has.
+fn invoice_number_used(number: u32) -> ApiError {
+    ApiError::conflict(format!(
+        "Invoice number {number} is already used in this instance"
+    ))
+}
+
 /// Validate a set of billable-item ids to add to an invoice
 /// (`createInvoice`'s `itemIds`, or `addInvoiceItems`'): at least one, no
 /// duplicates against each other or `existing` (the invoice's current
@@ -3815,20 +3823,50 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
     /// `invoice_id`), read the project and instance (requiring
     /// `businessName` to be set), allocate the next number from the
     /// per-instance counter, build the frozen snapshot, and write it all in
-    /// one conditional `UpdateItem`. Strictly final — no void, no
+    /// one conditional transaction with the number's reservation row
+    /// (`db::Handler::finalize_invoice`). Strictly final — no void, no
     /// un-finalize; only `setInvoicePaid` may touch a finalized invoice
     /// afterward. `CONFLICT` if the draft changed concurrently (a stale
     /// `version`, checked both up front — via the consistent items read —
     /// and in the final write's own condition).
+    ///
+    /// `issueDate` may be any valid date, past or future — backdating is how
+    /// an existing invoice is imported as it was issued. `number`, when given,
+    /// replaces step 4's counter allocation with exactly that number — for
+    /// importing an invoice under its original number. Owner-only, like
+    /// `setNextInvoiceNumber`, since it can move the same counter. Any number
+    /// no invoice in the instance already has is accepted, lower than the
+    /// counter or not; a used one is `CONFLICT`, and the invoice stays a
+    /// draft. A number above the counter moves the counter up to it first,
+    /// so automatic numbering never runs into it. The guarantee against a
+    /// duplicate is the number's reservation row, written in the same
+    /// transaction as the finalize (`db::Handler::finalize_invoice`).
     async fn finalize_invoice(
         &self,
         ctx: &Context<'_>,
         invoice_id: ID,
         issue_date: String,
+        number: Option<i32>,
     ) -> Result<Invoice<A>> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
-        let Some(AuthInfo::User { id: user_id, .. }) = ctx.data_opt::<AuthInfo>() else {
+        let Some(AuthInfo::User {
+            id: user_id,
+            memberships,
+            ..
+        }) = ctx.data_opt::<AuthInfo>()
+        else {
             return Err(ApiError::forbidden("Must be authenticated as a user").into());
+        };
+        let explicit_number = match number {
+            None => None,
+            Some(_) if !is_owner(memberships, &invoice.instance_id) => {
+                return Err(ApiError::forbidden(
+                    "Only an owner of this instance can choose an invoice number",
+                )
+                .into());
+            }
+            Some(n) if n < 1 => return Err(anyhow!("number must be at least 1")),
+            Some(n) => Some(u32::try_from(n).unwrap_or(0)),
         };
         if invoice.status != db::InvoiceStatus::Draft {
             return Err(ApiError::conflict("Invoice is already finalized").into());
@@ -3891,13 +3929,35 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             return Err(anyhow!("Complete the invoicing settings first"));
         }
 
-        // Step 4: allocate the number.
-        let number = self
-            .app
-            .db()
-            .increment_invoice_counter(&invoice.instance_id)
-            .await?;
-        let number = u32::try_from(number).unwrap_or(u32::MAX);
+        // Step 4: allocate the number — the counter's next, or the caller's
+        // explicit choice.
+        let number = match explicit_number {
+            None => {
+                let n = self
+                    .app
+                    .db()
+                    .increment_invoice_counter(&invoice.instance_id)
+                    .await?;
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }
+            Some(n) => {
+                if self
+                    .app
+                    .db()
+                    .invoice_number_used(&invoice.instance_id, n)
+                    .await?
+                {
+                    return Err(invoice_number_used(n).into());
+                }
+                // Forward-only, so a no-op for a number at or below the
+                // counter; above it, keeps the automatic sequence clear of `n`.
+                self.app
+                    .db()
+                    .set_next_invoice_number(&invoice.instance_id, u64::from(n))
+                    .await?;
+                n
+            }
+        };
 
         // Step 5: build the snapshot.
         let snapshot = invoicing::snapshot::build_snapshot(
@@ -3912,13 +3972,15 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         let snapshot_json = serde_json::to_string(&snapshot)
             .map_err(|e| anyhow!("Failed to serialize invoice snapshot: {e}"))?;
 
-        // Step 6: the conditional write. A failure here leaves `number`
-        // allocated but unused — a gap, never a duplicate (see
-        // `SCHEMA.md`'s "Known issues").
+        // Step 6: the conditional write, with the number's reservation. A
+        // failure here leaves a counter-allocated `number` unused — a gap,
+        // never a duplicate (see `SCHEMA.md`'s "Known issues"); an explicit
+        // one is simply still free, so a retry can claim it.
         let committed = self
             .app
             .db()
             .finalize_invoice(
+                &invoice.instance_id,
                 &invoice.id,
                 invoice.version,
                 number,
@@ -3929,6 +3991,15 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             )
             .await?;
         if !committed {
+            // Either condition can fail; say which, when it's the number.
+            if self
+                .app
+                .db()
+                .invoice_number_used(&invoice.instance_id, number)
+                .await?
+            {
+                return Err(invoice_number_used(number).into());
+            }
             return Err(
                 ApiError::conflict("Invoice changed concurrently — reload and try again").into(),
             );

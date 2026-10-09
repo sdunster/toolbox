@@ -11,9 +11,16 @@
 //! the next invoice number, and freezes what the invoice prints, so its
 //! description says so and it takes an explicit `issueDate` with no default.
 //!
+//! **Importing existing invoices** needs nothing extra: billable-item dates,
+//! `issueDate` and `paidDate` all accept any past date, and `finalize_invoice`
+//! takes an optional owner-only `number` — any number not already used in the
+//! instance — so an imported invoice keeps its original number and date in the
+//! same irreversible call.
+//!
 //! **Deliberately not exposed:** `updateInvoicingSettings` and
 //! `setNextInvoiceNumber` (owner-level instance settings — change them in the
-//! web app) and the raw invoice snapshot.
+//! web app; `finalize_invoice`'s `number` covers what an import needs) and the
+//! raw invoice snapshot.
 //!
 //! Money is integers: `unitPriceCents` is GST-exclusive cents, and a quantity is
 //! a decimal **string** with at most 2 decimal places (`"1.5"`) that only the
@@ -512,12 +519,24 @@ pub fn catalogue() -> Vec<Value> {
                 the number cannot be reused. Requires the instance's invoicing settings to \
                 already have a business name. `issueDate` (YYYY-MM-DD) is required: confirm it \
                 with the user rather than guessing. Only do this when the user has explicitly \
-                asked to finalize this specific invoice; check it first with `get_invoice`.",
+                asked to finalize this specific invoice; check it first with `get_invoice`.\n\n\
+                Importing an existing invoice: give its original `issueDate` (past dates are \
+                fine) and its original `number`. `number` is owner-only and may be any number \
+                no invoice in the instance already has, in any order; a used one is refused and \
+                leaves the invoice a draft. Automatic numbering carries on after the highest \
+                number used. Without `number`, the next number in sequence is used. The seller \
+                details and payment text printed are the instance's CURRENT invoicing settings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "invoiceId": { "type": "string" },
-                    "issueDate": { "type": "string", "description": "YYYY-MM-DD." },
+                    "issueDate": { "type": "string", "description": "YYYY-MM-DD; may be in the past." },
+                    "number": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Owner-only: use exactly this invoice number (e.g. 8 for \"008\") \
+                            instead of the next in sequence. For importing existing invoices; omit otherwise.",
+                    },
                 },
                 "required": ["invoiceId", "issueDate"],
             },
@@ -765,12 +784,21 @@ where
             ) else {
                 return Some(missing_argument("invoiceId/issueDate"));
             };
+            let number = match arguments.get("number") {
+                None | Some(Value::Null) => None,
+                Some(n) => match n.as_i64().and_then(|n| i32::try_from(n).ok()) {
+                    Some(n) => Some(n),
+                    None => return Some(ToolOutcome::error("number must be a whole number")),
+                },
+            };
             let doc = format!(
-                "mutation McpFinalize($id: ID!, $date: String!) {{ \
-                 finalizeInvoice(invoiceId: $id, issueDate: $date) {{ {INVOICE_DETAIL_FIELDS} }} }}"
+                "mutation McpFinalize($id: ID!, $date: String!, $number: Int) {{ \
+                 finalizeInvoice(invoiceId: $id, issueDate: $date, number: $number) \
+                 {{ {INVOICE_DETAIL_FIELDS} }} }}"
             );
             rename(
-                ctx.run(&doc, json!({ "id": id, "date": date })).await,
+                ctx.run(&doc, json!({ "id": id, "date": date, "number": number }))
+                    .await,
                 "finalizeInvoice",
                 "invoice",
             )

@@ -3565,6 +3565,7 @@ impl db::Handler for Handler {
 
     async fn finalize_invoice(
         &self,
+        instance_id: &str,
         invoice_id: &str,
         expected_version: u64,
         number: u32,
@@ -3573,11 +3574,8 @@ impl db::Handler for Handler {
         total_cents: i64,
         finalized_by_user_id: &str,
     ) -> db::Result<bool> {
-        self.ensure_writable()?;
         let now = crate::clock::now_sec();
-        let resp = self
-            .client
-            .update_item()
+        let update_invoice = Update::builder()
             .table_name(self.table_name("invoice"))
             .key("id", AttributeValue::S(invoice_id.to_string()))
             .update_expression(
@@ -3610,21 +3608,33 @@ impl db::Handler for Handler {
                 ":finalized_by",
                 AttributeValue::S(finalized_by_user_id.to_string()),
             )
-            .return_consumed_capacity(ReturnConsumedCapacity::Total)
-            .send()
-            .await;
-        match resp {
-            Ok(r) => {
-                record_capacity("finalize_invoice", r.consumed_capacity(), CapKind::Write);
-                Ok(true)
-            }
-            Err(SdkError::ServiceError(ref se))
-                if se.err().is_conditional_check_failed_exception() =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
-        }
+            .build()
+            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+
+        // An `Update`, not a `Put`, creating the row: the counter table's IAM
+        // grant is `UpdateItem`, and a transaction authorises each item by its
+        // own single-item action.
+        let reserve_number = Update::builder()
+            .table_name(self.table_name("counter"))
+            .key(
+                "id",
+                AttributeValue::S(db::invoice_number_reservation_id(instance_id, number)),
+            )
+            .update_expression("SET invoice_id = :invoice_id, created_at = :now")
+            .condition_expression("attribute_not_exists(id)")
+            .expression_attribute_values(":invoice_id", AttributeValue::S(invoice_id.to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+            .build()
+            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+
+        self.transact_write(
+            "finalize_invoice",
+            vec![
+                TransactWriteItem::builder().update(update_invoice).build(),
+                TransactWriteItem::builder().update(reserve_number).build(),
+            ],
+        )
+        .await
     }
 
     async fn set_invoice_paid(
@@ -3782,6 +3792,68 @@ impl db::Handler for Handler {
                 Ok(false)
             }
             Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
+        }
+    }
+
+    async fn invoice_number_used(&self, instance_id: &str, number: u32) -> db::Result<bool> {
+        let resp = self
+            .client
+            .get_item()
+            .table_name(self.table_name("counter"))
+            .key(
+                "id",
+                AttributeValue::S(db::invoice_number_reservation_id(instance_id, number)),
+            )
+            .consistent_read(true)
+            .projection_expression("id")
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        record_capacity(
+            "invoice_number_used",
+            resp.consumed_capacity(),
+            CapKind::Read,
+        );
+        if resp.item.is_some() {
+            return Ok(true);
+        }
+
+        // Invoices finalized before reservation rows existed have none, so
+        // also look for the number among the instance's invoices themselves.
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let resp = self
+                .client
+                .query()
+                .table_name(self.table_name("invoice"))
+                .index_name("instance_id-created_at-index")
+                .key_condition_expression("instance_id = :instance_id")
+                .filter_expression("#num = :number")
+                .projection_expression("id")
+                .expression_attribute_names("#num", "number")
+                .expression_attribute_values(
+                    ":instance_id",
+                    AttributeValue::S(instance_id.to_string()),
+                )
+                .expression_attribute_values(":number", AttributeValue::N(number.to_string()))
+                .set_exclusive_start_key(exclusive_start_key.take())
+                .return_consumed_capacity(ReturnConsumedCapacity::Total)
+                .send()
+                .await
+                .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+            record_capacity(
+                "invoice_number_used",
+                resp.consumed_capacity(),
+                CapKind::Read,
+            );
+            if resp.count > 0 {
+                return Ok(true);
+            }
+            exclusive_start_key = resp.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                return Ok(false);
+            }
         }
     }
 

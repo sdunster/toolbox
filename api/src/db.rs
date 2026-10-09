@@ -888,6 +888,16 @@ impl HasID for Invoice {
     }
 }
 
+/// The `counter` row id that reserves invoice `number` in an instance:
+/// `{instance_id}#invoice#{number}`. Written once, by the transaction that
+/// finalizes the invoice taking that number, and never removed (finalized
+/// invoices are permanent). Shares the table with the per-instance counter
+/// rows (whose id is the bare instance id) because both are number
+/// allocation; an instance id never contains `#`, so the two can't collide.
+pub fn invoice_number_reservation_id(instance_id: &str, number: u32) -> String {
+    format!("{instance_id}#invoice#{number}")
+}
+
 /// Which partition an invoice listing reads — mirrors
 /// [`BillableItemScope`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2003,23 +2013,28 @@ pub trait Handler: Sync {
         expected_version: u64,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// The finalize write — step 6 of CLAUDE.md's "finalize algorithm". A
-    /// single conditional `UpdateItem` (**not** a transaction: nothing else
-    /// is written here, since every item's `invoice_id` already points at
-    /// this invoice from the moment it was attached), conditioned on
-    /// `status = draft AND version = expected_version`, setting
+    /// `TransactWriteItems` of two updates: the invoice itself, conditioned
+    /// on `status = draft AND version = expected_version`, setting
     /// `status=finalized`, `number`, `issue_date`, `snapshot`,
     /// `total_cents`, `finalized_at`, `finalized_by_user_id`, and bumping
-    /// `version`. Every other step of the algorithm (reading the draft and
-    /// its items, allocating `number` from the counter, building the
-    /// snapshot) happens in the caller (`graphql::mutations::finalize_invoice`)
-    /// before this is called — `number` having already been allocated by
-    /// the time this runs is exactly why a failed condition here leaves a
-    /// *gap* in the numbering, never a duplicate (see `SCHEMA.md`'s "Known
-    /// issues"). `Ok(false)` on a version/status mismatch — a concurrent
-    /// edit or a second finalize racing this one.
+    /// `version`; and the number's reservation row in `counter`
+    /// ([`invoice_number_reservation_id`]), created conditioned on
+    /// `attribute_not_exists(id)` — what makes a duplicate number impossible
+    /// now that `finalizeInvoice(number:)` may claim a number below the
+    /// counter. (Nothing is written to the items: every item's `invoice_id`
+    /// already points at this invoice from the moment it was attached.)
+    /// Every other step of the algorithm (reading the draft and its items,
+    /// allocating `number`, building the snapshot) happens in the caller
+    /// (`graphql::mutations::finalize_invoice`) before this is called — a
+    /// counter-allocated `number` having already been taken by the time this
+    /// runs is exactly why a failed condition here leaves a *gap* in the
+    /// numbering, never a duplicate (see `SCHEMA.md`'s "Known issues").
+    /// `Ok(false)` if either condition fails — a concurrent edit, a second
+    /// finalize racing this one, or the number already being used.
     #[allow(clippy::too_many_arguments)]
     fn finalize_invoice(
         &self,
+        instance_id: &str,
         invoice_id: &str,
         expected_version: u64,
         number: u32,
@@ -2074,6 +2089,21 @@ pub trait Handler: Sync {
         &self,
         instance_id: &str,
         new_value: u64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Whether `number` is already used by an invoice in this instance — the
+    /// check behind `finalizeInvoice(number:)`, which may claim any unused
+    /// number, lower ones included. First a consistent `GetItem` of its
+    /// reservation row ([`invoice_number_reservation_id`], written by every
+    /// [`Self::finalize_invoice`]); then, for invoices finalized before
+    /// reservation rows existed, a query of the instance's invoices for that
+    /// `number`. The query is eventually consistent, which only matters for
+    /// an invoice finalized in the last moment — and every such invoice has a
+    /// reservation row. Advisory: the reservation's condition inside
+    /// `finalize_invoice` is what actually prevents a duplicate.
+    fn invoice_number_used(
+        &self,
+        instance_id: &str,
+        number: u32,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// One page of an invoice listing, newest `created_at` first — mirrors
     /// [`Self::list_billable_items`] exactly, including the "no `Limit` on a

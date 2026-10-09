@@ -241,15 +241,26 @@ local setup, and `SCHEMA.md` for the data model.
     transactions in this codebase (`dynamodb.rs`'s `transact_write` helper). `finalizeInvoice`
     freezes everything the invoice prints (seller/bill-to/reference, sorted lines, totals, GST
     flag, currency, payment text, number, issue date) into a JSON `snapshot`
-    (`invoicing::snapshot::build_snapshot`, `schema_version: 1`) via one conditional `UpdateItem`
-    (not a transaction — every item's `invoice_id` already points here); later edits to the project
+    (`invoicing::snapshot::build_snapshot`, `schema_version: 1`) via one `TransactWriteItems` of
+    two updates — the invoice itself, and the number's reservation row in `{prefix}_counter`
+    (`{instance_id}#invoice#{number}`, `attribute_not_exists`, see below; the items need no write,
+    every item's `invoice_id` already points here); later edits to the project
     or instance settings never alter it. **Strictly one-way**: no void, no un-finalize — the only
     mutation a finalized invoice still accepts is `setInvoicePaid` (any member; not printed on the
     invoice). The number comes from `{prefix}_counter`'s `next_invoice_number`, the same atomic-`ADD`
     counter pattern as tickets' `next_ticket_number` — allocated *before* the conditional finalize
     write, so a version mismatch there leaves a **gap**, never a duplicate (see `SCHEMA.md`'s
     "Known issues"). Owner-or-superuser `setNextInvoiceNumber` can move it **forward only**
-    (`CONFLICT` otherwise); `finalizeInvoice` additionally requires `businessName` to already be
+    (`CONFLICT` otherwise). For importing existing invoices, `finalizeInvoice` takes an optional
+    **owner-only** `number` that takes exactly that number instead of the next in sequence — any
+    number no invoice in the instance already has, lower than the counter included
+    (`db::Handler::invoice_number_used`: the reservation row, plus a query of the instance's
+    invoices for ones finalized before reservation rows existed). A number above the counter moves
+    the counter up to it first (`set_next_invoice_number`, forward-only), so the automatic sequence
+    never runs into a claimed number. What actually rules out a duplicate is the reservation row's
+    condition inside the finalize transaction, which every finalize — automatic or explicit — writes.
+    `issueDate` (and billable-item `date`, `paidDate`) may be any past date, which is
+    the other half of an import. `finalizeInvoice` additionally requires `businessName` to already be
     set ("Complete the invoicing settings first" otherwise). A draft's live preview and a finalized
     invoice's frozen content are built by the exact same `build_snapshot` function — the web
     preview and the printed invoice can't diverge in how a value is computed, only in *when* the
@@ -362,7 +373,9 @@ local setup, and `SCHEMA.md` for the data model.
   The invoicing tools (`mcp/invoicing.rs`) send no email and are refused for a support instance by
   the resolvers' own kind check. `finalize_invoice` is strictly irreversible, so its description
   says so, it is annotated destructive, and it requires an explicit `issueDate` (no default); the
-  owner-level `updateInvoicingSettings`/`setNextInvoiceNumber` are deliberately not tools.
+  owner-level `updateInvoicingSettings`/`setNextInvoiceNumber` are deliberately not tools —
+  `finalize_invoice`'s optional owner-only `number` (plus a past `issueDate`) is what importing an
+  existing invoice under its original number and date needs, in the one irreversible call.
   Every tool's description must say plainly if it sends customer email. `whoami` (memberships with
   role and instance kind) is the first tool; call it first to learn which instances apply.
 
