@@ -10,10 +10,14 @@
 //!   `createBillableItem`/`updateBillableItem`.
 //! - [`validate_total_within_safe_integer`], shared by every mutation that
 //!   changes an invoice's item set.
+//! - [`expense`]: expense input validation (`createExpense`/`updateExpense`).
+//! - [`vehicle`]: the ATO cents-per-km rate table and trip arithmetic.
 
+pub mod expense;
 pub mod money;
 pub mod pdf;
 pub mod snapshot;
+pub mod vehicle;
 
 use chrono::NaiveDate;
 

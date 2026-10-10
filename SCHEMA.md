@@ -655,6 +655,57 @@ finalize or mark paid; superusers get no access — same boundary as `project`/`
 
 ---
 
+### `{prefix}_expense`
+
+Money an invoicing instance spent — a purchase, or a cents-per-km vehicle trip — optionally against
+one of its projects. See CLAUDE.md's "Expenses" house rule. Never linked to an invoice.
+
+| Attribute     | Type | Role                                   |
+| ------------- | ---- | -------------------------------------- |
+| `id`          | S    | Hash key (PK) — nanoid                 |
+| `instance_id` | S    | GSI hash key                           |
+| `project_id`  | S    | GSI hash key — **optional**            |
+| `date`        | S    | GSI sort key — `YYYY-MM-DD`            |
+
+**GSIs:**
+
+| GSI                      | Hash key      | Sort key | Projection | Purpose                             |
+| ------------------------ | ------------- | -------- | ---------- | ----------------------------------- |
+| `instance_id-date-index` | `instance_id` | `date`   | ALL        | The expenses page; the per-person financial-year km total (`date BETWEEN`) |
+| `project_id-date-index`  | `project_id`  | `date`   | ALL        | One project's expenses. **Sparse**: an expense with no project has no `project_id` and never appears here |
+
+Read and paginated exactly like `billable_item`'s (newest first, `{date}:{id}` cursor). The
+optional category filter is a `FilterExpression`, so `list_expenses` follows the same "keep querying
+until the page is full" rule. `sum_vehicle_km_tenths` walks the caller's trips in one financial year
+(`instance_id = :i AND #d BETWEEN :from AND :to`, filtered to `category = vehicle_km AND
+created_by_user_id = :me`) — bounded by one person's trips in one year.
+
+**Non-obvious attributes:**
+
+- `date` (S) — canonical `YYYY-MM-DD` (`invoicing::validate_item_date`); a reserved word, aliased `#d`.
+- `category` (S) — one of a fixed list (`db::ExpenseCategory::as_str`, e.g. `materials`,
+  `vehicle_km`). `vehicle_km` decides the row's shape: a trip carries `distance_tenths_km` and
+  `rate_cents_per_km` and never `supplier`/`amount_cents`/`gst_cents`; every other category is the
+  reverse. `updateExpense` can change category, and `REMOVE`s whichever set no longer applies.
+- `supplier` (S) — purchases only; trimmed, ≤ 200 chars.
+- `amount_cents` (N) — purchases only; **GST-inclusive** (what was paid), `0 < a ≤ 1,000,000,000`.
+- `gst_cents` (N) — optional, purchases only; the GST included in `amount_cents`,
+  `0 ≤ g ≤ amount_cents`. Absent means GST-free.
+- `distance_tenths_km` (N) — trips only; km × 10, `0 < d ≤ 50,000` (5,000 km).
+- `rate_cents_per_km` (N) — trips only; the ATO rate for the trip date's financial year
+  (`invoicing::vehicle::ATO_RATES`), looked up on every write and stored, so a later table change
+  never alters a saved trip. A trip's amount is **not stored** — derived as round-half-up(`distance
+  × rate / 10`) on read.
+- `description` (S) — optional for a purchase; required for a trip (its business purpose). ≤ 2000.
+- `project_id` (S) — optional; absent (never `Null`) when the expense isn't for a project.
+- `created_by_user_id` (S) — whoever logged it; also whose km running total a trip counts toward.
+- `created_at`, `updated_at` (N)
+
+Any member (owner or agent) of the invoicing instance can create/update/delete expenses; superusers
+get no access. An archived project takes no new expenses, but one already on it stays editable.
+
+---
+
 ### `{prefix}_ephemeral_state`
 
 | Attribute | Type | Role                                                                   |

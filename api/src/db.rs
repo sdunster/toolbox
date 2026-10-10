@@ -610,6 +610,193 @@ pub struct ListBillableItemsPage {
     pub limit: i32,
 }
 
+/// `expense.category`: one of a fixed list, built into the code rather than
+/// configured per instance so totals stay comparable — see CLAUDE.md's
+/// "Expenses" house rule. Stored as [`Self::as_str`]. [`Self::VehicleKm`]
+/// is the one category with a different shape: a cents-per-km trip
+/// ([`ExpenseDetail::VehicleKm`]) rather than a purchase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ExpenseCategory {
+    Materials,
+    Subcontractors,
+    ToolsEquipment,
+    VehicleFuel,
+    VehicleKm,
+    Travel,
+    MealsEntertainment,
+    SoftwareSubscriptions,
+    PhoneInternet,
+    OfficeSupplies,
+    ProfessionalFees,
+    Insurance,
+    RentUtilities,
+    AdvertisingMarketing,
+    BankFees,
+    Training,
+    LicencesMemberships,
+    PostageFreight,
+    Other,
+}
+
+impl ExpenseCategory {
+    pub const ALL: [Self; 19] = [
+        Self::Materials,
+        Self::Subcontractors,
+        Self::ToolsEquipment,
+        Self::VehicleFuel,
+        Self::VehicleKm,
+        Self::Travel,
+        Self::MealsEntertainment,
+        Self::SoftwareSubscriptions,
+        Self::PhoneInternet,
+        Self::OfficeSupplies,
+        Self::ProfessionalFees,
+        Self::Insurance,
+        Self::RentUtilities,
+        Self::AdvertisingMarketing,
+        Self::BankFees,
+        Self::Training,
+        Self::LicencesMemberships,
+        Self::PostageFreight,
+        Self::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Materials => "materials",
+            Self::Subcontractors => "subcontractors",
+            Self::ToolsEquipment => "tools_equipment",
+            Self::VehicleFuel => "vehicle_fuel",
+            Self::VehicleKm => "vehicle_km",
+            Self::Travel => "travel",
+            Self::MealsEntertainment => "meals_entertainment",
+            Self::SoftwareSubscriptions => "software_subscriptions",
+            Self::PhoneInternet => "phone_internet",
+            Self::OfficeSupplies => "office_supplies",
+            Self::ProfessionalFees => "professional_fees",
+            Self::Insurance => "insurance",
+            Self::RentUtilities => "rent_utilities",
+            Self::AdvertisingMarketing => "advertising_marketing",
+            Self::BankFees => "bank_fees",
+            Self::Training => "training",
+            Self::LicencesMemberships => "licences_memberships",
+            Self::PostageFreight => "postage_freight",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+}
+
+/// The shape-specific half of an expense. Which variant a row has is
+/// decided by its category — [`ExpenseCategory::VehicleKm`] is always a
+/// `VehicleKm`, every other category a `Purchase` — enforced by
+/// `invoicing::expense::validate_expense_input`, the one constructor every
+/// write path goes through.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExpenseDetail {
+    /// Something bought, from a receipt.
+    Purchase {
+        supplier: String,
+        /// GST-inclusive — what was actually paid.
+        amount_cents: i64,
+        /// The GST included in `amount_cents`; absent for a GST-free purchase.
+        gst_cents: Option<i64>,
+    },
+    /// A business trip claimed by the ATO's cents-per-km method. Carries no
+    /// GST. The amount is derived, never stored —
+    /// [`crate::invoicing::vehicle::trip_amount_cents`].
+    VehicleKm {
+        distance_tenths_km: i64,
+        /// Looked up from the ATO table by the trip's date at write time
+        /// and stored, so a later table change never alters a saved trip.
+        rate_cents_per_km: i64,
+    },
+}
+
+/// Every editable attribute of an expense — `createExpense`'s input and
+/// `updateExpense`'s full replace.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpenseFields {
+    /// Optional — an expense need not belong to a project. Absent from the
+    /// row (never `Null`) when unset, which is what keeps it out of the
+    /// sparse `project_id-date-index`.
+    pub project_id: Option<String>,
+    /// `YYYY-MM-DD`, canonical — the listing GSIs' sort key, like
+    /// `BillableItem::date`.
+    pub date: String,
+    pub category: ExpenseCategory,
+    /// Optional for a purchase; required (the trip's business purpose) for
+    /// a vehicle trip.
+    pub description: Option<String>,
+    pub detail: ExpenseDetail,
+}
+
+/// An `expense` row — money an invoicing instance spent, optionally against
+/// one of its [`Project`]s. Never linked to an invoice.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Expense {
+    pub id: String,
+    pub instance_id: String,
+    pub fields: ExpenseFields,
+    /// Whoever logged it — for a vehicle trip, also whose 5,000 km running
+    /// total it counts toward.
+    pub created_by_user_id: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+impl Expense {
+    /// What the expense cost, in cents: the GST-inclusive amount paid for a
+    /// purchase, or distance × rate for a trip.
+    pub fn amount_cents(&self) -> i64 {
+        match &self.fields.detail {
+            ExpenseDetail::Purchase { amount_cents, .. } => *amount_cents,
+            ExpenseDetail::VehicleKm {
+                distance_tenths_km,
+                rate_cents_per_km,
+            } => crate::invoicing::vehicle::trip_amount_cents(
+                *distance_tenths_km,
+                *rate_cents_per_km,
+            ),
+        }
+    }
+}
+
+impl HasID for Expense {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Which partition an expense listing reads — mirrors
+/// [`BillableItemScope`]. `Project` reads the sparse
+/// `project_id-date-index`, so an expense with no project never appears
+/// in one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpenseScope<'a> {
+    Instance(&'a str),
+    Project(&'a str),
+}
+
+/// Keyset cursor for an expense listing: `{date}:{id}` — the same shape,
+/// for the same reason, as [`BillableItemCursor`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpenseCursor {
+    pub date: String,
+    pub id: String,
+}
+
+/// Forward-only (`first`/`after`), newest `date` first — mirrors
+/// [`ListBillableItemsPage`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListExpensesPage {
+    pub after: Option<ExpenseCursor>,
+    pub limit: i32,
+}
+
 /// `invoice.status`. **Strictly one-way**: `Finalized` never reverts to
 /// `Draft` — no void, no un-finalize, per CLAUDE.md's "Invoicing" house
 /// rule. The only thing that changes on a finalized invoice afterward is
@@ -1680,6 +1867,56 @@ pub trait Handler: Sync {
         &self,
         ids: &[T],
     ) -> impl Future<Output = Result<Vec<Option<BillableItem>>>> + Send;
+
+    // ── expense ───────────────────────────────────────────────────────────
+    //
+    // `date` is a DynamoDB reserved word, aliased `#d` as for `billable_item`.
+    //
+    fn create_expense(
+        &self,
+        instance_id: &str,
+        fields: &ExpenseFields,
+        created_by_user_id: &str,
+    ) -> impl Future<Output = Result<Expense>> + Send;
+    fn get_expenses<T: AsRef<str> + Sync>(
+        &self,
+        ids: &[T],
+    ) -> impl Future<Output = Result<Vec<Option<Expense>>>> + Send;
+    /// Full-replace every editable attribute: present values are `SET`,
+    /// absent optional ones `REMOVE`d (so switching a purchase to a trip
+    /// drops `supplier`/`amount_cents`/`gst_cents`, and clearing a project
+    /// drops the row out of `project_id-date-index`). `instance_id` and the
+    /// `created_*` attributes never change. `Ok(false)` (nothing written)
+    /// when the row no longer exists.
+    fn update_expense(
+        &self,
+        id: &str,
+        fields: &ExpenseFields,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// `Ok(false)` when the row no longer exists.
+    fn delete_expense(&self, id: &str) -> impl Future<Output = Result<bool>> + Send;
+    /// One page of expenses, newest `date` first, keyset-paginated —
+    /// [`Self::list_billable_items`]'s contract exactly, including "keep
+    /// querying until the page is full" when `category` adds a
+    /// `FilterExpression`.
+    fn list_expenses(
+        &self,
+        scope: ExpenseScope<'_>,
+        category: Option<ExpenseCategory>,
+        page: ListExpensesPage,
+    ) -> impl Future<Output = Result<Vec<Expense>>> + Send;
+    /// Total distance, in tenths of a km, of `user_id`'s vehicle trips in
+    /// `instance_id` dated `from..=to` (`YYYY-MM-DD`) — the 5,000 km running
+    /// total. Reads `instance_id-date-index` over that date range, filtered
+    /// to `category = vehicle_km` and the user; bounded by one person's
+    /// trips in one financial year.
+    fn sum_vehicle_km_tenths(
+        &self,
+        instance_id: &str,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> impl Future<Output = Result<i64>> + Send;
 
     // ── invoice ───────────────────────────────────────────────────────────
     //

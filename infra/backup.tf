@@ -28,6 +28,7 @@ locals {
     aws_dynamodb_table.project,
     aws_dynamodb_table.billable_item,
     aws_dynamodb_table.invoice,
+    aws_dynamodb_table.expense,
   ]
 }
 

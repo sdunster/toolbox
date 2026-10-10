@@ -1,4 +1,5 @@
-//! MCP tools for invoicing instances: projects, billable items and invoices.
+//! MCP tools for invoicing instances: projects, billable items, invoices and
+//! expenses.
 //! Every tool runs one fixed GraphQL document as the caller (see
 //! [`super::tool`]), so authorization is the site's: only a real member of an
 //! **invoicing** instance can use them, a superuser without a membership sees
@@ -29,6 +30,42 @@ const PROJECT_FIELDS: &str = "id name clientName clientAbn clientAddress referen
 
 const ITEM_FIELDS: &str = "id date description quantity unitPriceCents amountCents status \
      project { id name }";
+
+const EXPENSE_FIELDS: &str = "id date category description supplier amountCents gstCents \
+     distanceKm rateCentsPerKm project { id name }";
+
+/// `ExpenseCategoryType`'s values, for the tools' input schemas.
+const EXPENSE_CATEGORIES: [&str; 19] = [
+    "MATERIALS",
+    "SUBCONTRACTORS",
+    "TOOLS_EQUIPMENT",
+    "VEHICLE_FUEL",
+    "VEHICLE_KM",
+    "TRAVEL",
+    "MEALS_ENTERTAINMENT",
+    "SOFTWARE_SUBSCRIPTIONS",
+    "PHONE_INTERNET",
+    "OFFICE_SUPPLIES",
+    "PROFESSIONAL_FEES",
+    "INSURANCE",
+    "RENT_UTILITIES",
+    "ADVERTISING_MARKETING",
+    "BANK_FEES",
+    "TRAINING",
+    "LICENCES_MEMBERSHIPS",
+    "POSTAGE_FREIGHT",
+    "OTHER",
+];
+
+const EXPENSE_WRITE_DESCRIPTION: &str = "Record an expense in an INVOICING instance, \
+     optionally against one of its projects. Two shapes, chosen by `category`: a PURCHASE \
+     (every category except VEHICLE_KM) needs `supplier` and `amountCents` (GST-inclusive — \
+     what was paid) plus optional `gstCents` (the GST included; omit for a GST-free \
+     purchase); a VEHICLE_KM trip needs `distanceKm` and a `description` of its business \
+     purpose, and must not have supplier/amount/GST — its amount is distance x the ATO \
+     cents-per-km rate for the trip date's financial year, looked up for you. A car claimed \
+     by cents per km can't also claim its fuel (VEHICLE_FUEL). Expenses are never \
+     invoiced and send no email.";
 
 /// What a list of invoices shows. `get_invoice` adds the frozen-or-live detail.
 const INVOICE_SUMMARY_FIELDS: &str = "id status number displayNumber issueDate paidDate title \
@@ -133,6 +170,20 @@ pub fn catalogue() -> Vec<Value> {
     });
     let mut update_item_props = item_input.clone();
     update_item_props["id"] = json!({ "type": "string" });
+    let expense_props = json!({
+        "projectId": { "type": "string", "description": "Optional — omit for an expense not tied to a project." },
+        "date": { "type": "string", "description": "YYYY-MM-DD." },
+        "category": { "type": "string", "enum": EXPENSE_CATEGORIES },
+        "description": { "type": "string", "description": "Optional for a purchase; the business purpose of a VEHICLE_KM trip (required there)." },
+        "supplier": { "type": "string", "description": "Purchases only (required there)." },
+        "amountCents": { "type": "integer", "description": "Purchases only: GST-inclusive cents paid, 1 to 1,000,000,000." },
+        "gstCents": { "type": "integer", "description": "Purchases only: GST included in amountCents (usually amount / 11). Omit if GST-free." },
+        "distanceKm": { "type": "string", "description": "VEHICLE_KM only: km, at most 1 decimal place, up to 5000. e.g. \"12.5\"." },
+    });
+    let mut create_expense_props = expense_props.clone();
+    create_expense_props["instanceId"] = json!({ "type": "string" });
+    let mut update_expense_props = expense_props;
+    update_expense_props["id"] = json!({ "type": "string" });
 
     vec![
         json!({
@@ -265,6 +316,93 @@ pub fn catalogue() -> Vec<Value> {
             },
             "outputSchema": wrap("deletedId", json!({ "type": "string" })),
             "annotations": { "title": "Delete billable item", "destructiveHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "list_expenses",
+            "title": "List expenses",
+            "description": "List expenses (money the business spent, and cents-per-km vehicle \
+                trips) in an INVOICING instance, newest first, optionally for one project and/or \
+                one `category`. Results are paged: pass `endCursor` as `after` for the next page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "projectId": { "type": "string" },
+                    "category": { "type": "string", "enum": EXPENSE_CATEGORIES },
+                    "first": paging_props()["first"].clone(),
+                    "after": paging_props()["after"].clone(),
+                },
+                "required": ["instanceId"],
+            },
+            "outputSchema": listing_schema("expenses", expense_schema()),
+            "annotations": { "title": "List expenses", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "create_expense",
+            "title": "Create expense",
+            "description": EXPENSE_WRITE_DESCRIPTION,
+            "inputSchema": {
+                "type": "object",
+                "properties": create_expense_props,
+                "required": ["instanceId", "date", "category"],
+            },
+            "outputSchema": wrap("expense", expense_schema()),
+            "annotations": { "title": "Create expense", "idempotentHint": false },
+        }),
+        json!({
+            "name": "update_expense",
+            "title": "Update expense",
+            "description": format!(
+                "Replace an expense (a full replace: pass every field it should keep — an \
+                 omitted projectId, gstCents or description is cleared). {EXPENSE_WRITE_DESCRIPTION}"
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": update_expense_props,
+                "required": ["id", "date", "category"],
+            },
+            "outputSchema": wrap("expense", expense_schema()),
+            "annotations": { "title": "Update expense", "idempotentHint": true },
+        }),
+        json!({
+            "name": "delete_expense",
+            "title": "Delete expense",
+            "description": "Permanently delete an expense.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"],
+            },
+            "outputSchema": wrap("deletedId", json!({ "type": "string" })),
+            "annotations": { "title": "Delete expense", "destructiveHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "get_vehicle_km_summary",
+            "title": "Vehicle km this financial year",
+            "description": "Your own cents-per-km vehicle trips (VEHICLE_KM expenses) in an \
+                INVOICING instance for one Australian financial year, against the ATO cap of \
+                5,000 business km per car. `financialYear` is the year it starts in (2026 = \
+                1 July 2026 to 30 June 2027); defaults to the current one. Informational: \
+                nothing stops a trip past the cap.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "financialYear": { "type": "integer" },
+                },
+                "required": ["instanceId"],
+            },
+            "outputSchema": wrap("summary", json!({
+                "type": "object",
+                "properties": {
+                    "financialYear": { "type": "integer" },
+                    "financialYearLabel": { "type": "string", "description": "e.g. \"2026–27\"." },
+                    "totalKm": { "type": "string" },
+                    "capKm": { "type": "integer" },
+                    "rateCentsPerKm": { "type": ["integer", "null"] },
+                },
+            })),
+            "annotations": { "title": "Vehicle km this financial year", "readOnlyHint": true, "idempotentHint": true },
         }),
         json!({
             "name": "list_invoices",
@@ -505,6 +643,41 @@ where
                 .await,
                 "deleteBillableItem",
                 "deletedId",
+            )
+        }
+        "list_expenses" => list_expenses(ctx, arguments).await,
+        "create_expense" | "update_expense" => write_expense(ctx, name, arguments).await,
+        "delete_expense" => {
+            let Some(id) = string_arg(arguments, "id") else {
+                return Some(missing_argument("id"));
+            };
+            rename(
+                ctx.run(
+                    "mutation McpDeleteExpense($id: ID!) { deleteExpense(id: $id) }",
+                    json!({ "id": id }),
+                )
+                .await,
+                "deleteExpense",
+                "deletedId",
+            )
+        }
+        "get_vehicle_km_summary" => {
+            let Some(instance_id) = string_arg(arguments, "instanceId") else {
+                return Some(missing_argument("instanceId"));
+            };
+            rename(
+                ctx.run(
+                    "query McpVehicleKm($instanceId: ID!, $financialYear: Int) { \
+                     vehicleKmSummary(instanceId: $instanceId, financialYear: $financialYear) { \
+                     financialYear financialYearLabel totalKm capKm rateCentsPerKm } }",
+                    json!({
+                        "instanceId": instance_id,
+                        "financialYear": arguments.get("financialYear").and_then(Value::as_i64),
+                    }),
+                )
+                .await,
+                "vehicleKmSummary",
+                "summary",
             )
         }
         "list_invoices" => list_invoices(ctx, arguments).await,
@@ -853,4 +1026,108 @@ where
         "invoices",
         "invoices",
     )
+}
+
+fn expense_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "date": { "type": "string", "description": "YYYY-MM-DD." },
+            "category": { "type": "string", "enum": EXPENSE_CATEGORIES },
+            "description": { "type": ["string", "null"] },
+            "supplier": { "type": ["string", "null"], "description": "Null for a vehicle trip." },
+            "amountCents": { "type": "integer", "description": "GST-inclusive cents paid; for a trip, distance x rate." },
+            "gstCents": { "type": ["integer", "null"], "description": "GST included in amountCents; null when GST-free or a trip." },
+            "distanceKm": { "type": ["string", "null"], "description": "A trip's km, e.g. \"12.5\"; null for a purchase." },
+            "rateCentsPerKm": { "type": ["integer", "null"], "description": "The ATO rate the trip was claimed at." },
+            "project": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
+        },
+    })
+}
+
+/// The `ExpenseInput` fields, forwarded as given — the server does all the
+/// validation. `distanceKm` may be a string (preferred) or a JSON number.
+fn expense_input(arguments: &Value) -> Value {
+    let distance_km = match arguments.get("distanceKm") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    json!({
+        "projectId": string_arg(arguments, "projectId"),
+        "date": string_arg(arguments, "date"),
+        "category": string_arg(arguments, "category"),
+        "description": string_arg(arguments, "description"),
+        "supplier": string_arg(arguments, "supplier"),
+        "amountCents": arguments.get("amountCents").and_then(Value::as_i64),
+        "gstCents": arguments.get("gstCents").and_then(Value::as_i64),
+        "distanceKm": distance_km,
+    })
+}
+
+async fn list_expenses<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
+where
+    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+{
+    let Some(instance_id) = string_arg(arguments, "instanceId") else {
+        return missing_argument("instanceId");
+    };
+    let doc = format!(
+        "query McpExpenses($instanceId: ID!, $projectId: ID, $category: ExpenseCategoryType, \
+         $first: Int!, $after: String) {{ expenses(instanceId: $instanceId, \
+         projectId: $projectId, category: $category, first: $first, after: $after) {{ \
+         edges {{ node {{ {EXPENSE_FIELDS} }} }} pageInfo {{ hasNextPage endCursor }} }} }}"
+    );
+    unwrap_connection(
+        ctx.run(
+            &doc,
+            json!({
+                "instanceId": instance_id,
+                "projectId": string_arg(arguments, "projectId"),
+                "category": string_arg(arguments, "category"),
+                "first": page_size(arguments),
+                "after": string_arg(arguments, "after"),
+            }),
+        )
+        .await,
+        "expenses",
+        "expenses",
+    )
+}
+
+async fn write_expense<A>(ctx: &ToolContext<'_, A>, name: &str, arguments: &Value) -> ToolOutcome
+where
+    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+{
+    if string_arg(arguments, "date").is_none() || string_arg(arguments, "category").is_none() {
+        return missing_argument("date/category");
+    }
+    let input = expense_input(arguments);
+    let (doc, field, vars) = if name == "create_expense" {
+        let Some(instance_id) = string_arg(arguments, "instanceId") else {
+            return missing_argument("instanceId");
+        };
+        (
+            format!(
+                "mutation McpCreateExpense($instanceId: ID!, $input: ExpenseInput!) {{ \
+                 createExpense(instanceId: $instanceId, input: $input) {{ {EXPENSE_FIELDS} }} }}"
+            ),
+            "createExpense",
+            json!({ "instanceId": instance_id, "input": input }),
+        )
+    } else {
+        let Some(id) = string_arg(arguments, "id") else {
+            return missing_argument("id");
+        };
+        (
+            format!(
+                "mutation McpUpdateExpense($id: ID!, $input: ExpenseInput!) {{ \
+                 updateExpense(id: $id, input: $input) {{ {EXPENSE_FIELDS} }} }}"
+            ),
+            "updateExpense",
+            json!({ "id": id, "input": input }),
+        )
+    };
+    rename(ctx.run(&doc, vars).await, field, "expense")
 }

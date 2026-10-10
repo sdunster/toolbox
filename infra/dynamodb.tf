@@ -613,6 +613,73 @@ resource "aws_dynamodb_table" "billable_item" {
   }
 }
 
+# ── expense ──────────────────────────────────────────────────────────────────
+# Money an invoicing instance spent — a purchase, or a cents-per-km vehicle
+# trip — optionally against one of its projects; see CLAUDE.md's "Expenses"
+# house rule. Same key shape as billable_item: `date` (YYYY-MM-DD, a reserved
+# word, aliased `#d`) sorts both listing GSIs, newest first.
+
+resource "aws_dynamodb_table" "expense" {
+  name                        = "${var.db_prefix}_expense"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "id"
+  deletion_protection_enabled = true
+
+  point_in_time_recovery {
+    enabled                 = true
+    recovery_period_in_days = 35
+  }
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+  attribute {
+    name = "instance_id"
+    type = "S"
+  }
+  attribute {
+    name = "project_id"
+    type = "S"
+  }
+  attribute {
+    name = "date"
+    type = "S"
+  }
+
+  # The instance-wide expenses page, and the per-person financial-year
+  # vehicle km total (a `date BETWEEN` range on this index). ALL: every
+  # field is rendered in the list, and the category filter runs as a
+  # FilterExpression over the projected rows.
+  global_secondary_index {
+    name = "instance_id-date-index"
+    key_schema {
+      attribute_name = "instance_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "date"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+
+  # One project's expenses. Sparse: `project_id` is optional and omitted
+  # when unset, so an expense with no project never appears here.
+  global_secondary_index {
+    name = "project_id-date-index"
+    key_schema {
+      attribute_name = "project_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "date"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+}
+
 # ── invoice ──────────────────────────────────────────────────────────────────
 # A project's billable items collected for billing — see CLAUDE.md's
 # "Invoicing" house rule. `created_at` (N) is the sort key of both listing

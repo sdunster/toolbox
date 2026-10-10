@@ -64,6 +64,8 @@ Invoicing tools (INVOICING instances only; none send email):
 | `create_invoice` / `add_invoice_items` / `remove_invoice_items` / `delete_invoice` | Draft invoices |
 | `finalize_invoice` | **Irreversible**: numbers and freezes the invoice; requires an explicit `issueDate` |
 | `set_invoice_paid` / `get_invoice_pdf_url` | Paid date (omit to clear); presigned PDF link for a finalized invoice |
+| `list_expenses` / `create_expense` / `update_expense` / `delete_expense` | Money spent, optionally against a project. A purchase takes supplier + GST-inclusive cents (+ optional GST); a `VEHICLE_KM` trip takes distance + purpose and is priced at the ATO cents-per-km rate for its date |
+| `get_vehicle_km_summary` | The caller's own trip km for a financial year against the ATO's 5,000 km cap |
 
 Not exposed: attachments (an MCP client can't upload, and download URLs are presigned links), the
 raw HTML body, and the owner-level invoicing settings and next-invoice-number (use the web app).
