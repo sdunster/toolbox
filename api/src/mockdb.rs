@@ -450,6 +450,7 @@ impl db::Handler for Handler {
 
     async fn finalize_invoice(
         &self,
+        _instance_id: &str,
         _invoice_id: &str,
         _expected_version: u64,
         _number: u32,
@@ -486,6 +487,10 @@ impl db::Handler for Handler {
         _instance_id: &str,
         _new_value: u64,
     ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn invoice_number_used(&self, _instance_id: &str, _number: u32) -> db::Result<bool> {
         Self::unsupported()
     }
 

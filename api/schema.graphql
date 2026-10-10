@@ -1179,13 +1179,26 @@ type MutationRoot {
 	`invoice_id`), read the project and instance (requiring
 	`businessName` to be set), allocate the next number from the
 	per-instance counter, build the frozen snapshot, and write it all in
-	one conditional `UpdateItem`. Strictly final — no void, no
+	one conditional transaction with the number's reservation row
+	(`db::Handler::finalize_invoice`). Strictly final — no void, no
 	un-finalize; only `setInvoicePaid` may touch a finalized invoice
 	afterward. `CONFLICT` if the draft changed concurrently (a stale
 	`version`, checked both up front — via the consistent items read —
 	and in the final write's own condition).
+	
+	`issueDate` may be any valid date, past or future — backdating is how
+	an existing invoice is imported as it was issued. `number`, when given,
+	replaces step 4's counter allocation with exactly that number — for
+	importing an invoice under its original number. Owner-only, like
+	`setNextInvoiceNumber`, since it can move the same counter. Any number
+	no invoice in the instance already has is accepted, lower than the
+	counter or not; a used one is `CONFLICT`, and the invoice stays a
+	draft. A number above the counter moves the counter up to it first,
+	so automatic numbering never runs into it. The guarantee against a
+	duplicate is the number's reservation row, written in the same
+	transaction as the finalize (`db::Handler::finalize_invoice`).
 	"""
-	finalizeInvoice(invoiceId: ID!, issueDate: String!): Invoice!
+	finalizeInvoice(invoiceId: ID!, issueDate: String!, number: Int): Invoice!
 	"""
 	Set (`paidDate` given) or clear (`null`) a finalized invoice's paid
 	status. Any member may call this — paid status is not printed on

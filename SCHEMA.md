@@ -291,9 +291,18 @@ appending anything.
 | --------- | ---- | ---------------------------------------------- |
 | `id`      | S    | Hash key (PK) — the instance id, not a nanoid  |
 
-No GSIs. One row per instance; the row's `id` is the owning instance's id directly (not a
+No GSIs. One counter row per instance; the row's `id` is the owning instance's id directly (not a
 separately generated nanoid), since the counter's whole purpose is a 1:1 relationship with an
 instance and there is no other access pattern to support.
+
+The table also holds one **invoice-number reservation row** per finalized invoice:
+`id = {instance_id}#invoice#{number}` (`db::invoice_number_reservation_id`; an instance id is a
+nanoid, which never contains `#`, so it can't collide with a counter row), with `invoice_id` (S)
+and `created_at` (N). It is created by the same `TransactWriteItems` that finalizes the invoice,
+conditioned on `attribute_not_exists(id)` — the guarantee that no two invoices in an instance share
+a number, now that `finalizeInvoice(number:)` can take one below the counter. Never removed, like
+the finalized invoice it records. Invoices finalized before reservation rows existed have none;
+`db::Handler::invoice_number_used` also queries the instance's invoices to cover them.
 
 **Non-obvious attributes:**
 
@@ -302,7 +311,11 @@ instance and there is no other access pattern to support.
 - `next_invoice_number` (N) — the invoicing counterpart, same atomic-`ADD`-only rule, incremented
   by `finalizeInvoice` (`db::Handler::increment_invoice_counter`) and settable forward-only via
   `setNextInvoiceNumber` (`db::Handler::set_next_invoice_number`, condition
-  `attribute_not_exists(next_invoice_number) OR next_invoice_number <= :new_value`). Absent means
+  `attribute_not_exists(next_invoice_number) OR next_invoice_number <= :new_value`). An owner's
+  `finalizeInvoice(number:)` (importing an existing invoice under its original number) doesn't
+  `ADD`: it moves the counter up to that number through the same forward-only write — a no-op
+  for a number at or below it — so automatic numbering continues after the highest number used
+  and never lands on a claimed one. Absent means
   `0` (no invoice finalized yet, and `nextInvoiceNumber` has never been set) —
   `InvoicingSettingsInfo.nextInvoiceNumber` reads this lazily (a single `GetItem`, not carried on
   every `Instance` fetch) and reports `this + 1`. See "Known issues and risks" for the same
@@ -617,7 +630,9 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   versa — enforced structurally by the transactional writes, never by a separate consistency pass.
 - `created_by_user_id` (S), `created_at`, `updated_at` (N)
 - `number` (N) — optional; absent for a draft. Assigned exactly once, at finalization, from
-  `{prefix}_counter`'s `next_invoice_number` (see that table's entry). Displayed zero-padded to 3
+  `{prefix}_counter`'s `next_invoice_number` (see that table's entry) — the next in sequence, or
+  any unused number an owner gives `finalizeInvoice(number:)`. Unique per instance, enforced by the
+  number's reservation row in `{prefix}_counter`. Displayed zero-padded to 3
   digits (`invoicingSettings`'s convention; it simply grows past 999).
 - `issue_date` (S) — optional; `YYYY-MM-DD`. Absent for a draft; set once, at finalization, never
   changed afterward.
@@ -646,9 +661,10 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
 `DeleteItem` grants, and with no `ConditionCheck` no `dynamodb:ConditionCheckItem` grant is needed)
 across this table and
 `billable_item` together, via a small `transact_write` helper in `dynamodb.rs` — the first use of
-DynamoDB transactions in this codebase. `finalizeInvoice`'s own write is a single conditional
-`UpdateItem`, not a transaction: by the time it runs, every item's `invoice_id` already points at
-this invoice (from the moment it was attached), so nothing else needs writing alongside it.
+DynamoDB transactions in this codebase. `finalizeInvoice`'s write is a transaction too, but not
+with the items — by the time it runs, every item's `invoice_id` already points at this invoice
+(from the moment it was attached) — with the number's reservation row in `{prefix}_counter` (see
+that table's entry). Both are `Update` items, so `UpdateItem` grants authorise it.
 
 Any member (owner or agent) of the invoicing instance can create/attach/detach/delete a draft, and
 finalize or mark paid; superusers get no access — same boundary as `project`/`billable_item`.
@@ -804,17 +820,19 @@ conditional `UpdateItem` that actually finalizes the invoice will succeed. If th
 condition fails — the draft's `version` no longer matches, because another edit or another
 finalize attempt raced this one and won — the number that was just allocated is never written onto
 any invoice: it is permanently skipped, and the caller sees `CONFLICT` ("invoice changed, reload").
+An explicit `finalizeInvoice(number:)` has no such gap: its number isn't taken from the counter,
+and the reservation row is written in the same transaction as the invoice, so a failed finalize
+leaves that number free for a retry.
 This is a deliberate trade, not a bug to fix: allocating the number only *after* confirming the
 write would succeed would need either a second round trip inside the same logical operation (its
-own new race) or folding the counter `ADD` into the same transaction as the invoice write — but the
-counter row isn't a per-item condition the invoice's own `TransactWriteItems` participates in (the
-finalize write is a plain `UpdateItem`, not a transaction; see that table's entry above), and
+own new race) or folding the counter `ADD` into the same transaction as the invoice write, and
 `ADD`ing a shared per-instance counter inside a transaction would serialize every concurrent
 finalize across the whole instance on that one row, for a purely cosmetic guarantee (a gap in
 `008, 010, 011, …` costs nothing an accountant cares about; a duplicate `010, 010` would). Two
-invoices sharing the same `number` is the failure mode this must prevent, and it does: the number
-is never reused, because the counter itself never moves backward and a failed finalize never writes
-the number it allocated onto anything.
+invoices sharing the same `number` is the failure mode this must prevent, and it does: the counter
+never moves backward, a failed finalize never writes the number it allocated onto anything, and
+every finalize's transaction creates that number's reservation row only if it doesn't already exist
+— which is what also covers a number an owner chose explicitly.
 
 #### `processed_message` — the idempotency check has a window, not a guarantee, against non-SQS redelivery
 
