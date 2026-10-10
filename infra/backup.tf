@@ -29,6 +29,7 @@ locals {
     aws_dynamodb_table.billable_item,
     aws_dynamodb_table.invoice,
     aws_dynamodb_table.expense,
+    aws_dynamodb_table.credit_note,
   ]
 }
 

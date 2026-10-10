@@ -49,6 +49,7 @@ const item1 = {
   quantity: "3",
   unitPriceCents: 15000,
   amountCents: 45000,
+  gstFree: false,
   status: "DRAFT",
   invoice: { __typename: "Invoice", id: "inv-1" },
   project: { __typename: "Project", id: "proj-1", name: "Website Redesign" },
@@ -60,6 +61,8 @@ function invoiceResponse(
     displayNumber: string | null;
     issueDate: string | null;
     paidDate: string | null;
+    payments: unknown[];
+    creditNotes: unknown[];
     gstRegistered: boolean;
     items: unknown[];
     subtotalCents: number;
@@ -85,6 +88,8 @@ function invoiceResponse(
           __typename: "Project",
           id: "proj-1",
           name: "Website Redesign",
+          clientEmail: "accounts@retail.example",
+          effectivePaymentTermsDays: 30,
           instance: { __typename: "Instance", id: "inst-ledger" },
         },
         title: gstRegistered ? "Tax Invoice" : "Invoice",
@@ -97,6 +102,7 @@ function invoiceResponse(
           quantity: (item as typeof item1).quantity,
           unitPriceCents: (item as typeof item1).unitPriceCents,
           amountCents: (item as typeof item1).amountCents,
+          gstFree: false,
         })),
         subtotalCents,
         gstCents,
@@ -106,6 +112,17 @@ function invoiceResponse(
         paymentDetails: "BSB 000-000 Acc 00000000",
         items,
         paidDate: overrides.paidDate ?? null,
+        dueDate: status === "FINALIZED" ? "2026-09-18" : null,
+        overdue: false,
+        daysOverdue: null,
+        paidCents: overrides.paidDate ? totalCents : 0,
+        creditedCents: 0,
+        balanceCents:
+          status === "FINALIZED" && !overrides.paidDate ? totalCents : 0,
+        payments: overrides.payments ?? [],
+        sentAt: null,
+        sentTo: [],
+        creditNotes: overrides.creditNotes ?? [],
       },
     },
   };
@@ -161,9 +178,9 @@ describe("InvoiceDetailPage — draft", () => {
       screen.getByRole("button", { name: "Delete draft" }),
     ).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Remove" })).toBeInTheDocument();
-    // No paid control on a draft.
+    // No payment control on a draft.
     expect(
-      screen.queryByRole("button", { name: "Mark as paid" }),
+      screen.queryByRole("button", { name: "Record payment" }),
     ).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Finalize" }));
@@ -178,6 +195,8 @@ describe("InvoiceDetailPage — draft", () => {
       expect(finalizeVariables).toEqual({
         invoiceId: "inv-1",
         issueDate: "2026-08-19",
+        // The default follows the issue date: 30 days' terms.
+        dueDate: "2026-09-18",
       }),
     );
   });
@@ -237,8 +256,8 @@ describe("InvoiceDetailPage — draft", () => {
 });
 
 describe("InvoiceDetailPage — finalized", () => {
-  it("hides every draft action and toggles paid status", async () => {
-    let paidVariables: Record<string, unknown> | undefined;
+  it("hides every draft action and records a payment of the balance", async () => {
+    let paymentVariables: Record<string, unknown> | undefined;
     server.use(
       relayEndpoint.query("InvoiceDetailPageQuery", () =>
         HttpResponse.json(
@@ -249,18 +268,13 @@ describe("InvoiceDetailPage — finalized", () => {
           }),
         ),
       ),
-      relayEndpoint.mutation("InvoicePaidControlMutation", ({ variables }) => {
-        paidVariables = variables;
-        return HttpResponse.json({
-          data: {
-            setInvoicePaid: {
-              __typename: "Invoice",
-              id: "inv-1",
-              paidDate: variables.paidDate,
-            },
-          },
-        });
-      }),
+      relayEndpoint.mutation(
+        "InvoicePaidControlRecordMutation",
+        ({ variables }) => {
+          paymentVariables = variables;
+          return HttpResponse.json({ data: null, errors: [{ message: "x" }] });
+        },
+      ),
     );
     const user = UserEvent.setup();
     renderPage();
@@ -275,24 +289,23 @@ describe("InvoiceDetailPage — finalized", () => {
     expect(
       screen.queryByRole("button", { name: "Delete draft" }),
     ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Remove" }),
-    ).not.toBeInTheDocument();
+    expect(screen.getByText("Due 18/09/2026")).toBeInTheDocument();
 
-    const dateInput = screen.getByLabelText("Paid date");
-    expect(dateInput).toHaveValue(localToday());
-    await user.click(screen.getByRole("button", { name: "Mark as paid" }));
+    expect(screen.getByLabelText("Payment date")).toHaveValue(localToday());
+    expect(screen.getByLabelText("Amount (AUD)")).toHaveValue("450");
+    await user.type(screen.getByLabelText("Note"), "EFT");
+    await user.click(screen.getByRole("button", { name: "Record payment" }));
 
     await waitFor(() =>
-      expect(paidVariables).toEqual({
+      expect(paymentVariables).toEqual({
         invoiceId: "inv-1",
-        paidDate: localToday(),
+        input: { date: localToday(), amountCents: 45000, note: "EFT" },
       }),
     );
   });
 
-  it("shows the paid date and sends null to mark unpaid", async () => {
-    let paidVariables: Record<string, unknown> | undefined;
+  it("shows a settled invoice's payments and removes one", async () => {
+    let deleteVariables: Record<string, unknown> | undefined;
     server.use(
       relayEndpoint.query("InvoiceDetailPageQuery", () =>
         HttpResponse.json(
@@ -301,30 +314,124 @@ describe("InvoiceDetailPage — finalized", () => {
             displayNumber: "008",
             issueDate: "2026-08-19",
             paidDate: "2026-08-25",
+            payments: [
+              {
+                id: "pay-1",
+                date: "2026-08-25",
+                amountCents: 45000,
+                note: null,
+              },
+            ],
           }),
         ),
       ),
-      relayEndpoint.mutation("InvoicePaidControlMutation", ({ variables }) => {
-        paidVariables = variables;
-        return HttpResponse.json({
-          data: {
-            setInvoicePaid: {
-              __typename: "Invoice",
-              id: "inv-1",
-              paidDate: null,
-            },
-          },
-        });
+      relayEndpoint.mutation(
+        "InvoicePaidControlDeleteMutation",
+        ({ variables }) => {
+          deleteVariables = variables;
+          return HttpResponse.json({ data: null, errors: [{ message: "x" }] });
+        },
+      ),
+    );
+    const user = UserEvent.setup();
+    renderPage();
+
+    expect(
+      await screen.findByText("Paid — settled on 25/08/2026"),
+    ).toBeInTheDocument();
+    // Nothing owed: no form to record another payment.
+    expect(
+      screen.queryByRole("button", { name: "Record payment" }),
+    ).not.toBeInTheDocument();
+    await user.click(
+      screen.getByRole("button", {
+        name: "Remove payment of 450.00 on 25/08/2026",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(deleteVariables).toEqual({
+        invoiceId: "inv-1",
+        paymentId: "pay-1",
+      }),
+    );
+  });
+
+  it("issues a full credit note", async () => {
+    let creditVariables: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.query("InvoiceDetailPageQuery", () =>
+        HttpResponse.json(
+          invoiceResponse({
+            status: "FINALIZED",
+            displayNumber: "008",
+            issueDate: "2026-08-19",
+          }),
+        ),
+      ),
+      relayEndpoint.mutation(
+        "InvoiceCreditNotesIssueMutation",
+        ({ variables }) => {
+          creditVariables = variables;
+          return HttpResponse.json({ data: null, errors: [{ message: "x" }] });
+        },
+      ),
+    );
+    const user = UserEvent.setup();
+    renderPage();
+
+    await screen.findByText("Invoice 008");
+    await user.click(screen.getByRole("button", { name: "Issue credit note" }));
+    await user.type(screen.getByLabelText("Reason"), "Cancelled");
+    expect(screen.getByLabelText("The whole invoice")).toBeChecked();
+    const issueButtons = screen.getAllByRole("button", {
+      name: "Issue credit note",
+    });
+    await user.click(issueButtons[issueButtons.length - 1]);
+
+    await waitFor(() =>
+      expect(creditVariables).toEqual({
+        invoiceId: "inv-1",
+        input: { issueDate: localToday(), reason: "Cancelled", lines: null },
+      }),
+    );
+  });
+
+  it("emails the invoice to the client by default", async () => {
+    let sendVariables: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.query("InvoiceDetailPageQuery", () =>
+        HttpResponse.json(
+          invoiceResponse({
+            status: "FINALIZED",
+            displayNumber: "008",
+            issueDate: "2026-08-19",
+          }),
+        ),
+      ),
+      relayEndpoint.mutation("InvoiceSendPanelMutation", ({ variables }) => {
+        sendVariables = variables;
+        return HttpResponse.json({ data: null, errors: [{ message: "x" }] });
       }),
     );
     const user = UserEvent.setup();
     renderPage();
 
-    expect(await screen.findByText("Paid on 25/08/2026")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Mark as unpaid" }));
+    await screen.findByText("Invoice 008");
+    expect(screen.getByText("Not emailed yet.")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Email to client" }));
+    expect(
+      screen.getByText(
+        "Leave blank to send to the client email, accounts@retail.example.",
+      ),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Send email" }));
 
     await waitFor(() =>
-      expect(paidVariables).toEqual({ invoiceId: "inv-1", paidDate: null }),
+      expect(sendVariables).toEqual({
+        invoiceId: "inv-1",
+        input: { to: [], cc: [], message: null },
+      }),
     );
   });
 });

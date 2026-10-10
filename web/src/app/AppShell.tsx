@@ -33,6 +33,7 @@ const INVOICING_NAV_ITEMS = [
   { to: "/app/projects", label: "Projects" },
   { to: "/app/billable-items", label: "Billable items" },
   { to: "/app/expenses", label: "Expenses" },
+  { to: "/app/reports", label: "Reports" },
 ];
 // `updateInvoicingSettings` is owner-or-superuser in the API — hidden from an
 // agent as a convenience only, like `DELETED_NAV_ITEM`; the page itself also

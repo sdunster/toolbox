@@ -56,7 +56,7 @@ fn build_snapshot(gst_registered: bool, lines: Vec<InvoiceSnapshotLine>) -> Invo
         0
     };
     InvoiceSnapshot {
-        schema_version: 1,
+        schema_version: toolbox::invoicing::snapshot::SCHEMA_VERSION,
         title: if gst_registered {
             "Tax Invoice"
         } else {
@@ -75,6 +75,8 @@ fn build_snapshot(gst_registered: bool, lines: Vec<InvoiceSnapshotLine>) -> Invo
         gst_cents,
         total_cents: subtotal_cents + gst_cents,
         payment_details: Some(fictional_payment_details()),
+        due_date: Some("2026-09-02".into()),
+        credit_note: None,
         no_gst_note: !gst_registered,
     }
 }
@@ -87,6 +89,7 @@ fn simple_line(desc: &str, qty_hundredths: i64, price_cents: i64) -> InvoiceSnap
         quantity_hundredths: qty_hundredths,
         unit_price_cents: price_cents,
         amount_cents: money::line_amount_cents(qty_hundredths, price_cents),
+        gst_free: false,
     }
 }
 

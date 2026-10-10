@@ -21,6 +21,7 @@ const invoicingSettingsFormFragment = graphql`
       paymentDetails
       gstRegistered
       currency
+      paymentTermsDays
     }
   }
 `;
@@ -62,6 +63,9 @@ export function InvoicingSettingsForm({
     settings?.gstRegistered ?? false,
   );
   const [currency, setCurrency] = useState(settings?.currency ?? "AUD");
+  const [paymentTermsDays, setPaymentTermsDays] = useState(
+    String(settings?.paymentTermsDays ?? 14),
+  );
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
@@ -95,6 +99,10 @@ export function InvoicingSettingsForm({
           paymentDetails: paymentDetails.trim(),
           gstRegistered,
           currency: currency.trim().toUpperCase(),
+          paymentTermsDays:
+            paymentTermsDays.trim() === ""
+              ? null
+              : Number.parseInt(paymentTermsDays, 10),
         },
       },
       onCompleted: () => setSaved(true),
@@ -201,6 +209,23 @@ export function InvoicingSettingsForm({
           <p className="mt-1 text-xs text-ink-muted">
             A three-letter code, used in invoice column and total headings.
             Defaults to AUD.
+          </p>
+        </FormField>
+
+        <FormField label="Payment terms (days)" htmlFor="invoicing-terms">
+          <div className="w-24">
+            <TextInput
+              id="invoicing-terms"
+              type="number"
+              min={0}
+              max={365}
+              value={paymentTermsDays}
+              onChange={(e) => setPaymentTermsDays(e.target.value)}
+            />
+          </div>
+          <p className="mt-1 text-xs text-ink-muted">
+            An invoice is due this many days after it&apos;s issued, unless its
+            project says otherwise. Defaults to 14.
           </p>
         </FormField>
 

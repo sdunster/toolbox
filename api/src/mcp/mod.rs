@@ -142,8 +142,10 @@ const INSTRUCTIONS: &str = "Toolbox is a multi-tenant support-ticket and invoici
     and which instances (and kinds of instance) you can work in. Ticket tools apply to SUPPORT \
     instances only. `reply_to_ticket` and closing or reopening a ticket send email to the \
     customer and cannot be unsent; internal notes and assignment do not. Invoicing tools apply \
-    to INVOICING instances only and send no email, but `finalize_invoice` is irreversible: only \
-    call it when the user has explicitly asked to finalize that specific invoice.";
+    to INVOICING instances only. `send_invoice` and `send_credit_note` email the client and \
+    cannot be unsent; no other invoicing tool sends email. `finalize_invoice` and \
+    `issue_credit_note` are irreversible: only call them when the user has explicitly asked \
+    for that specific invoice or credit note.";
 
 // ── Tool registry ───────────────────────────────────────────────────────────
 

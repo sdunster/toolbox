@@ -84,6 +84,7 @@ describe("AddBillableItemForm", () => {
         description: "Site visit\n* measure up",
         quantity: "1.5",
         unitPriceCents: 120050,
+        gstFree: false,
       },
     });
     // The form resets for the next item but keeps the date just used.
@@ -146,6 +147,7 @@ function unbilledItem(id: string, description: string) {
     quantity: "1",
     unitPriceCents: 10000,
     amountCents: 10000,
+    gstFree: false,
     status: "UNBILLED",
     invoice: null,
     project: { __typename: "Project", id: "proj-1", name: "Website Redesign" },

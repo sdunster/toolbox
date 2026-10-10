@@ -524,12 +524,39 @@ fn build_left_column_rows(
 ) -> Vec<HeaderRow> {
     let mut rows = Vec::new();
     let issue_date = snap.issue_date.as_deref().unwrap_or("");
-    rows.push(Some((
-        format!("Invoice date: {}", format_ddmmyyyy(issue_date)),
-        false,
-    )));
     let number = snap.display_number.as_deref().unwrap_or("Draft");
-    rows.push(Some((format!("Invoice number: {number}"), false)));
+    match &snap.credit_note {
+        Some(info) => {
+            rows.push(Some((
+                format!("Date: {}", format_ddmmyyyy(issue_date)),
+                false,
+            )));
+            rows.push(Some((format!("Credit note number: {number}"), false)));
+            rows.push(Some((
+                format!(
+                    "Adjusts invoice {} of {}",
+                    info.invoice_display_number,
+                    format_ddmmyyyy(&info.invoice_issue_date)
+                ),
+                false,
+            )));
+            rows.push(None);
+            rows.push(Some(("Reason".to_string(), true)));
+            for line in wrap_text_lines(metrics, &info.reason, max_width, COLUMN_FONT_SIZE) {
+                rows.push(Some((line, false)));
+            }
+        }
+        None => {
+            rows.push(Some((
+                format!("Invoice date: {}", format_ddmmyyyy(issue_date)),
+                false,
+            )));
+            if let Some(due) = snap.due_date.as_deref() {
+                rows.push(Some((format!("Due date: {}", format_ddmmyyyy(due)), true)));
+            }
+            rows.push(Some((format!("Invoice number: {number}"), false)));
+        }
+    }
     rows.push(None);
     rows.push(Some(("Invoice to".to_string(), true)));
     for line in wrap_text_lines(metrics, &snap.bill_to.name, max_width, COLUMN_FONT_SIZE) {
@@ -727,12 +754,17 @@ fn draw_totals(
             &format!("GST (10%)   {}", money::format_cents(snap.gst_cents)),
         );
     }
+    let total_label = if snap.credit_note.is_some() {
+        "Total credit"
+    } else {
+        "Total"
+    };
     draw_line(
         layer,
         &mut y,
         true,
         &format!(
-            "Total {}   {}",
+            "{total_label} {}   {}",
             snap.currency,
             money::format_cents(snap.total_cents)
         ),
@@ -842,9 +874,15 @@ pub fn render_invoice_pdf(snapshot: &InvoiceSnapshot) -> Result<Vec<u8>> {
     y = draw_table_header(&layer, &ctx, &snapshot.currency, y);
 
     for line in &snapshot.lines {
+        // A GST-free line on a tax invoice says so under its description.
+        let description = if snapshot.gst_registered && line.gst_free {
+            format!("{}\n(GST-free)", line.description)
+        } else {
+            line.description.clone()
+        };
         let desc_lines = layout_description(
             &metrics,
-            &line.description,
+            &description,
             COL_DESC_X1 - COL_DESC_X0 - 2.0 * CELL_PAD,
         );
         let needed = row_height(desc_lines.len());
@@ -947,6 +985,7 @@ mod tests {
             quantity_hundredths: qty_hundredths,
             unit_price_cents: price_cents,
             amount_cents: money::line_amount_cents(qty_hundredths, price_cents),
+            gst_free: false,
         }
     }
 
@@ -980,6 +1019,8 @@ mod tests {
                 "Please make all payments to the below account details:\nBSB 000-000\nAcc 00000000"
                     .into(),
             ),
+            due_date: Some("2026-09-02".into()),
+            credit_note: None,
             no_gst_note: !gst_registered,
         }
     }
@@ -1313,5 +1354,23 @@ mod tests {
             .windows(needle.len())
             .filter(|w| *w == needle)
             .count()
+    }
+
+    #[test]
+    fn renders_a_credit_note_with_a_gst_free_line() {
+        let mut free = line("Permit fee", 100, 5_000);
+        free.gst_free = true;
+        let mut snap = base_snapshot(true, vec![line("Labour", 100, 10_000), free]);
+        snap.title = "Adjustment Note".into();
+        snap.display_number = Some("CN-001".into());
+        snap.due_date = None;
+        snap.payment_details = None;
+        snap.credit_note = Some(crate::invoicing::snapshot::CreditNoteSnapshotInfo {
+            invoice_display_number: "008".into(),
+            invoice_issue_date: "2026-08-19".into(),
+            reason: "Work not completed".into(),
+        });
+        let bytes = render_invoice_pdf(&snap).expect("renders");
+        assert!(bytes.starts_with(b"%PDF"));
     }
 }

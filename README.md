@@ -8,7 +8,8 @@ Anyone can also raise a ticket from the public web form after verifying their em
 A second, separate function — **invoicing** — lives in its own instances alongside support ones,
 sharing the same instance switcher and membership roles: track clients/projects, record billable
 items, turn them into invoices, and track expenses (including cents-per-km vehicle trips). Once finalized, an invoice is read-only and downloadable as a
-PDF, rendered server-side from its frozen content (see CLAUDE.md's "Invoicing" house rule).
+PDF, rendered server-side from its frozen content (see CLAUDE.md's "Invoicing" house rule); it can
+be emailed to the client, paid off in part or in full, and corrected only by a credit note.
 
 **Features:**
 - Inbound email → ticket, with reply threading via `+tag` addressing and `In-Reply-To`/`References`
@@ -19,7 +20,10 @@ PDF, rendered server-side from its frozen content (see CLAUDE.md's "Invoicing" h
 - Invoicing instances: clients/projects, billable items, invoices, and expenses — a second function
   alongside support, isolated from it but sharing the same login and instance switcher
 - Finalized invoices download as a PDF, rendered server-side and cached in S3 behind a presigned,
-  filename-forcing download link
+  filename-forcing download link, and can be emailed to the client with the PDF attached
+- Due dates from payment terms, partial payments, overdue tracking, and credit (adjustment) notes
+- GST/BAS figures (cash or accrual), aged receivables, per-project profit, and CSV exports for an
+  accountant; expenses can carry a receipt and be re-billed to a client
 - Runs on AWS Lambda + DynamoDB — scales to zero when idle
 
 **Stack:** Rust (GraphQL API, async-graphql) · React + Relay (frontend) · AWS (Lambda, DynamoDB,

@@ -262,6 +262,29 @@ const TABLES: &[Table] = &[
         ttl: None,
     },
     Table {
+        name: "credit_note",
+        hash: "id",
+        attrs: &[
+            Attr("id", S),
+            Attr("instance_id", S),
+            Attr("invoice_id", S),
+            Attr("created_at", N),
+        ],
+        gsis: &[
+            all(
+                "instance_id-created_at-index",
+                "instance_id",
+                Some("created_at"),
+            ),
+            all(
+                "invoice_id-created_at-index",
+                "invoice_id",
+                Some("created_at"),
+            ),
+        ],
+        ttl: None,
+    },
+    Table {
         name: "webauthn_credential",
         hash: "id",
         attrs: &[Attr("id", S), Attr("user_id", S)],

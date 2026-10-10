@@ -752,6 +752,72 @@ resource "aws_dynamodb_table" "invoice" {
   }
 }
 
+# ── credit_note ──────────────────────────────────────────────────────────────
+# An adjustment/credit note against one finalized invoice — see CLAUDE.md's
+# "Payments and credit notes" house rule. Issued in one TransactWriteItems with
+# an Update on its invoice (Put/Update items only — the existing
+# PutItem/UpdateItem grants cover it). Never updated afterwards except to
+# cache its PDF key and record a send; never deleted. `number` and `snapshot`
+# are reserved words, aliased in any expression that names them.
+
+resource "aws_dynamodb_table" "credit_note" {
+  name                        = "${var.db_prefix}_credit_note"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "id"
+  deletion_protection_enabled = true
+
+  point_in_time_recovery {
+    enabled                 = true
+    recovery_period_in_days = 35
+  }
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+  attribute {
+    name = "instance_id"
+    type = "S"
+  }
+  attribute {
+    name = "invoice_id"
+    type = "S"
+  }
+  attribute {
+    name = "created_at"
+    type = "N"
+  }
+
+  # The instance-wide list, and the GST report / CSV export (every credit
+  # note in the instance). ALL: every field is rendered or summed.
+  global_secondary_index {
+    name = "instance_id-created_at-index"
+    key_schema {
+      attribute_name = "instance_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "created_at"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+
+  # One invoice's credit notes — the invoice page.
+  global_secondary_index {
+    name = "invoice_id-created_at-index"
+    key_schema {
+      attribute_name = "invoice_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "created_at"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+}
+
 # ── webauthn_credential ──────────────────────────────────────────────────────
 
 resource "aws_dynamodb_table" "webauthn_credential" {

@@ -213,11 +213,11 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) 
     let project = db
         .create_project(
             &instance.id,
-            "Fictional Job",
-            "Fictional Client Pty Ltd",
-            None,
-            None,
-            None,
+            &db::ProjectFields {
+                name: "Fictional Job".into(),
+                client_name: "Fictional Client Pty Ltd".into(),
+                ..Default::default()
+            },
         )
         .await
         .expect("create_project");
@@ -540,11 +540,11 @@ async fn an_archived_project_takes_no_new_items() {
     db.update_project(
         &project_id,
         db::ProjectUpdateShape::Fields {
-            name: "Fictional Job",
-            client_name: "Fictional Client Pty Ltd",
-            client_abn: None,
-            client_address: None,
-            reference: None,
+            fields: &db::ProjectFields {
+                name: "Fictional Job".into(),
+                client_name: "Fictional Client Pty Ltd".into(),
+                ..Default::default()
+            },
             archived: true,
         },
     )
@@ -629,7 +629,14 @@ async fn pagination_across_pages_with_the_filter_applied() {
     let db = dynamodb::Handler::new(&prefix, false).await;
     let (instance_id, agent_id, project_id) = setup(&db, "paging").await;
     let other_project = db
-        .create_project(&instance_id, "Other Job", "Other Client", None, None, None)
+        .create_project(
+            &instance_id,
+            &db::ProjectFields {
+                name: "Other Job".into(),
+                client_name: "Other Client".into(),
+                ..Default::default()
+            },
+        )
         .await
         .expect("create_project");
     let schema = build_schema(db);

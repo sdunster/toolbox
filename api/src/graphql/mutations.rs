@@ -28,6 +28,7 @@ use crate::storage::Handler as _;
 
 use super::auth::{AuthGuard, AuthRequirement, is_member, is_owner};
 use super::error::ApiError;
+use super::finance::{CreditNote, CreditNoteInput, RecordPaymentInput, SendDocumentInput};
 use super::query::{
     ApiTokenInfo, BillableItem, BillableItemInput, CreateProjectInput, CreatedApiToken, Expense,
     ExpenseInput, InboundAddressInfo, Instance, InstanceKindType, Invoice, InvoicingSettingsInput,
@@ -508,15 +509,256 @@ struct ValidBillableItem {
     unit_price_cents: i64,
 }
 
-fn validate_billable_item_input(input: &BillableItemInput) -> Result<ValidBillableItem> {
+/// `unit_price_cents` is the price the caller resolved — the input's own,
+/// else the project's default (create) or the item's current one (update).
+fn validate_billable_item_input(
+    input: &BillableItemInput,
+    unit_price_cents: i64,
+) -> Result<ValidBillableItem> {
     Ok(ValidBillableItem {
         date: invoicing::validate_item_date(&input.date).map_err(|e| anyhow!(e))?,
         description: invoicing::validate_description(&input.description).map_err(|e| anyhow!(e))?,
         quantity_hundredths: invoicing::money::parse_quantity(&input.quantity)
             .map_err(|e| anyhow!(e))?,
-        unit_price_cents: invoicing::validate_unit_price_cents(input.unit_price_cents)
+        unit_price_cents: invoicing::validate_unit_price_cents(unit_price_cents)
             .map_err(|e| anyhow!(e))?,
     })
+}
+
+/// `createProject`/`updateProject`'s raw fields, before validation.
+struct ProjectFieldsInput<'a> {
+    name: &'a str,
+    client_name: &'a str,
+    client_abn: Option<&'a str>,
+    client_address: Option<&'a str>,
+    client_email: Option<&'a str>,
+    reference: Option<&'a str>,
+    payment_terms_days: Option<i32>,
+    default_unit_price_cents: Option<i64>,
+}
+
+/// Trim and validate every project field; blank optional strings become
+/// `None` (absent / `REMOVE`d).
+fn validate_project_fields(input: ProjectFieldsInput<'_>) -> Result<db::ProjectFields> {
+    let client_email =
+        normalize_project_field(input.client_email, "clientEmail", MAX_PROJECT_FIELD_LEN)?
+            .map(|e| db::normalize_user_email(&e).map_err(|e| anyhow!(e)))
+            .transpose()?;
+    Ok(db::ProjectFields {
+        name: require_project_name(input.name)?,
+        client_name: require_project_client_name(input.client_name)?,
+        client_abn: normalize_project_field(input.client_abn, "clientAbn", MAX_PROJECT_FIELD_LEN)?,
+        client_address: normalize_project_field(
+            input.client_address,
+            "clientAddress",
+            MAX_PROJECT_LONG_FIELD_LEN,
+        )?,
+        client_email,
+        reference: normalize_project_field(input.reference, "reference", MAX_PROJECT_FIELD_LEN)?,
+        payment_terms_days: input
+            .payment_terms_days
+            .map(invoicing::validate_payment_terms_days)
+            .transpose()
+            .map_err(|e| anyhow!(e))?,
+        default_unit_price_cents: input
+            .default_unit_price_cents
+            .map(invoicing::validate_unit_price_cents)
+            .transpose()
+            .map_err(|e| anyhow!(e))?,
+    })
+}
+
+/// Longest credit-note reason, in characters.
+const MAX_CREDIT_NOTE_REASON_LEN: usize = 500;
+
+/// Largest receipt `attachExpenseReceipt` accepts.
+const MAX_RECEIPT_BYTES: u64 = 20 * 1024 * 1024;
+
+/// A new payment row, stamped with who recorded it and when.
+fn new_payment(
+    date: &str,
+    amount_cents: i64,
+    note: Option<String>,
+    user_id: &str,
+) -> db::InvoicePayment {
+    db::InvoicePayment {
+        id: crate::dynamodb::new_id(),
+        date: date.to_string(),
+        amount_cents,
+        note,
+        recorded_by_user_id: user_id.to_string(),
+        recorded_at: crate::clock::now_sec(),
+    }
+}
+
+/// Write a finalized invoice's new `payments` list, recomputing `paid_date`
+/// (`invoicing::ledger::settled_date`) in the same conditional write, and
+/// return the updated invoice. An invoice that was already settled keeps
+/// its `paid_date` if it still is; one newly settled is dated by its latest
+/// payment. `CONFLICT` if it changed since `invoice` was read.
+async fn write_payments<A: App + HasDb + Send + Sync>(
+    app: &A,
+    invoice: db::Invoice,
+    payments: Vec<db::InvoicePayment>,
+) -> Result<Invoice<A>> {
+    let fallback = invoice.paid_date.clone().unwrap_or_default();
+    let paid_date = invoicing::ledger::settled_date(
+        invoice.total_cents.unwrap_or(0),
+        invoice.credited_cents,
+        &payments,
+        &fallback,
+    )
+    .map(|d| match &invoice.paid_date {
+        Some(existing) => existing.clone(),
+        None => d,
+    })
+    // Settled by credits alone with nothing to date it by.
+    .map(|d| {
+        if d.is_empty() {
+            invoicing::today_utc()
+        } else {
+            d
+        }
+    });
+    let committed = app
+        .db()
+        .set_invoice_payments(
+            &invoice.id,
+            invoice.version,
+            &payments,
+            paid_date.as_deref(),
+        )
+        .await?;
+    if !committed {
+        return Err(
+            ApiError::conflict("Invoice changed concurrently — reload and try again").into(),
+        );
+    }
+    Ok(Invoice::new(db::Invoice {
+        payments,
+        paid_date,
+        version: invoice.version + 1,
+        updated_at: crate::clock::now_sec(),
+        ..invoice
+    }))
+}
+
+/// Resolve `sendInvoice`/`sendCreditNote`'s recipients (an empty `to`
+/// means the project's client email) and covering message.
+fn resolve_send_input(
+    input: &SendDocumentInput,
+    client_email: Option<&str>,
+) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    let to = if input.to.is_empty() {
+        vec![
+            client_email
+                .ok_or_else(|| {
+                    anyhow!("This project has no client email — add one, or say who to send it to")
+                })?
+                .to_string(),
+        ]
+    } else {
+        input.to.clone()
+    };
+    let (to, cc) = invoicing::send::normalize_recipients(&to, &input.cc).map_err(|e| anyhow!(e))?;
+    let message =
+        invoicing::send::validate_message(input.message.as_deref()).map_err(|e| anyhow!(e))?;
+    Ok((to, cc, message))
+}
+
+/// A finalized invoice's frozen snapshot.
+fn invoice_snapshot(invoice: &db::Invoice) -> Result<invoicing::snapshot::InvoiceSnapshot> {
+    let json = invoice
+        .snapshot
+        .as_deref()
+        .ok_or_else(|| anyhow!("Finalized invoice {} is missing its snapshot", invoice.id))?;
+    serde_json::from_str(json)
+        .map_err(|e| anyhow!("Invoice {} has a corrupt snapshot: {e}", invoice.id))
+}
+
+fn credit_note_snapshot(note: &db::CreditNote) -> Result<invoicing::snapshot::InvoiceSnapshot> {
+    serde_json::from_str(&note.snapshot)
+        .map_err(|e| anyhow!("Credit note {} has a corrupt snapshot: {e}", note.id))
+}
+
+/// `Invoice-008.pdf`.
+fn invoice_pdf_filename(invoice: &db::Invoice) -> String {
+    let display_number = invoice
+        .number
+        .map(|n| format!("{n:03}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("Invoice-{display_number}.pdf")
+}
+
+/// `Credit-Note-CN-001.pdf`.
+fn credit_note_pdf_filename(note: &db::CreditNote) -> String {
+    format!("Credit-Note-{}.pdf", note.display_number())
+}
+
+/// A frozen document's PDF: the cached object at `cached_key` when there is
+/// one, else rendered from `snapshot` and stored at `new_key`. Returns the
+/// key and the bytes; the caller records a newly stored key on its row.
+async fn document_pdf<A: App + HasStorage + Send + Sync>(
+    app: &A,
+    cached_key: Option<&str>,
+    snapshot: &invoicing::snapshot::InvoiceSnapshot,
+    new_key: &str,
+) -> Result<(String, Vec<u8>)> {
+    if let Some(key) = cached_key {
+        return Ok((key.to_string(), app.storage().get_bytes(key).await?));
+    }
+    let bytes = invoicing::pdf::render_invoice_pdf(snapshot)?;
+    app.storage()
+        .put_bytes(new_key, &bytes, "application/pdf")
+        .await?;
+    Ok((new_key.to_string(), bytes))
+}
+
+/// The credit-note counterpart of [`require_invoice_member`]: `NOT_FOUND`
+/// for missing and not-yours alike; superusers get no access.
+async fn require_credit_note_member<A: App + HasDb + Send + Sync>(
+    ctx: &Context<'_>,
+    app: &A,
+    id: &str,
+) -> Result<db::CreditNote> {
+    let Some(AuthInfo::User { memberships, .. }) = ctx.data_opt::<AuthInfo>() else {
+        return Err(ApiError::forbidden("Must be authenticated as a user").into());
+    };
+    let note = app
+        .db()
+        .get_credit_note_consistent(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("CreditNote", id))?;
+    if !is_member(memberships, &note.instance_id) {
+        return Err(ApiError::not_found("CreditNote", id).into());
+    }
+    Ok(note)
+}
+
+/// What a re-billed expense's line says by default: the category and
+/// supplier (or a trip's distance), then its own description.
+fn rebill_description(expense: &db::Expense) -> String {
+    let head = match &expense.fields.detail {
+        db::ExpenseDetail::Purchase { supplier, .. } => {
+            format!("{}: {supplier}", expense.fields.category.label())
+        }
+        db::ExpenseDetail::VehicleKm {
+            distance_tenths_km, ..
+        } => format!(
+            "Vehicle travel: {} km",
+            invoicing::vehicle::format_distance_km(*distance_tenths_km)
+        ),
+    };
+    match expense.fields.description.as_deref() {
+        Some(d) if !d.is_empty() => format!("{head}\n{d}"),
+        _ => head,
+    }
+}
+
+/// `receipts/{instance_id}/{expense_id}/` — every receipt key for an
+/// expense starts with this, which is what `attachExpenseReceipt` checks.
+fn receipt_key_prefix(expense: &db::Expense) -> String {
+    format!("receipts/{}/{}/", expense.instance_id, expense.id)
 }
 
 /// Move every validated `pending/…` key in `keys` into
@@ -3286,6 +3528,11 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                 Some(trimmed.to_string())
             }
         };
+        let payment_terms_days = input
+            .payment_terms_days
+            .map(invoicing::validate_payment_terms_days)
+            .transpose()
+            .map_err(|e| anyhow!(e))?;
 
         self.app
             .db()
@@ -3300,6 +3547,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                     payment_details: payment_details.as_deref(),
                     gst_registered: input.gst_registered,
                     currency: currency.as_deref(),
+                    payment_terms_days,
                 },
             )
             .await?;
@@ -3313,6 +3561,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             payment_details,
             gst_registered: input.gst_registered,
             currency,
+            payment_terms_days,
             ..instance
         }))
     }
@@ -3341,35 +3590,20 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
             .map_err(|e| anyhow!(e))?;
 
-        let name = require_project_name(&input.name)?;
-        let client_name = require_project_client_name(&input.client_name)?;
-        let client_abn = normalize_project_field(
-            input.client_abn.as_deref(),
-            "clientAbn",
-            MAX_PROJECT_FIELD_LEN,
-        )?;
-        let client_address = normalize_project_field(
-            input.client_address.as_deref(),
-            "clientAddress",
-            MAX_PROJECT_LONG_FIELD_LEN,
-        )?;
-        let reference = normalize_project_field(
-            input.reference.as_deref(),
-            "reference",
-            MAX_PROJECT_FIELD_LEN,
-        )?;
-
+        let fields = validate_project_fields(ProjectFieldsInput {
+            name: &input.name,
+            client_name: &input.client_name,
+            client_abn: input.client_abn.as_deref(),
+            client_address: input.client_address.as_deref(),
+            client_email: input.client_email.as_deref(),
+            reference: input.reference.as_deref(),
+            payment_terms_days: input.payment_terms_days,
+            default_unit_price_cents: input.default_unit_price_cents,
+        })?;
         let created = self
             .app
             .db()
-            .create_project(
-                instance_id.as_str(),
-                &name,
-                &client_name,
-                client_abn.as_deref(),
-                client_address.as_deref(),
-                reference.as_deref(),
-            )
+            .create_project(instance_id.as_str(), &fields)
             .await?;
         Ok(Project::new(created))
     }
@@ -3387,46 +3621,36 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         input: UpdateProjectInput,
     ) -> Result<Project<A>> {
         let project = require_project_member(ctx, &*self.app, id.as_str()).await?;
-
-        let name = require_project_name(&input.name)?;
-        let client_name = require_project_client_name(&input.client_name)?;
-        let client_abn = normalize_project_field(
-            input.client_abn.as_deref(),
-            "clientAbn",
-            MAX_PROJECT_FIELD_LEN,
-        )?;
-        let client_address = normalize_project_field(
-            input.client_address.as_deref(),
-            "clientAddress",
-            MAX_PROJECT_LONG_FIELD_LEN,
-        )?;
-        let reference = normalize_project_field(
-            input.reference.as_deref(),
-            "reference",
-            MAX_PROJECT_FIELD_LEN,
-        )?;
-
+        let fields = validate_project_fields(ProjectFieldsInput {
+            name: &input.name,
+            client_name: &input.client_name,
+            client_abn: input.client_abn.as_deref(),
+            client_address: input.client_address.as_deref(),
+            client_email: input.client_email.as_deref(),
+            reference: input.reference.as_deref(),
+            payment_terms_days: input.payment_terms_days,
+            default_unit_price_cents: input.default_unit_price_cents,
+        })?;
         self.app
             .db()
             .update_project(
                 &project.id,
                 db::ProjectUpdateShape::Fields {
-                    name: &name,
-                    client_name: &client_name,
-                    client_abn: client_abn.as_deref(),
-                    client_address: client_address.as_deref(),
-                    reference: reference.as_deref(),
+                    fields: &fields,
                     archived: input.archived,
                 },
             )
             .await?;
 
         Ok(Project::new(db::Project {
-            name,
-            client_name,
-            client_abn,
-            client_address,
-            reference,
+            name: fields.name,
+            client_name: fields.client_name,
+            client_abn: fields.client_abn,
+            client_address: fields.client_address,
+            client_email: fields.client_email,
+            reference: fields.reference,
+            payment_terms_days: fields.payment_terms_days,
+            default_unit_price_cents: fields.default_unit_price_cents,
             archived: input.archived,
             updated_at: crate::clock::now_sec(),
             ..project
@@ -3456,19 +3680,24 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                 "Project is archived — un-archive it to add billable items"
             ));
         }
-        let fields = validate_billable_item_input(&input)?;
+        let unit_price_cents = input
+            .unit_price_cents
+            .or(project.default_unit_price_cents)
+            .ok_or_else(|| anyhow!("Unit price is required — this project has no default rate"))?;
+        let fields = validate_billable_item_input(&input, unit_price_cents)?;
         let created = self
             .app
             .db()
-            .create_billable_item(
-                &project.instance_id,
-                &project.id,
-                &fields.date,
-                &fields.description,
-                fields.quantity_hundredths,
-                fields.unit_price_cents,
-                user_id,
-            )
+            .create_billable_item(&db::NewBillableItem {
+                instance_id: &project.instance_id,
+                project_id: &project.id,
+                date: &fields.date,
+                description: &fields.description,
+                quantity_hundredths: fields.quantity_hundredths,
+                unit_price_cents: fields.unit_price_cents,
+                gst_free: input.gst_free,
+                created_by_user_id: user_id,
+            })
             .await?;
         Ok(BillableItem::new(created))
     }
@@ -3512,7 +3741,10 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         } else {
             None
         };
-        let fields = validate_billable_item_input(&input)?;
+        let fields = validate_billable_item_input(
+            &input,
+            input.unit_price_cents.unwrap_or(item.unit_price_cents),
+        )?;
         let written = self
             .app
             .db()
@@ -3524,6 +3756,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                     description: &fields.description,
                     quantity_hundredths: fields.quantity_hundredths,
                     unit_price_cents: fields.unit_price_cents,
+                    gst_free: input.gst_free,
                 },
             )
             .await?;
@@ -3542,6 +3775,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             description: fields.description,
             quantity_hundredths: fields.quantity_hundredths,
             unit_price_cents: fields.unit_price_cents,
+            gst_free: input.gst_free,
             updated_at: crate::clock::now_sec(),
             ..item
         };
@@ -3553,13 +3787,19 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
 
     /// Delete a billable item, returning its id (for the client's store).
     /// Unbilled only, regardless of the item's invoice's own status — see
-    /// CLAUDE.md's "Invoicing" house rule.
+    /// CLAUDE.md's "Invoicing" house rule. Deleting an item `rebillExpense`
+    /// made frees its expense to be re-billed again (same transaction).
     async fn delete_billable_item(&self, ctx: &Context<'_>, id: ID) -> Result<ID> {
         let item = require_billable_item_member(ctx, &*self.app, id.as_str()).await?;
         if item.invoice_id.is_some() {
             return Err(ApiError::conflict("Billable item is already on an invoice").into());
         }
-        if !self.app.db().delete_billable_item(&item.id).await? {
+        if !self
+            .app
+            .db()
+            .delete_billable_item(&item.id, item.source_expense_id.as_deref())
+            .await?
+        {
             return Err(ApiError::conflict(
                 "Billable item changed (deleted or put on an invoice) — reload and try again",
             )
@@ -3632,12 +3872,21 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         }))
     }
 
-    /// Delete an expense, returning its id. Expenses are never on an
-    /// invoice, so nothing else holds on to one.
+    /// Delete an expense, returning its id. Refused (`CONFLICT`) while it
+    /// is re-billed — delete the billable item `rebillExpense` made first.
     async fn delete_expense(&self, ctx: &Context<'_>, id: ID) -> Result<ID> {
         let expense = require_expense_member(ctx, &*self.app, id.as_str()).await?;
+        if expense.billable_item_id.is_some() {
+            return Err(ApiError::conflict(
+                "Expense has been re-billed — delete its billable item first",
+            )
+            .into());
+        }
         if !self.app.db().delete_expense(&expense.id).await? {
-            return Err(ApiError::not_found("Expense", id.as_str()).into());
+            return Err(ApiError::conflict(
+                "Expense changed (deleted or re-billed) — reload and try again",
+            )
+            .into());
         }
         Ok(ID(expense.id))
     }
@@ -3841,12 +4090,17 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
     /// so automatic numbering never runs into it. The guarantee against a
     /// duplicate is the number's reservation row, written in the same
     /// transaction as the finalize (`db::Handler::finalize_invoice`).
+    ///
+    /// `dueDate` (`YYYY-MM-DD`, on or after `issueDate`) defaults to
+    /// `issueDate` + the project's payment terms (else the instance's, else
+    /// 14 days); it is frozen onto the row and printed on the invoice.
     async fn finalize_invoice(
         &self,
         ctx: &Context<'_>,
         invoice_id: ID,
         issue_date: String,
         number: Option<i32>,
+        due_date: Option<String>,
     ) -> Result<Invoice<A>> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
         let Some(AuthInfo::User {
@@ -3929,6 +4183,15 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             return Err(anyhow!("Complete the invoicing settings first"));
         }
 
+        let due_date = match due_date.as_deref() {
+            Some(d) => invoicing::validate_item_date(d).map_err(|e| anyhow!(e))?,
+            None => invoicing::add_days(&issue_date, project.payment_terms_days(&instance))
+                .map_err(|e| anyhow!(e))?,
+        };
+        if due_date < issue_date {
+            return Err(anyhow!("The due date can't be before the issue date"));
+        }
+
         // Step 4: allocate the number — the counter's next, or the caller's
         // explicit choice.
         let number = match explicit_number {
@@ -3966,6 +4229,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             &resolved_items,
             Some(number),
             Some(&issue_date),
+            Some(&due_date),
         );
         invoicing::validate_total_within_safe_integer(snapshot.total_cents)
             .map_err(|e| anyhow!(e))?;
@@ -3983,11 +4247,15 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                 &invoice.instance_id,
                 &invoice.id,
                 invoice.version,
-                number,
-                &issue_date,
-                &snapshot_json,
-                snapshot.total_cents,
-                user_id,
+                &db::FinalizeInvoice {
+                    number,
+                    issue_date: &issue_date,
+                    due_date: &due_date,
+                    snapshot_json: &snapshot_json,
+                    total_cents: snapshot.total_cents,
+                    gst_cents: snapshot.gst_cents,
+                    finalized_by_user_id: user_id,
+                },
             )
             .await?;
         if !committed {
@@ -4011,8 +4279,10 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             version: invoice.version + 1,
             number: Some(number),
             issue_date: Some(issue_date),
+            due_date: Some(due_date),
             snapshot: Some(snapshot_json),
             total_cents: Some(snapshot.total_cents),
+            gst_cents: Some(snapshot.gst_cents),
             finalized_at: Some(now),
             finalized_by_user_id: Some(user_id.clone()),
             updated_at: now,
@@ -4020,10 +4290,11 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         }))
     }
 
-    /// Set (`paidDate` given) or clear (`null`) a finalized invoice's paid
-    /// status. Any member may call this — paid status is not printed on
-    /// the invoice and is not part of what finalization freezes. `CONFLICT`
-    /// on a draft, or if the invoice changed concurrently.
+    /// Mark a finalized invoice paid in full on `paidDate` — a shortcut for
+    /// `recordInvoicePayment` of its whole remaining balance — or, with
+    /// `null`, remove every payment recorded against it. `CONFLICT` on a
+    /// draft, when `paidDate` is given but nothing is owed, or if the
+    /// invoice changed concurrently.
     async fn set_invoice_paid(
         &self,
         ctx: &Context<'_>,
@@ -4031,26 +4302,157 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         paid_date: Option<String>,
     ) -> Result<Invoice<A>> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        let user_id = require_user_id(ctx)?;
         if invoice.status != db::InvoiceStatus::Finalized {
             return Err(ApiError::conflict("Only a finalized invoice can be marked paid").into());
         }
-        let validated = match &paid_date {
-            Some(d) => Some(invoicing::validate_item_date(d).map_err(|e| anyhow!(e))?),
-            None => None,
+        let payments = match &paid_date {
+            Some(d) => {
+                let date = invoicing::validate_item_date(d).map_err(|e| anyhow!(e))?;
+                let balance = invoice.balance_cents();
+                if balance <= 0 {
+                    return Err(ApiError::conflict("Invoice is already paid").into());
+                }
+                let mut payments = invoice.payments.clone();
+                payments.push(new_payment(&date, balance, None, &user_id));
+                payments
+            }
+            None => Vec::new(),
         };
-        let committed = self
+        write_payments(&*self.app, invoice, payments).await
+    }
+
+    /// Record a payment received against a finalized invoice: `amountCents`
+    /// (GST-inclusive, > 0, no more than the balance owing) on `date`. When
+    /// it settles the balance the invoice becomes PAID, dated by the latest
+    /// payment. `CONFLICT` on a draft, an already-settled invoice, or a
+    /// concurrent change.
+    async fn record_invoice_payment(
+        &self,
+        ctx: &Context<'_>,
+        invoice_id: ID,
+        input: RecordPaymentInput,
+    ) -> Result<Invoice<A>> {
+        let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        let user_id = require_user_id(ctx)?;
+        if invoice.status != db::InvoiceStatus::Finalized {
+            return Err(ApiError::conflict("Only a finalized invoice can take payments").into());
+        }
+        let date = invoicing::validate_item_date(&input.date).map_err(|e| anyhow!(e))?;
+        let note = invoicing::ledger::validate_payment_note(input.note.as_deref())
+            .map_err(|e| anyhow!(e))?;
+        let balance = invoice.balance_cents();
+        if balance <= 0 {
+            return Err(ApiError::conflict("Invoice is already paid").into());
+        }
+        if input.amount_cents <= 0 {
+            return Err(anyhow!("Amount must be greater than zero"));
+        }
+        if input.amount_cents > balance {
+            return Err(anyhow!(
+                "Amount is more than the {} still owing",
+                invoicing::money::format_cents(balance)
+            ));
+        }
+        if invoice.payments.len() >= invoicing::ledger::MAX_PAYMENTS_PER_INVOICE {
+            return Err(anyhow!(
+                "An invoice can have at most {} payments",
+                invoicing::ledger::MAX_PAYMENTS_PER_INVOICE
+            ));
+        }
+        let mut payments = invoice.payments.clone();
+        payments.push(new_payment(&date, input.amount_cents, note, &user_id));
+        write_payments(&*self.app, invoice, payments).await
+    }
+
+    /// Remove one recorded payment (a mistake, a bounced transfer). The
+    /// invoice goes back to UNPAID if that leaves anything owing.
+    /// `NOT_FOUND` for a payment id not on this invoice.
+    async fn delete_invoice_payment(
+        &self,
+        ctx: &Context<'_>,
+        invoice_id: ID,
+        payment_id: ID,
+    ) -> Result<Invoice<A>> {
+        let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        if !invoice.payments.iter().any(|p| p.id == payment_id.as_str()) {
+            return Err(ApiError::not_found("Payment", payment_id.as_str()).into());
+        }
+        let payments = invoice
+            .payments
+            .iter()
+            .filter(|p| p.id != payment_id.as_str())
+            .cloned()
+            .collect();
+        write_payments(&*self.app, invoice, payments).await
+    }
+
+    /// **Sends email.** Mail a finalized invoice to the client with its PDF
+    /// attached: to `input.to` (default: the project's client email) and
+    /// `input.cc`, at most 10 in total, with an optional covering
+    /// `message`. Sent from the system sender under the business name, with
+    /// `Reply-To` the business email — see `invoicing::send`. Sending is
+    /// this mutation's whole point, so a send failure fails it (nothing is
+    /// recorded); on success `sentAt`/`sentTo` are updated. Can be sent
+    /// again (a reminder). `CONFLICT` on a draft.
+    async fn send_invoice(
+        &self,
+        ctx: &Context<'_>,
+        invoice_id: ID,
+        #[graphql(default)] input: SendDocumentInput,
+    ) -> Result<Invoice<A>> {
+        let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        if invoice.status != db::InvoiceStatus::Finalized {
+            return Err(ApiError::conflict("Only a finalized invoice can be sent").into());
+        }
+        let project = self
             .app
             .db()
-            .set_invoice_paid(&invoice.id, validated.as_deref())
-            .await?;
-        if !committed {
-            return Err(
-                ApiError::conflict("Invoice changed concurrently — reload and try again").into(),
-            );
+            .get_projects(&[invoice.project_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Project", invoice.project_id.as_str()))?;
+        let (to, cc, message) = resolve_send_input(&input, project.client_email.as_deref())?;
+        let snapshot = invoice_snapshot(&invoice)?;
+        let filename = invoice_pdf_filename(&invoice);
+        let (key, bytes) = document_pdf(
+            &*self.app,
+            invoice.pdf_s3_key.as_deref(),
+            &snapshot,
+            &format!("invoices/{}/{}/{filename}", invoice.instance_id, invoice.id),
+        )
+        .await?;
+        if invoice.pdf_s3_key.is_none() {
+            self.app.db().set_invoice_pdf_key(&invoice.id, &key).await?;
         }
+        let built = invoicing::send::build(
+            &snapshot,
+            invoice.balance_cents(),
+            &bytes,
+            &filename,
+            &to,
+            &cc,
+            message.as_deref(),
+        )?;
+        self.app
+            .mail()
+            .send_raw(&built.raw, &built.to, &built.cc)
+            .await
+            .map_err(|e| anyhow!("Sending the invoice failed: {e}"))?;
+        let now = crate::clock::now_sec();
+        let mut sent_to = to.clone();
+        sent_to.extend(cc);
+        self.app
+            .db()
+            .set_invoice_sent(&invoice.id, now, &sent_to)
+            .await?;
+        info!(invoice_id = %invoice.id, "sent invoice");
         Ok(Invoice::new(db::Invoice {
-            paid_date: validated,
-            updated_at: crate::clock::now_sec(),
+            sent_at: Some(now),
+            sent_to,
+            pdf_s3_key: Some(key),
             ..invoice
         }))
     }
@@ -4063,60 +4465,469 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
     /// yet to render.
     ///
     /// This is a mutation, not a query, because the *first* call for a
-    /// given invoice writes: it parses the frozen `snapshot` (the only
-    /// input `invoicing::pdf::render_invoice_pdf` ever reads — never live
-    /// project/instance state, so a later settings/project edit can't
-    /// change what a downloaded PDF says), renders it, `put_bytes`s it to
-    /// `invoices/{instance_id}/{invoice_id}/Invoice-{displayNumber}.pdf`,
-    /// and caches that key on the invoice row
-    /// (`db::Handler::set_invoice_pdf_key`, conditioned on `status =
-    /// finalized`). Every later call for the same invoice just presigns
-    /// the cached key. Rendering is deterministic from the snapshot — same
-    /// content, same page count, same layout — so two callers racing this
-    /// on the same never-yet-downloaded invoice each render and write a
-    /// complete, correct PDF of the same invoice (see `invoicing::pdf`'s
-    /// doc comment for the one respect in which the *bytes* aren't
-    /// identical between the two: printpdf embeds a fresh random id in
-    /// each file's trailer). Never a real race to guard against with a
-    /// conditional write here — whichever write lands last is still the
-    /// right document.
+    /// given invoice writes: it renders the frozen `snapshot` (the only input
+    /// `invoicing::pdf::render_invoice_pdf` reads), stores it, and caches the
+    /// key on the row (`db::Handler::set_invoice_pdf_key`). Every later call
+    /// presigns the cached key. Rendering is deterministic from the snapshot,
+    /// so two callers racing the first render each store a correct PDF of
+    /// the same invoice — see `invoicing::pdf`'s doc comment.
     async fn download_invoice_pdf(&self, ctx: &Context<'_>, invoice_id: ID) -> Result<String> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
         if invoice.status != db::InvoiceStatus::Finalized {
             return Err(ApiError::conflict("Only a finalized invoice can be downloaded").into());
         }
-        let display_number = invoice
-            .number
-            .map(|n| format!("{n:03}"))
-            .unwrap_or_else(|| "unknown".to_string());
-        let filename = format!("Invoice-{display_number}.pdf");
-
+        let filename = invoice_pdf_filename(&invoice);
         let key = match invoice.pdf_s3_key.clone() {
             Some(key) => key,
             None => {
-                let snapshot_json = invoice.snapshot.as_deref().ok_or_else(|| {
-                    anyhow!("Finalized invoice {} is missing its snapshot", invoice.id)
-                })?;
-                let snapshot: invoicing::snapshot::InvoiceSnapshot =
-                    serde_json::from_str(snapshot_json).map_err(|e| {
-                        anyhow!("Invoice {} has a corrupt snapshot: {e}", invoice.id)
-                    })?;
-                let pdf_bytes = invoicing::pdf::render_invoice_pdf(&snapshot)?;
-                let key = format!("invoices/{}/{}/{filename}", invoice.instance_id, invoice.id);
-                self.app
-                    .storage()
-                    .put_bytes(&key, &pdf_bytes, "application/pdf")
-                    .await?;
+                let snapshot = invoice_snapshot(&invoice)?;
+                let (key, _) = document_pdf(
+                    &*self.app,
+                    None,
+                    &snapshot,
+                    &format!("invoices/{}/{}/{filename}", invoice.instance_id, invoice.id),
+                )
+                .await?;
                 self.app.db().set_invoice_pdf_key(&invoice.id, &key).await?;
                 key
             }
         };
-        let url = self
-            .app
+        self.app
             .storage()
             .presign_get_download(&key, &filename)
+            .await
+    }
+
+    /// **Irreversible.** Issue a credit note (an adjustment note, when the
+    /// invoice was a tax invoice) against a finalized invoice: numbered from
+    /// its own `CN-` sequence, frozen at once, and never editable or
+    /// deletable — the correction for a finalized invoice, which itself can
+    /// never change. `input.lines` are GST-exclusive amounts to credit;
+    /// omit them to credit the whole invoice (only while nothing has been
+    /// credited against it). The credit note's total (with GST, at the
+    /// invoice's own GST registration) can't exceed what's left
+    /// uncredited. The invoice's balance drops by that total, and if that
+    /// settles it, it becomes PAID as of the credit note's date. Any member;
+    /// sends no email (see `sendCreditNote`). `CONFLICT` on a draft or a
+    /// concurrent change.
+    async fn issue_credit_note(
+        &self,
+        ctx: &Context<'_>,
+        invoice_id: ID,
+        input: CreditNoteInput,
+    ) -> Result<CreditNote<A>> {
+        let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        let user_id = require_user_id(ctx)?;
+        if invoice.status != db::InvoiceStatus::Finalized {
+            return Err(
+                ApiError::conflict("A credit note can only adjust a finalized invoice").into(),
+            );
+        }
+        let issue_date =
+            invoicing::validate_item_date(&input.issue_date).map_err(|e| anyhow!(e))?;
+        if invoice
+            .issue_date
+            .as_deref()
+            .is_some_and(|d| issue_date.as_str() < d)
+        {
+            return Err(anyhow!(
+                "A credit note can't be dated before the invoice it adjusts"
+            ));
+        }
+        let reason = input.reason.trim().to_string();
+        if reason.is_empty() {
+            return Err(anyhow!("Give a reason for the credit note"));
+        }
+        if reason.chars().count() > MAX_CREDIT_NOTE_REASON_LEN {
+            return Err(anyhow!(
+                "Reason cannot be longer than {MAX_CREDIT_NOTE_REASON_LEN} characters"
+            ));
+        }
+        let invoice_snap = invoice_snapshot(&invoice)?;
+        let lines = match &input.lines {
+            None => {
+                if invoice.credited_cents > 0 {
+                    return Err(anyhow!(
+                        "This invoice already has a credit note — list the lines to credit"
+                    ));
+                }
+                invoicing::snapshot::full_credit_lines(&invoice_snap)
+            }
+            Some(lines) => {
+                if lines.is_empty() || lines.len() > MAX_INVOICE_ITEMS {
+                    return Err(anyhow!(
+                        "A credit note needs between 1 and {MAX_INVOICE_ITEMS} lines"
+                    ));
+                }
+                lines
+                    .iter()
+                    .map(|l| {
+                        if l.amount_cents <= 0 {
+                            return Err(anyhow!("Each line's amount must be greater than zero"));
+                        }
+                        invoicing::validate_unit_price_cents(l.amount_cents)
+                            .map_err(|e| anyhow!(e))?;
+                        Ok(invoicing::snapshot::CreditLine {
+                            description: invoicing::validate_description(&l.description)
+                                .map_err(|e| anyhow!(e))?,
+                            amount_cents: l.amount_cents,
+                            gst_free: l.gst_free,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        // Check the total against what's left before spending a number on it.
+        let trial = invoicing::snapshot::build_credit_note_snapshot(
+            &invoice_snap,
+            0,
+            &issue_date,
+            &reason,
+            &lines,
+        );
+        let creditable = invoice.total_cents.unwrap_or(0) - invoice.credited_cents;
+        if trial.total_cents > creditable {
+            return Err(anyhow!(
+                "That credits {} but only {} of this invoice is left to credit",
+                invoicing::money::format_cents(trial.total_cents),
+                invoicing::money::format_cents(creditable.max(0))
+            ));
+        }
+
+        let number = self
+            .app
+            .db()
+            .increment_credit_note_counter(&invoice.instance_id)
             .await?;
-        Ok(url)
+        let number = u32::try_from(number).unwrap_or(u32::MAX);
+        let snapshot = invoicing::snapshot::build_credit_note_snapshot(
+            &invoice_snap,
+            number,
+            &issue_date,
+            &reason,
+            &lines,
+        );
+        let note = db::CreditNote {
+            id: crate::dynamodb::new_id(),
+            instance_id: invoice.instance_id.clone(),
+            invoice_id: invoice.id.clone(),
+            project_id: invoice.project_id.clone(),
+            number,
+            issue_date: issue_date.clone(),
+            reason,
+            snapshot: serde_json::to_string(&snapshot)
+                .map_err(|e| anyhow!("Failed to serialize credit note snapshot: {e}"))?,
+            subtotal_cents: snapshot.subtotal_cents,
+            gst_cents: snapshot.gst_cents,
+            total_cents: snapshot.total_cents,
+            created_by_user_id: user_id,
+            created_at: crate::clock::now_sec(),
+            pdf_s3_key: None,
+            sent_at: None,
+            sent_to: Vec::new(),
+        };
+        let settled = if invoice.paid_date.is_none() {
+            invoicing::ledger::settled_date(
+                invoice.total_cents.unwrap_or(0),
+                invoice.credited_cents + note.total_cents,
+                &invoice.payments,
+                &issue_date,
+            )
+        } else {
+            None
+        };
+        let committed = self
+            .app
+            .db()
+            .create_credit_note(&note, invoice.version, settled.as_deref())
+            .await?;
+        if !committed {
+            // The number is now a gap, never a duplicate — like an invoice
+            // number lost to a failed finalize.
+            return Err(
+                ApiError::conflict("Invoice changed concurrently — reload and try again").into(),
+            );
+        }
+        Ok(CreditNote::new(note))
+    }
+
+    /// Download a credit note's PDF — `downloadInvoicePdf`'s twin: rendered
+    /// from the frozen snapshot on first call, cached after.
+    async fn download_credit_note_pdf(
+        &self,
+        ctx: &Context<'_>,
+        credit_note_id: ID,
+    ) -> Result<String> {
+        let note = require_credit_note_member(ctx, &*self.app, credit_note_id.as_str()).await?;
+        let filename = credit_note_pdf_filename(&note);
+        let key = match note.pdf_s3_key.clone() {
+            Some(key) => key,
+            None => {
+                let snapshot = credit_note_snapshot(&note)?;
+                let (key, _) = document_pdf(
+                    &*self.app,
+                    None,
+                    &snapshot,
+                    &format!("credit-notes/{}/{}/{filename}", note.instance_id, note.id),
+                )
+                .await?;
+                self.app
+                    .db()
+                    .set_credit_note_pdf_key(&note.id, &key)
+                    .await?;
+                key
+            }
+        };
+        self.app
+            .storage()
+            .presign_get_download(&key, &filename)
+            .await
+    }
+
+    /// **Sends email.** `sendInvoice` for a credit note: mails it with its
+    /// PDF to `input.to` (default: the project's client email) and `cc`.
+    async fn send_credit_note(
+        &self,
+        ctx: &Context<'_>,
+        credit_note_id: ID,
+        #[graphql(default)] input: SendDocumentInput,
+    ) -> Result<CreditNote<A>> {
+        let note = require_credit_note_member(ctx, &*self.app, credit_note_id.as_str()).await?;
+        let project = self
+            .app
+            .db()
+            .get_projects(&[note.project_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Project", note.project_id.as_str()))?;
+        let (to, cc, message) = resolve_send_input(&input, project.client_email.as_deref())?;
+        let snapshot = credit_note_snapshot(&note)?;
+        let filename = credit_note_pdf_filename(&note);
+        let (key, bytes) = document_pdf(
+            &*self.app,
+            note.pdf_s3_key.as_deref(),
+            &snapshot,
+            &format!("credit-notes/{}/{}/{filename}", note.instance_id, note.id),
+        )
+        .await?;
+        if note.pdf_s3_key.is_none() {
+            self.app
+                .db()
+                .set_credit_note_pdf_key(&note.id, &key)
+                .await?;
+        }
+        let built = invoicing::send::build(
+            &snapshot,
+            0,
+            &bytes,
+            &filename,
+            &to,
+            &cc,
+            message.as_deref(),
+        )?;
+        self.app
+            .mail()
+            .send_raw(&built.raw, &built.to, &built.cc)
+            .await
+            .map_err(|e| anyhow!("Sending the credit note failed: {e}"))?;
+        let now = crate::clock::now_sec();
+        let mut sent_to = to.clone();
+        sent_to.extend(cc);
+        self.app
+            .db()
+            .set_credit_note_sent(&note.id, now, &sent_to)
+            .await?;
+        Ok(CreditNote::new(db::CreditNote {
+            sent_at: Some(now),
+            sent_to,
+            pdf_s3_key: Some(key),
+            ..note
+        }))
+    }
+
+    /// Re-bill an expense to its project's client: create an UNBILLED
+    /// billable item for its GST-exclusive cost plus `markupPercent`
+    /// (default 0, at most 1000, 2 dp), dated like the expense, linked to it
+    /// so it can't be billed twice. `description` defaults to the
+    /// expense's category and supplier. `gstFree` (default `false`) marks
+    /// the new line GST-free. Refused for an expense with no project, on an
+    /// archived project, or already re-billed (`CONFLICT`). Deleting the
+    /// item frees the expense to be re-billed again.
+    async fn rebill_expense(
+        &self,
+        ctx: &Context<'_>,
+        expense_id: ID,
+        markup_percent: Option<String>,
+        description: Option<String>,
+        #[graphql(default)] gst_free: bool,
+    ) -> Result<BillableItem<A>> {
+        let expense = require_expense_member(ctx, &*self.app, expense_id.as_str()).await?;
+        let user_id = require_user_id(ctx)?;
+        if expense.billable_item_id.is_some() {
+            return Err(ApiError::conflict("Expense has already been re-billed").into());
+        }
+        let project_id = expense
+            .fields
+            .project_id
+            .clone()
+            .ok_or_else(|| anyhow!("Put the expense on a project before re-billing it"))?;
+        let project = self
+            .app
+            .db()
+            .get_projects(&[project_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Project", project_id.as_str()))?;
+        if project.archived {
+            return Err(anyhow!(
+                "Project is archived — un-archive it to add billable items"
+            ));
+        }
+        let markup = invoicing::parse_markup_basis_points(markup_percent.as_deref().unwrap_or(""))
+            .map_err(|e| anyhow!(e))?;
+        let unit_price_cents =
+            invoicing::rebill_unit_price_cents(expense.amount_ex_gst_cents(), markup);
+        invoicing::validate_unit_price_cents(unit_price_cents).map_err(|e| anyhow!(e))?;
+        let description = match description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+        {
+            Some(d) => d.to_string(),
+            None => rebill_description(&expense),
+        };
+        let description = invoicing::validate_description(&description).map_err(|e| anyhow!(e))?;
+        let created = self
+            .app
+            .db()
+            .rebill_expense(
+                &expense.id,
+                &db::NewBillableItem {
+                    instance_id: &expense.instance_id,
+                    project_id: &project.id,
+                    date: &expense.fields.date,
+                    description: &description,
+                    quantity_hundredths: 100,
+                    unit_price_cents,
+                    gst_free,
+                    created_by_user_id: &user_id,
+                },
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::conflict("Expense changed (deleted or re-billed) — reload and try again")
+            })?;
+        Ok(BillableItem::new(created))
+    }
+
+    /// Mint a presigned PUT for an expense's receipt, at
+    /// `receipts/{instanceId}/{expenseId}/{random}/{filename}`. Upload the
+    /// file there, then call `attachExpenseReceipt` with the returned key.
+    async fn create_expense_receipt_upload(
+        &self,
+        ctx: &Context<'_>,
+        expense_id: ID,
+        filename: String,
+        content_type: String,
+    ) -> Result<AttachmentUpload> {
+        let expense = require_expense_member(ctx, &*self.app, expense_id.as_str()).await?;
+        let safe_name = attachments::sanitize_filename(Some(&filename), 0);
+        let key = format!(
+            "{}{}/{safe_name}",
+            receipt_key_prefix(&expense),
+            crate::dynamodb::new_id()
+        );
+        let upload_url = self.app.storage().presign_put(&key, &content_type).await?;
+        Ok(AttachmentUpload { key, upload_url })
+    }
+
+    /// Attach an uploaded receipt (a key from `createExpenseReceiptUpload`
+    /// for this same expense) to the expense, replacing any earlier one.
+    /// Refused for a key belonging to another expense, a file that wasn't
+    /// uploaded, or one over 20 MB.
+    async fn attach_expense_receipt(
+        &self,
+        ctx: &Context<'_>,
+        expense_id: ID,
+        key: String,
+        content_type: String,
+    ) -> Result<Expense<A>> {
+        let expense = require_expense_member(ctx, &*self.app, expense_id.as_str()).await?;
+        let prefix = receipt_key_prefix(&expense);
+        let filename = key
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, name)| name)
+            .filter(|name| !name.is_empty() && !name.contains('/'))
+            .ok_or_else(|| ApiError::forbidden("That upload doesn't belong to this expense"))?
+            .to_string();
+        let size = self
+            .app
+            .storage()
+            .object_size(&key)
+            .await
+            .map_err(|_| anyhow!("The receipt hasn't finished uploading"))?;
+        if size > MAX_RECEIPT_BYTES {
+            return Err(anyhow!("A receipt can be at most 20 MB"));
+        }
+        let content_type = match content_type.trim() {
+            "" => "application/octet-stream".to_string(),
+            t => t.chars().take(100).collect(),
+        };
+        let receipt = db::ExpenseReceipt {
+            s3_key: key,
+            filename,
+            content_type,
+            size,
+        };
+        if !self
+            .app
+            .db()
+            .set_expense_receipt(&expense.id, Some(&receipt))
+            .await?
+        {
+            return Err(ApiError::not_found("Expense", expense_id.as_str()).into());
+        }
+        Ok(Expense::new(db::Expense {
+            receipt: Some(receipt),
+            updated_at: crate::clock::now_sec(),
+            ..expense
+        }))
+    }
+
+    /// Detach an expense's receipt.
+    async fn remove_expense_receipt(
+        &self,
+        ctx: &Context<'_>,
+        expense_id: ID,
+    ) -> Result<Expense<A>> {
+        let expense = require_expense_member(ctx, &*self.app, expense_id.as_str()).await?;
+        if !self.app.db().set_expense_receipt(&expense.id, None).await? {
+            return Err(ApiError::not_found("Expense", expense_id.as_str()).into());
+        }
+        Ok(Expense::new(db::Expense {
+            receipt: None,
+            updated_at: crate::clock::now_sec(),
+            ..expense
+        }))
+    }
+
+    /// A presigned download URL for an expense's receipt. `NOT_FOUND` when
+    /// it has none.
+    async fn download_expense_receipt(&self, ctx: &Context<'_>, expense_id: ID) -> Result<String> {
+        let expense = require_expense_member(ctx, &*self.app, expense_id.as_str()).await?;
+        let receipt = expense
+            .receipt
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("Receipt", expense_id.as_str()))?;
+        self.app
+            .storage()
+            .presign_get_download(&receipt.s3_key, &receipt.filename)
+            .await
     }
 
     /// Owner-or-superuser: set the next invoice number to be assigned by

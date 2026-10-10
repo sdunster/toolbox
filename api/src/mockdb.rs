@@ -273,11 +273,7 @@ impl db::Handler for Handler {
     async fn create_project(
         &self,
         _instance_id: &str,
-        _name: &str,
-        _client_name: &str,
-        _client_abn: Option<&str>,
-        _client_address: Option<&str>,
-        _reference: Option<&str>,
+        _fields: &db::ProjectFields,
     ) -> db::Result<db::Project> {
         Self::unsupported()
     }
@@ -305,14 +301,16 @@ impl db::Handler for Handler {
 
     async fn create_billable_item(
         &self,
-        _instance_id: &str,
-        _project_id: &str,
-        _date: &str,
-        _description: &str,
-        _quantity_hundredths: i64,
-        _unit_price_cents: i64,
-        _created_by_user_id: &str,
+        _item: &db::NewBillableItem<'_>,
     ) -> db::Result<db::BillableItem> {
+        Self::unsupported()
+    }
+
+    async fn rebill_expense(
+        &self,
+        _expense_id: &str,
+        _item: &db::NewBillableItem<'_>,
+    ) -> db::Result<Option<db::BillableItem>> {
         Self::unsupported()
     }
 
@@ -332,7 +330,11 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
-    async fn delete_billable_item(&self, _id: &str) -> db::Result<bool> {
+    async fn delete_billable_item(
+        &self,
+        _id: &str,
+        _source_expense_id: Option<&str>,
+    ) -> db::Result<bool> {
         Self::unsupported()
     }
 
@@ -375,6 +377,30 @@ impl db::Handler for Handler {
     }
 
     async fn delete_expense(&self, _id: &str) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn set_expense_receipt(
+        &self,
+        _id: &str,
+        _receipt: Option<&db::ExpenseReceipt>,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn list_expenses_in_range(
+        &self,
+        _instance_id: &str,
+        _from: &str,
+        _to: &str,
+    ) -> db::Result<Vec<db::Expense>> {
+        Self::unsupported()
+    }
+
+    async fn list_all_expenses_by_project(
+        &self,
+        _project_id: &str,
+    ) -> db::Result<Vec<db::Expense>> {
         Self::unsupported()
     }
 
@@ -453,20 +479,34 @@ impl db::Handler for Handler {
         _instance_id: &str,
         _invoice_id: &str,
         _expected_version: u64,
-        _number: u32,
-        _issue_date: &str,
-        _snapshot_json: &str,
-        _total_cents: i64,
-        _finalized_by_user_id: &str,
+        _finalized: &db::FinalizeInvoice<'_>,
     ) -> db::Result<bool> {
         Self::unsupported()
     }
 
-    async fn set_invoice_paid(
+    async fn set_invoice_payments(
         &self,
         _invoice_id: &str,
+        _expected_version: u64,
+        _payments: &[db::InvoicePayment],
         _paid_date: Option<&str>,
     ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn set_invoice_sent(
+        &self,
+        _invoice_id: &str,
+        _sent_at: u64,
+        _to: &[String],
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn list_all_finalized_invoices(
+        &self,
+        _scope: db::InvoiceScope<'_>,
+    ) -> db::Result<Vec<db::Invoice>> {
         Self::unsupported()
     }
 
@@ -500,6 +540,60 @@ impl db::Handler for Handler {
         _filter: db::InvoiceListFilter,
         _page: db::ListInvoicesPage,
     ) -> db::Result<Vec<db::Invoice>> {
+        Self::unsupported()
+    }
+
+    // ── credit_note ───────────────────────────────────────────────────────
+
+    async fn create_credit_note(
+        &self,
+        _note: &db::CreditNote,
+        _invoice_expected_version: u64,
+        _settled_date: Option<&str>,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn get_credit_notes<T: AsRef<str> + Sync>(
+        &self,
+        _ids: &[T],
+    ) -> db::Result<Vec<Option<db::CreditNote>>> {
+        Self::unsupported()
+    }
+
+    async fn get_credit_note_consistent(&self, _id: &str) -> db::Result<Option<db::CreditNote>> {
+        Self::unsupported()
+    }
+
+    async fn list_credit_notes(
+        &self,
+        _scope: db::CreditNoteScope<'_>,
+        _page: db::ListCreditNotesPage,
+    ) -> db::Result<Vec<db::CreditNote>> {
+        Self::unsupported()
+    }
+
+    async fn list_all_credit_notes(
+        &self,
+        _scope: db::CreditNoteScope<'_>,
+    ) -> db::Result<Vec<db::CreditNote>> {
+        Self::unsupported()
+    }
+
+    async fn increment_credit_note_counter(&self, _instance_id: &str) -> db::Result<u64> {
+        Self::unsupported()
+    }
+
+    async fn set_credit_note_pdf_key(&self, _id: &str, _key: &str) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn set_credit_note_sent(
+        &self,
+        _id: &str,
+        _sent_at: u64,
+        _to: &[String],
+    ) -> db::Result<bool> {
         Self::unsupported()
     }
 

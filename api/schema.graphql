@@ -70,6 +70,14 @@ type BillableItem {
 	"""
 	amountCents: Int!
 	"""
+	No GST is charged on this line.
+	"""
+	gstFree: Boolean!
+	"""
+	The expense this item re-bills, when `rebillExpense` made it.
+	"""
+	sourceExpense: Expense
+	"""
 	`UNBILLED` when not on an invoice; otherwise `DRAFT`/`INVOICED`
 	according to that invoice's own status, dataloaded — a page of items
 	resolves this once per node, same as [`Self::project`]. Falls back to
@@ -138,12 +146,18 @@ of editable fields for both (update is a full replace).
 (`"2"`, `"1.5"`, `"0.25"`) — a string so no client float ever gets
 near it; the server is the one parser (`invoicing::money::parse_quantity`).
 - `unitPriceCents`: integer cents, GST-exclusive, `0 ≤ p ≤ 1,000,000,000`.
+Optional: omitted, a new item takes its project's
+`defaultUnitPriceCents` (an error if the project has none), and an
+update keeps the item's current price.
+- `gstFree`: no GST on this line even when the instance is
+GST-registered (e.g. a re-billed GST-free cost). Defaults to `false`.
 """
 input BillableItemInput {
 	date: String!
 	description: String!
 	quantity: String!
-	unitPriceCents: Int!
+	unitPriceCents: Int
+	gstFree: Boolean! = false
 }
 
 """
@@ -161,18 +175,136 @@ enum BillableItemStatusType {
 
 """
 `createProject`'s argument.
+
+- `clientEmail`: where `sendInvoice` mails by default.
+- `paymentTermsDays`: `0..=365`, overriding the instance's terms for
+this project's invoices; `null` uses the instance's.
+- `defaultUnitPriceCents`: the GST-exclusive rate a new billable item on
+this project gets when it doesn't name one.
 """
 input CreateProjectInput {
 	name: String!
 	clientName: String!
 	clientAbn: String
 	clientAddress: String
+	clientEmail: String
 	reference: String
+	paymentTermsDays: Int
+	defaultUnitPriceCents: Int
 }
 
 type CreatedApiToken {
 	token: String!
 	apiToken: ApiTokenInfo!
+}
+
+type CreditNote {
+	id: ID!
+	number: Int!
+	"""
+	`CN-001`.
+	"""
+	displayNumber: String!
+	"""
+	`YYYY-MM-DD`.
+	"""
+	issueDate: String!
+	reason: String!
+	"""
+	The invoice this credit note adjusts. A strongly consistent read,
+	not the dataloader: `issueCreditNote` returns this field in the same
+	response that just changed the invoice's balance.
+	"""
+	invoice: Invoice!
+	project: Project!
+	"""
+	"Adjustment Note" or "Credit Note".
+	"""
+	title: String!
+	billTo: InvoiceBillToInfo!
+	seller: InvoiceSellerInfo!
+	lines: [InvoiceLineInfo!]!
+	subtotalCents: Int!
+	gstCents: Int!
+	"""
+	GST-inclusive — what this takes off the invoice's balance.
+	"""
+	totalCents: Int!
+	currency: String!
+	gstRegistered: Boolean!
+	createdAt: Int!
+	"""
+	When `sendCreditNote` last mailed it; `null` if never.
+	"""
+	sentAt: Int
+	sentTo: [String!]!
+}
+
+type CreditNoteConnection {
+	"""
+	Information to aid in pagination.
+	"""
+	pageInfo: PageInfo!
+	"""
+	A list of edges.
+	"""
+	edges: [CreditNoteEdge!]!
+	"""
+	A list of nodes.
+	"""
+	nodes: [CreditNote!]!
+}
+
+"""
+An edge in a connection.
+"""
+type CreditNoteEdge {
+	"""
+	The item at the end of the edge
+	"""
+	node: CreditNote!
+	"""
+	A cursor for use in pagination
+	"""
+	cursor: String!
+}
+
+"""
+`issueCreditNote`'s argument. Omit `lines` to credit the whole invoice
+(only allowed when nothing has been credited against it yet).
+"""
+input CreditNoteInput {
+	"""
+	`YYYY-MM-DD`; on or after the invoice's issue date.
+	"""
+	issueDate: String!
+	"""
+	Why — printed on the credit note. Required.
+	"""
+	reason: String!
+	lines: [CreditNoteLineInput!]
+}
+
+"""
+One line of a credit note: a GST-exclusive amount being credited.
+"""
+input CreditNoteLineInput {
+	description: String!
+	"""
+	GST-exclusive cents, > 0.
+	"""
+	amountCents: Int!
+	gstFree: Boolean! = false
+}
+
+"""
+`invoicingExport`'s kind.
+"""
+enum CsvExportType {
+	INVOICES
+	CREDIT_NOTES
+	PAYMENTS
+	EXPENSES
 }
 
 type Expense {
@@ -215,6 +347,16 @@ type Expense {
 	`null` for a purchase.
 	"""
 	rateCentsPerKm: Int
+	"""
+	The billable item `rebillExpense` made from this expense, if any.
+	An expense that has been re-billed can't be deleted.
+	"""
+	rebilledItem: BillableItem
+	"""
+	The uploaded receipt, if any — download it with
+	`downloadExpenseReceipt`.
+	"""
+	receipt: ExpenseReceiptInfo
 	"""
 	Dataloaded — see [`TicketMessage::author`]'s doc comment.
 	"""
@@ -304,6 +446,59 @@ input ExpenseInput {
 	amountCents: Int
 	gstCents: Int
 	distanceKm: String
+}
+
+"""
+An expense's uploaded receipt. Download it with
+`downloadExpenseReceipt`.
+"""
+type ExpenseReceiptInfo {
+	filename: String!
+	contentType: String!
+	size: Int!
+}
+
+"""
+`gstReport`: the BAS figures for a period.
+"""
+type GstReport {
+	"""
+	`YYYY-MM-DD`, inclusive.
+	"""
+	from: String!
+	to: String!
+	basis: ReportBasisType!
+	"""
+	Whether the instance is set as GST-registered *now* — a non-registered
+	business has no BAS GST to report, though the sales figures still
+	stand.
+	"""
+	gstRegistered: Boolean!
+	currency: String!
+	"""
+	G1: total sales, GST-inclusive, net of credit notes.
+	"""
+	salesCents: Int!
+	"""
+	1A: GST on sales.
+	"""
+	gstOnSalesCents: Int!
+	"""
+	Every expense in the period, GST-inclusive.
+	"""
+	purchasesCents: Int!
+	"""
+	1B: GST on purchases.
+	"""
+	gstOnPurchasesCents: Int!
+	"""
+	1A − 1B: positive is GST payable, negative a refund.
+	"""
+	netGstCents: Int!
+	invoiceCount: Int!
+	creditNoteCount: Int!
+	paymentCount: Int!
+	expenseCount: Int!
 }
 
 """
@@ -404,9 +599,49 @@ type Invoice {
 	"""
 	issueDate: String
 	"""
-	`YYYY-MM-DD`; `null` means unpaid. Never printed on the invoice.
+	`YYYY-MM-DD`: when the invoice was settled — paid in full, or
+	paid and credited down to nothing. `null` while anything is owed.
+	Never printed on the invoice.
 	"""
 	paidDate: String
+	"""
+	`YYYY-MM-DD`; `null` for a draft. Frozen at finalization.
+	"""
+	dueDate: String
+	"""
+	Unpaid and past its due date, by today's UTC date.
+	"""
+	overdue: Boolean!
+	"""
+	Whole days past due (by today's UTC date) while unpaid; `null` when
+	it isn't overdue.
+	"""
+	daysOverdue: Int
+	"""
+	Payments recorded against it, oldest first.
+	"""
+	payments: [InvoicePaymentInfo!]!
+	paidCents: Int!
+	"""
+	Sum of its credit notes, GST-inclusive.
+	"""
+	creditedCents: Int!
+	"""
+	Total − credited − paid. Negative when overpaid. `0` for a draft.
+	"""
+	balanceCents: Int!
+	"""
+	Credit notes issued against it, newest (highest number) first.
+	"""
+	creditNotes: [CreditNote!]!
+	"""
+	When `sendInvoice` last mailed it (Unix seconds); `null` if never.
+	"""
+	sentAt: Int
+	"""
+	Who it was last mailed to.
+	"""
+	sentTo: [String!]!
 	"""
 	Dataloaded — see `TicketMessage::author`'s doc comment.
 	"""
@@ -489,6 +724,10 @@ enum InvoiceFilterType {
 	DRAFT
 	UNPAID
 	PAID
+	"""
+	Unpaid and past its due date (by today's UTC date).
+	"""
+	OVERDUE
 }
 
 """
@@ -500,6 +739,30 @@ type InvoiceLineInfo {
 	quantity: String!
 	unitPriceCents: Int!
 	amountCents: Int!
+	"""
+	No GST on this line.
+	"""
+	gstFree: Boolean!
+}
+
+"""
+One payment received against an invoice.
+"""
+type InvoicePaymentInfo {
+	id: ID!
+	"""
+	`YYYY-MM-DD`.
+	"""
+	date: String!
+	"""
+	GST-inclusive cents.
+	"""
+	amountCents: Int!
+	note: String
+	"""
+	Unix seconds.
+	"""
+	recordedAt: Int!
 }
 
 """
@@ -535,6 +798,11 @@ type InvoicingSettingsInfo {
 	"""
 	currency: String!
 	"""
+	Days after issue an invoice falls due, unless its project says
+	otherwise. Defaults to 14.
+	"""
+	paymentTermsDays: Int!
+	"""
 	`(counter value, or 0 if never finalized) + 1` — the number
 	`finalizeInvoice` will assign next, and `setNextInvoiceNumber`'s
 	argument shape. Read lazily here (a `counter` `GetItem`), not
@@ -561,6 +829,10 @@ input InvoicingSettingsInput {
 	paymentDetails: String!
 	gstRegistered: Boolean!
 	currency: String!
+	"""
+	`0..=365`; `null` resets to the default (14).
+	"""
+	paymentTermsDays: Int
 }
 
 type MemberInfo {
@@ -1116,7 +1388,8 @@ type MutationRoot {
 	"""
 	Delete a billable item, returning its id (for the client's store).
 	Unbilled only, regardless of the item's invoice's own status — see
-	CLAUDE.md's "Invoicing" house rule.
+	CLAUDE.md's "Invoicing" house rule. Deleting an item `rebillExpense`
+	made frees its expense to be re-billed again (same transaction).
 	"""
 	deleteBillableItem(id: ID!): ID!
 	"""
@@ -1134,8 +1407,8 @@ type MutationRoot {
 	"""
 	updateExpense(id: ID!, input: ExpenseInput!): Expense!
 	"""
-	Delete an expense, returning its id. Expenses are never on an
-	invoice, so nothing else holds on to one.
+	Delete an expense, returning its id. Refused (`CONFLICT`) while it
+	is re-billed — delete the billable item `rebillExpense` made first.
 	"""
 	deleteExpense(id: ID!): ID!
 	"""
@@ -1197,15 +1470,45 @@ type MutationRoot {
 	so automatic numbering never runs into it. The guarantee against a
 	duplicate is the number's reservation row, written in the same
 	transaction as the finalize (`db::Handler::finalize_invoice`).
+	
+	`dueDate` (`YYYY-MM-DD`, on or after `issueDate`) defaults to
+	`issueDate` + the project's payment terms (else the instance's, else
+	14 days); it is frozen onto the row and printed on the invoice.
 	"""
-	finalizeInvoice(invoiceId: ID!, issueDate: String!, number: Int): Invoice!
+	finalizeInvoice(invoiceId: ID!, issueDate: String!, number: Int, dueDate: String): Invoice!
 	"""
-	Set (`paidDate` given) or clear (`null`) a finalized invoice's paid
-	status. Any member may call this — paid status is not printed on
-	the invoice and is not part of what finalization freezes. `CONFLICT`
-	on a draft, or if the invoice changed concurrently.
+	Mark a finalized invoice paid in full on `paidDate` — a shortcut for
+	`recordInvoicePayment` of its whole remaining balance — or, with
+	`null`, remove every payment recorded against it. `CONFLICT` on a
+	draft, when `paidDate` is given but nothing is owed, or if the
+	invoice changed concurrently.
 	"""
 	setInvoicePaid(invoiceId: ID!, paidDate: String): Invoice!
+	"""
+	Record a payment received against a finalized invoice: `amountCents`
+	(GST-inclusive, > 0, no more than the balance owing) on `date`. When
+	it settles the balance the invoice becomes PAID, dated by the latest
+	payment. `CONFLICT` on a draft, an already-settled invoice, or a
+	concurrent change.
+	"""
+	recordInvoicePayment(invoiceId: ID!, input: RecordPaymentInput!): Invoice!
+	"""
+	Remove one recorded payment (a mistake, a bounced transfer). The
+	invoice goes back to UNPAID if that leaves anything owing.
+	`NOT_FOUND` for a payment id not on this invoice.
+	"""
+	deleteInvoicePayment(invoiceId: ID!, paymentId: ID!): Invoice!
+	"""
+	**Sends email.** Mail a finalized invoice to the client with its PDF
+	attached: to `input.to` (default: the project's client email) and
+	`input.cc`, at most 10 in total, with an optional covering
+	`message`. Sent from the system sender under the business name, with
+	`Reply-To` the business email — see `invoicing::send`. Sending is
+	this mutation's whole point, so a send failure fails it (nothing is
+	recorded); on success `sentAt`/`sentTo` are updated. Can be sent
+	again (a reminder). `CONFLICT` on a draft.
+	"""
+	sendInvoice(invoiceId: ID!, input: SendDocumentInput! = {to: [], cc: [], message: null}): Invoice!
 	"""
 	Download a finalized invoice's PDF: a presigned URL with
 	`Content-Disposition: attachment; filename="Invoice-{displayNumber}.pdf"`
@@ -1215,25 +1518,72 @@ type MutationRoot {
 	yet to render.
 	
 	This is a mutation, not a query, because the *first* call for a
-	given invoice writes: it parses the frozen `snapshot` (the only
-	input `invoicing::pdf::render_invoice_pdf` ever reads — never live
-	project/instance state, so a later settings/project edit can't
-	change what a downloaded PDF says), renders it, `put_bytes`s it to
-	`invoices/{instance_id}/{invoice_id}/Invoice-{displayNumber}.pdf`,
-	and caches that key on the invoice row
-	(`db::Handler::set_invoice_pdf_key`, conditioned on `status =
-	finalized`). Every later call for the same invoice just presigns
-	the cached key. Rendering is deterministic from the snapshot — same
-	content, same page count, same layout — so two callers racing this
-	on the same never-yet-downloaded invoice each render and write a
-	complete, correct PDF of the same invoice (see `invoicing::pdf`'s
-	doc comment for the one respect in which the *bytes* aren't
-	identical between the two: printpdf embeds a fresh random id in
-	each file's trailer). Never a real race to guard against with a
-	conditional write here — whichever write lands last is still the
-	right document.
+	given invoice writes: it renders the frozen `snapshot` (the only input
+	`invoicing::pdf::render_invoice_pdf` reads), stores it, and caches the
+	key on the row (`db::Handler::set_invoice_pdf_key`). Every later call
+	presigns the cached key. Rendering is deterministic from the snapshot,
+	so two callers racing the first render each store a correct PDF of
+	the same invoice — see `invoicing::pdf`'s doc comment.
 	"""
 	downloadInvoicePdf(invoiceId: ID!): String!
+	"""
+	**Irreversible.** Issue a credit note (an adjustment note, when the
+	invoice was a tax invoice) against a finalized invoice: numbered from
+	its own `CN-` sequence, frozen at once, and never editable or
+	deletable — the correction for a finalized invoice, which itself can
+	never change. `input.lines` are GST-exclusive amounts to credit;
+	omit them to credit the whole invoice (only while nothing has been
+	credited against it). The credit note's total (with GST, at the
+	invoice's own GST registration) can't exceed what's left
+	uncredited. The invoice's balance drops by that total, and if that
+	settles it, it becomes PAID as of the credit note's date. Any member;
+	sends no email (see `sendCreditNote`). `CONFLICT` on a draft or a
+	concurrent change.
+	"""
+	issueCreditNote(invoiceId: ID!, input: CreditNoteInput!): CreditNote!
+	"""
+	Download a credit note's PDF — `downloadInvoicePdf`'s twin: rendered
+	from the frozen snapshot on first call, cached after.
+	"""
+	downloadCreditNotePdf(creditNoteId: ID!): String!
+	"""
+	**Sends email.** `sendInvoice` for a credit note: mails it with its
+	PDF to `input.to` (default: the project's client email) and `cc`.
+	"""
+	sendCreditNote(creditNoteId: ID!, input: SendDocumentInput! = {to: [], cc: [], message: null}): CreditNote!
+	"""
+	Re-bill an expense to its project's client: create an UNBILLED
+	billable item for its GST-exclusive cost plus `markupPercent`
+	(default 0, at most 1000, 2 dp), dated like the expense, linked to it
+	so it can't be billed twice. `description` defaults to the
+	expense's category and supplier. `gstFree` (default `false`) marks
+	the new line GST-free. Refused for an expense with no project, on an
+	archived project, or already re-billed (`CONFLICT`). Deleting the
+	item frees the expense to be re-billed again.
+	"""
+	rebillExpense(expenseId: ID!, markupPercent: String, description: String, gstFree: Boolean! = false): BillableItem!
+	"""
+	Mint a presigned PUT for an expense's receipt, at
+	`receipts/{instanceId}/{expenseId}/{random}/{filename}`. Upload the
+	file there, then call `attachExpenseReceipt` with the returned key.
+	"""
+	createExpenseReceiptUpload(expenseId: ID!, filename: String!, contentType: String!): AttachmentUpload!
+	"""
+	Attach an uploaded receipt (a key from `createExpenseReceiptUpload`
+	for this same expense) to the expense, replacing any earlier one.
+	Refused for a key belonging to another expense, a file that wasn't
+	uploaded, or one over 20 MB.
+	"""
+	attachExpenseReceipt(expenseId: ID!, key: String!, contentType: String!): Expense!
+	"""
+	Detach an expense's receipt.
+	"""
+	removeExpenseReceipt(expenseId: ID!): Expense!
+	"""
+	A presigned download URL for an expense's receipt. `NOT_FOUND` when
+	it has none.
+	"""
+	downloadExpenseReceipt(expenseId: ID!): String!
 	"""
 	Owner-or-superuser: set the next invoice number to be assigned by
 	`finalizeInvoice` (`db::Handler::set_next_invoice_number` writes
@@ -1349,9 +1699,52 @@ type Project {
 	clientAbn: String
 	clientAddress: String
 	reference: String
+	clientEmail: String
+	"""
+	This project's own payment terms override; `null` means the
+	instance's apply — see `effectivePaymentTermsDays`.
+	"""
+	paymentTermsDays: Int
+	"""
+	The terms this project's invoices actually get: its own override,
+	else the instance's.
+	"""
+	effectivePaymentTermsDays: Int!
+	"""
+	GST-exclusive cents a new billable item gets when it names no price.
+	"""
+	defaultUnitPriceCents: Int
+	"""
+	What this project has invoiced, been paid, and cost — computed from
+	every finalized invoice, expense and unbilled item on it. Reads all
+	of them, so ask for it on one project at a time, not on a list.
+	"""
+	financials: ProjectFinancialsInfo!
 	archived: Boolean!
 	createdAt: Int!
 	updatedAt: Int!
+}
+
+"""
+`Project.financials`. Everything GST-exclusive except where named.
+"""
+type ProjectFinancialsInfo {
+	"""
+	Finalized invoices, net of credit notes.
+	"""
+	invoicedCents: Int!
+	invoicedInclGstCents: Int!
+	paidCents: Int!
+	outstandingCents: Int!
+	expensesCents: Int!
+	"""
+	Billable items not yet on any invoice.
+	"""
+	unbilledCents: Int!
+	"""
+	Invoiced − expenses.
+	"""
+	profitCents: Int!
 }
 
 """
@@ -1503,6 +1896,40 @@ type QueryRoot {
 	"""
 	invoice(id: ID!): Invoice
 	"""
+	Credit notes in an invoicing instance — all of them, or one
+	invoice's when `invoiceId` is given — as a Relay connection, newest
+	first. Same posture as [`Self::invoices`].
+	"""
+	creditNotes(instanceId: ID!, invoiceId: ID, first: Int, after: String): CreditNoteConnection!
+	"""
+	One credit note by id — `null` for missing, not-yours and a support
+	instance alike, like [`Self::invoice`].
+	"""
+	creditNote(id: ID!): CreditNote
+	"""
+	The BAS figures for `from..=to` (`YYYY-MM-DD`, at most 2 years
+	apart): sales and GST on sales (G1/1A) from finalized invoices,
+	credit notes and payments on the chosen `basis`, and purchases and
+	GST on purchases (1B) from expenses by their date. See
+	`invoicing::report::gst_summary` for exactly how each basis counts.
+	Member; a support instance is rejected.
+	"""
+	gstReport(instanceId: ID!, from: String!, to: String!, basis: ReportBasisType!): GstReport!
+	"""
+	Aged receivables: every finalized invoice with a balance owing,
+	bucketed by days past due as of today (UTC). Member; a support
+	instance is rejected.
+	"""
+	receivables(instanceId: ID!): ReceivablesReport!
+	"""
+	A CSV export for `from..=to` (`YYYY-MM-DD`, at most 2 years apart):
+	finalized invoices by issue date, credit notes by issue date,
+	payments by payment date, or expenses by date. Returned as the CSV
+	text itself; the web app saves it as a file. Member; a support
+	instance is rejected. See `invoicing::csv`.
+	"""
+	invoicingExport(instanceId: ID!, kind: CsvExportType!, from: String!, to: String!): String!
+	"""
 	Every instance, **including soft-deleted ones**, sorted by name — the
 	admin instance list. Superuser-only; unlike every other way an
 	`Instance` is reached, this deliberately does not filter `deleted`
@@ -1533,6 +1960,69 @@ type QueryRoot {
 	self-only even when reached this way — see that field's doc comment.
 	"""
 	adminUser(id: ID!): User
+}
+
+type ReceivablesReport {
+	"""
+	`YYYY-MM-DD` — the (UTC) date the buckets are measured from.
+	"""
+	asOf: String!
+	currency: String!
+	totalCents: Int!
+	"""
+	Not yet due.
+	"""
+	currentCents: Int!
+	days1To30Cents: Int!
+	days31To60Cents: Int!
+	days61To90Cents: Int!
+	daysOver90Cents: Int!
+	"""
+	Every invoice with a balance owing, most overdue first.
+	"""
+	invoices: [Invoice!]!
+}
+
+"""
+`recordInvoicePayment`'s argument.
+"""
+input RecordPaymentInput {
+	"""
+	`YYYY-MM-DD` — when the money arrived.
+	"""
+	date: String!
+	"""
+	GST-inclusive cents, > 0 and no more than the invoice's balance.
+	"""
+	amountCents: Int!
+	note: String
+}
+
+"""
+`gstReport`'s basis.
+"""
+enum ReportBasisType {
+	"""
+	By payment date, GST apportioned per payment.
+	"""
+	CASH
+	"""
+	By issue date.
+	"""
+	ACCRUAL
+}
+
+"""
+`sendInvoice`/`sendCreditNote`'s argument. An empty `to` means the
+project's client email.
+"""
+input SendDocumentInput {
+	to: [String!]! = []
+	cc: [String!]! = []
+	"""
+	An optional covering note, put above the summary in the email.
+	"""
+	message: String
 }
 
 """
@@ -1682,14 +2172,18 @@ enum TicketStatusType {
 }
 
 """
-`updateProject`'s argument — full-replace, including `archived`.
+`updateProject`'s argument — full-replace, including `archived`: an
+omitted optional field is cleared.
 """
 input UpdateProjectInput {
 	name: String!
 	clientName: String!
 	clientAbn: String
 	clientAddress: String
+	clientEmail: String
 	reference: String
+	paymentTermsDays: Int
+	defaultUnitPriceCents: Int
 	archived: Boolean!
 }
 

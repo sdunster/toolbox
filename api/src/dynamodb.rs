@@ -400,6 +400,7 @@ impl TryInto<db::Instance> for Item {
             payment_details: self.string_field("payment_details")?,
             gst_registered: self.bool_field("gst_registered")?.unwrap_or(false),
             currency: self.string_field("currency")?,
+            payment_terms_days: self.i64_field("payment_terms_days")?.map(|d| d as u32),
         })
     }
 }
@@ -491,6 +492,9 @@ impl TryInto<db::Project> for Item {
             client_abn: self.string_field("client_abn")?,
             client_address: self.string_field("client_address")?,
             reference: self.string_field("reference")?,
+            client_email: self.string_field("client_email")?,
+            payment_terms_days: self.i64_field("payment_terms_days")?.map(|d| d as u32),
+            default_unit_price_cents: self.i64_field("default_unit_price_cents")?,
             archived: self.bool_field("archived")?.unwrap_or(false),
             created_at: self
                 .i64_field("created_at")?
@@ -528,6 +532,8 @@ impl TryInto<db::BillableItem> for Item {
                 .i64_field("unit_price_cents")?
                 .ok_or_else(|| anyhow!("BillableItem missing unit_price_cents"))?,
             invoice_id: self.string_field("invoice_id")?,
+            gst_free: self.bool_field("gst_free")?.unwrap_or(false),
+            source_expense_id: self.string_field("source_expense_id")?,
             created_by_user_id: self
                 .string_field("created_by_user_id")?
                 .ok_or_else(|| anyhow!("BillableItem missing created_by_user_id"))?,
@@ -584,6 +590,18 @@ impl TryInto<db::Expense> for Item {
                 category,
                 description: self.string_field("description")?,
                 detail,
+            },
+            billable_item_id: self.string_field("billable_item_id")?,
+            receipt: match self.string_field("receipt_s3_key")? {
+                None => None,
+                Some(s3_key) => Some(db::ExpenseReceipt {
+                    s3_key,
+                    filename: self.string_field("receipt_filename")?.unwrap_or_default(),
+                    content_type: self
+                        .string_field("receipt_content_type")?
+                        .unwrap_or_else(|| "application/octet-stream".to_string()),
+                    size: self.i64_field("receipt_size")?.unwrap_or(0) as u64,
+                }),
             },
             created_by_user_id: self
                 .string_field("created_by_user_id")?
@@ -682,8 +700,219 @@ impl TryInto<db::Invoice> for Item {
             finalized_by_user_id: self.string_field("finalized_by_user_id")?,
             paid_date: self.string_field("paid_date")?,
             pdf_s3_key: self.string_field("pdf_s3_key")?,
+            due_date: self.string_field("due_date")?,
+            gst_cents: self.i64_field("gst_cents")?,
+            payments: match self.string_field("payments")? {
+                None => Vec::new(),
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| anyhow!("Invoice has corrupt payments: {e}"))?,
+            },
+            credited_cents: self.i64_field("credited_cents")?.unwrap_or(0),
+            credited_gst_cents: self.i64_field("credited_gst_cents")?.unwrap_or(0),
+            sent_at: self.i64_field("sent_at")?.map(|t| t as u64),
+            sent_to: self.string_set_field("sent_to")?,
         })
     }
+}
+
+impl TryInto<db::CreditNote> for Item {
+    type Error = HydrationError;
+    fn try_into(self) -> Result<db::CreditNote, Self::Error> {
+        let req_s = |field: &str| -> Result<String, HydrationError> {
+            Ok(self
+                .string_field(field)?
+                .ok_or_else(|| anyhow!("CreditNote missing {field}"))?)
+        };
+        let req_n = |field: &str| -> Result<i64, HydrationError> {
+            Ok(self
+                .i64_field(field)?
+                .ok_or_else(|| anyhow!("CreditNote missing {field}"))?)
+        };
+        Ok(db::CreditNote {
+            id: self.id()?,
+            instance_id: req_s("instance_id")?,
+            invoice_id: req_s("invoice_id")?,
+            project_id: req_s("project_id")?,
+            number: req_n("number")? as u32,
+            issue_date: req_s("issue_date")?,
+            reason: req_s("reason")?,
+            snapshot: req_s("snapshot")?,
+            subtotal_cents: req_n("subtotal_cents")?,
+            gst_cents: req_n("gst_cents")?,
+            total_cents: req_n("total_cents")?,
+            created_by_user_id: req_s("created_by_user_id")?,
+            created_at: req_n("created_at")? as u64,
+            pdf_s3_key: self.string_field("pdf_s3_key")?,
+            sent_at: self.i64_field("sent_at")?.map(|t| t as u64),
+            sent_to: self.string_set_field("sent_to")?,
+        })
+    }
+}
+
+/// Build a `SET a = :a, … REMOVE b, …` expression from `(name, placeholder,
+/// value)` triples: `Some` values are `SET`, `None` ones `REMOVE`d — the
+/// omit-optional-attributes house rule for a full-replace update. `name` may
+/// be an `#alias` the caller registers itself. Returns the expression and
+/// the placeholder values to register.
+fn set_remove_expression(
+    fields: Vec<(&str, &str, Option<AttributeValue>)>,
+    extra_sets: &[&str],
+) -> (String, Vec<(String, AttributeValue)>) {
+    let mut sets: Vec<String> = extra_sets.iter().map(|s| s.to_string()).collect();
+    let mut removes: Vec<&str> = Vec::new();
+    let mut values = Vec::new();
+    for (name, placeholder, value) in fields {
+        match value {
+            Some(v) => {
+                sets.push(format!("{name} = {placeholder}"));
+                values.push((placeholder.to_string(), v));
+            }
+            None => removes.push(name),
+        }
+    }
+    let mut expr = String::new();
+    if !sets.is_empty() {
+        expr.push_str("SET ");
+        expr.push_str(&sets.join(", "));
+    }
+    if !removes.is_empty() {
+        if !expr.is_empty() {
+            expr.push(' ');
+        }
+        expr.push_str("REMOVE ");
+        expr.push_str(&removes.join(", "));
+    }
+    (expr, values)
+}
+
+/// Map a conditional `UpdateItem`'s outcome to the `Ok(true)` (written) /
+/// `Ok(false)` (condition failed) / `Err` (anything else) contract most
+/// conditional writes here share.
+fn conditional_write_result(
+    op: &'static str,
+    resp: Result<
+        aws_sdk_dynamodb::operation::update_item::UpdateItemOutput,
+        SdkError<aws_sdk_dynamodb::operation::update_item::UpdateItemError>,
+    >,
+) -> db::Result<bool> {
+    match resp {
+        Ok(r) => {
+            record_capacity(op, r.consumed_capacity(), CapKind::Write);
+            Ok(true)
+        }
+        Err(SdkError::ServiceError(ref se)) if se.err().is_conditional_check_failed_exception() => {
+            Ok(false)
+        }
+        Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
+    }
+}
+
+/// The GSI, its hash attribute, and the hash value a credit-note listing
+/// reads.
+fn credit_note_index(scope: db::CreditNoteScope<'_>) -> (&'static str, &'static str, &str) {
+    match scope {
+        db::CreditNoteScope::Instance(id) => ("instance_id-created_at-index", "instance_id", id),
+        db::CreditNoteScope::Invoice(id) => ("invoice_id-created_at-index", "invoice_id", id),
+    }
+}
+
+/// A new `billable_item` row and the record it hydrates to — shared by
+/// `create_billable_item` and `rebill_expense`.
+fn billable_item_row(
+    item: &db::NewBillableItem<'_>,
+    source_expense_id: Option<&str>,
+) -> (HashMap<String, AttributeValue>, db::BillableItem) {
+    let id = new_id();
+    let now = crate::clock::now_sec();
+    let mut row: HashMap<String, AttributeValue> = HashMap::from([
+        ("id".to_string(), AttributeValue::S(id.clone())),
+        (
+            "instance_id".to_string(),
+            AttributeValue::S(item.instance_id.to_string()),
+        ),
+        (
+            "project_id".to_string(),
+            AttributeValue::S(item.project_id.to_string()),
+        ),
+        ("date".to_string(), AttributeValue::S(item.date.to_string())),
+        (
+            "description".to_string(),
+            AttributeValue::S(item.description.to_string()),
+        ),
+        (
+            "quantity_hundredths".to_string(),
+            AttributeValue::N(item.quantity_hundredths.to_string()),
+        ),
+        (
+            "unit_price_cents".to_string(),
+            AttributeValue::N(item.unit_price_cents.to_string()),
+        ),
+        (
+            "created_by_user_id".to_string(),
+            AttributeValue::S(item.created_by_user_id.to_string()),
+        ),
+        ("created_at".to_string(), AttributeValue::N(now.to_string())),
+        ("updated_at".to_string(), AttributeValue::N(now.to_string())),
+    ]);
+    if item.gst_free {
+        row.insert("gst_free".to_string(), AttributeValue::Bool(true));
+    }
+    if let Some(expense_id) = source_expense_id {
+        row.insert(
+            "source_expense_id".to_string(),
+            AttributeValue::S(expense_id.to_string()),
+        );
+    }
+    let record = db::BillableItem {
+        id,
+        instance_id: item.instance_id.to_string(),
+        project_id: item.project_id.to_string(),
+        date: item.date.to_string(),
+        description: item.description.to_string(),
+        quantity_hundredths: item.quantity_hundredths,
+        unit_price_cents: item.unit_price_cents,
+        invoice_id: None,
+        gst_free: item.gst_free,
+        source_expense_id: source_expense_id.map(str::to_string),
+        created_by_user_id: item.created_by_user_id.to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    (row, record)
+}
+
+/// Every editable `project` attribute as `(name, placeholder, value)` —
+/// shared by `create_project` (absent ones are simply not written) and
+/// `update_project` (absent ones are `REMOVE`d). `reference` is a reserved
+/// word, so it goes by `#ref`.
+fn project_attributes(
+    f: &db::ProjectFields,
+) -> Vec<(&'static str, &'static str, Option<AttributeValue>)> {
+    let s = |v: &Option<String>| v.as_ref().map(|v| AttributeValue::S(v.clone()));
+    vec![
+        ("#n", ":name", Some(AttributeValue::S(f.name.clone()))),
+        (
+            "client_name",
+            ":client_name",
+            Some(AttributeValue::S(f.client_name.clone())),
+        ),
+        ("client_abn", ":client_abn", s(&f.client_abn)),
+        ("client_address", ":client_address", s(&f.client_address)),
+        ("client_email", ":client_email", s(&f.client_email)),
+        ("#ref", ":reference", s(&f.reference)),
+        (
+            "payment_terms_days",
+            ":terms",
+            f.payment_terms_days
+                .map(|d| AttributeValue::N(d.to_string())),
+        ),
+        (
+            "default_unit_price_cents",
+            ":rate",
+            f.default_unit_price_cents
+                .map(|c| AttributeValue::N(c.to_string())),
+        ),
+    ]
 }
 
 impl TryInto<db::EphemeralState> for Item {
@@ -1509,6 +1738,7 @@ impl db::Handler for Handler {
             payment_details: None,
             gst_registered: false,
             currency: None,
+            payment_terms_days: None,
         })
     }
 
@@ -1591,6 +1821,7 @@ impl db::Handler for Handler {
                 payment_details,
                 gst_registered,
                 currency,
+                payment_terms_days,
             } => {
                 let mut sets: Vec<String> = Vec::new();
                 let mut removes: Vec<&str> = Vec::new();
@@ -1629,6 +1860,16 @@ impl db::Handler for Handler {
                             .expression_attribute_values(":cur", AttributeValue::S(c.to_string()));
                     }
                     None => removes.push("currency"),
+                }
+                match payment_terms_days {
+                    Some(d) => {
+                        sets.push("payment_terms_days = :terms".to_string());
+                        req = req.expression_attribute_values(
+                            ":terms",
+                            AttributeValue::N(d.to_string()),
+                        );
+                    }
+                    None => removes.push("payment_terms_days"),
                 }
                 // Omit-optional-attributes house rule: only ever written `true`.
                 if gst_registered {
@@ -2616,37 +2857,37 @@ impl db::Handler for Handler {
     async fn create_project(
         &self,
         instance_id: &str,
-        name: &str,
-        client_name: &str,
-        client_abn: Option<&str>,
-        client_address: Option<&str>,
-        reference: Option<&str>,
+        fields: &db::ProjectFields,
     ) -> db::Result<db::Project> {
         self.ensure_writable()?;
         let id = new_id();
         let now = crate::clock::now_sec();
-        let mut req = self
+        let mut item: HashMap<String, AttributeValue> = HashMap::from([
+            ("id".to_string(), AttributeValue::S(id.clone())),
+            (
+                "instance_id".to_string(),
+                AttributeValue::S(instance_id.to_string()),
+            ),
+            ("created_at".to_string(), AttributeValue::N(now.to_string())),
+            ("updated_at".to_string(), AttributeValue::N(now.to_string())),
+        ]);
+        for (name, _, value) in project_attributes(fields) {
+            let name = match name {
+                "#n" => "name",
+                "#ref" => "reference",
+                other => other,
+            };
+            if let Some(v) = value {
+                item.insert(name.to_string(), v);
+            }
+        }
+        let resp = self
             .client
             .put_item()
             .table_name(self.table_name("project"))
-            .item("id", AttributeValue::S(id.clone()))
-            .item("instance_id", AttributeValue::S(instance_id.to_string()))
-            .item("name", AttributeValue::S(name.to_string()))
-            .item("client_name", AttributeValue::S(client_name.to_string()))
-            .item("created_at", AttributeValue::N(now.to_string()))
-            .item("updated_at", AttributeValue::N(now.to_string()))
+            .set_item(Some(item))
             .condition_expression("attribute_not_exists(id)")
-            .return_consumed_capacity(ReturnConsumedCapacity::Total);
-        if let Some(v) = client_abn {
-            req = req.item("client_abn", AttributeValue::S(v.to_string()));
-        }
-        if let Some(v) = client_address {
-            req = req.item("client_address", AttributeValue::S(v.to_string()));
-        }
-        if let Some(v) = reference {
-            req = req.item("reference", AttributeValue::S(v.to_string()));
-        }
-        let resp = req
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
             .await
             .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
@@ -2654,11 +2895,14 @@ impl db::Handler for Handler {
         Ok(db::Project {
             id,
             instance_id: instance_id.to_string(),
-            name: name.to_string(),
-            client_name: client_name.to_string(),
-            client_abn: client_abn.map(str::to_string),
-            client_address: client_address.map(str::to_string),
-            reference: reference.map(str::to_string),
+            name: fields.name.clone(),
+            client_name: fields.client_name.clone(),
+            client_abn: fields.client_abn.clone(),
+            client_address: fields.client_address.clone(),
+            reference: fields.reference.clone(),
+            client_email: fields.client_email.clone(),
+            payment_terms_days: fields.payment_terms_days,
+            default_unit_price_cents: fields.default_unit_price_cents,
             archived: false,
             created_at: now,
             updated_at: now,
@@ -2690,21 +2934,16 @@ impl db::Handler for Handler {
     async fn update_project(&self, id: &str, change: db::ProjectUpdateShape<'_>) -> db::Result<()> {
         self.ensure_writable()?;
         match change {
-            db::ProjectUpdateShape::Fields {
-                name,
-                client_name,
-                client_abn,
-                client_address,
-                reference,
-                archived,
-            } => {
+            db::ProjectUpdateShape::Fields { fields, archived } => {
                 let now = crate::clock::now_sec();
-                let mut sets = vec![
-                    "#n = :name".to_string(),
-                    "client_name = :client_name".to_string(),
-                    "updated_at = :updated_at".to_string(),
-                ];
-                let mut removes: Vec<&str> = Vec::new();
+                let mut attrs = project_attributes(fields);
+                // Omit-optional-attributes house rule: only ever written `true`.
+                attrs.push((
+                    "archived",
+                    ":archived",
+                    archived.then_some(AttributeValue::Bool(true)),
+                ));
+                let (expr, values) = set_remove_expression(attrs, &["updated_at = :updated_at"]);
                 let mut req = self
                     .client
                     .update_item()
@@ -2716,45 +2955,12 @@ impl db::Handler for Handler {
                     // appear literally in an update/condition/projection
                     // expression — aliased via #ref like #n above.
                     .expression_attribute_names("#ref", "reference")
-                    .expression_attribute_values(":name", AttributeValue::S(name.to_string()))
-                    .expression_attribute_values(
-                        ":client_name",
-                        AttributeValue::S(client_name.to_string()),
-                    )
-                    .expression_attribute_values(":updated_at", AttributeValue::N(now.to_string()));
-
-                let optional_fields: [(&str, &str, Option<&str>); 3] = [
-                    (":client_abn", "client_abn", client_abn),
-                    (":client_address", "client_address", client_address),
-                    (":reference", "#ref", reference),
-                ];
-                for (placeholder, attr, value) in optional_fields {
-                    match value {
-                        Some(v) => {
-                            sets.push(format!("{attr} = {placeholder}"));
-                            req = req.expression_attribute_values(
-                                placeholder,
-                                AttributeValue::S(v.to_string()),
-                            );
-                        }
-                        None => removes.push(attr),
-                    }
-                }
-                // Omit-optional-attributes house rule: only ever written `true`.
-                if archived {
-                    sets.push("archived = :archived".to_string());
-                    req = req.expression_attribute_values(":archived", AttributeValue::Bool(true));
-                } else {
-                    removes.push("archived");
-                }
-
-                let mut update_expr = format!("SET {}", sets.join(", "));
-                if !removes.is_empty() {
-                    update_expr.push_str(" REMOVE ");
-                    update_expr.push_str(&removes.join(", "));
+                    .expression_attribute_values(":updated_at", AttributeValue::N(now.to_string()))
+                    .update_expression(expr);
+                for (placeholder, value) in values {
+                    req = req.expression_attribute_values(placeholder, value);
                 }
                 let resp = req
-                    .update_expression(update_expr)
                     .return_consumed_capacity(ReturnConsumedCapacity::Total)
                     .send()
                     .await
@@ -2773,40 +2979,15 @@ impl db::Handler for Handler {
 
     async fn create_billable_item(
         &self,
-        instance_id: &str,
-        project_id: &str,
-        date: &str,
-        description: &str,
-        quantity_hundredths: i64,
-        unit_price_cents: i64,
-        created_by_user_id: &str,
+        item: &db::NewBillableItem<'_>,
     ) -> db::Result<db::BillableItem> {
         self.ensure_writable()?;
-        let id = new_id();
-        let now = crate::clock::now_sec();
+        let (row, record) = billable_item_row(item, None);
         let resp = self
             .client
             .put_item()
             .table_name(self.table_name("billable_item"))
-            .item("id", AttributeValue::S(id.clone()))
-            .item("instance_id", AttributeValue::S(instance_id.to_string()))
-            .item("project_id", AttributeValue::S(project_id.to_string()))
-            .item("date", AttributeValue::S(date.to_string()))
-            .item("description", AttributeValue::S(description.to_string()))
-            .item(
-                "quantity_hundredths",
-                AttributeValue::N(quantity_hundredths.to_string()),
-            )
-            .item(
-                "unit_price_cents",
-                AttributeValue::N(unit_price_cents.to_string()),
-            )
-            .item(
-                "created_by_user_id",
-                AttributeValue::S(created_by_user_id.to_string()),
-            )
-            .item("created_at", AttributeValue::N(now.to_string()))
-            .item("updated_at", AttributeValue::N(now.to_string()))
+            .set_item(Some(row))
             .condition_expression("attribute_not_exists(id)")
             .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
@@ -2817,19 +2998,40 @@ impl db::Handler for Handler {
             resp.consumed_capacity(),
             CapKind::Write,
         );
-        Ok(db::BillableItem {
-            id,
-            instance_id: instance_id.to_string(),
-            project_id: project_id.to_string(),
-            date: date.to_string(),
-            description: description.to_string(),
-            quantity_hundredths,
-            unit_price_cents,
-            invoice_id: None,
-            created_by_user_id: created_by_user_id.to_string(),
-            created_at: now,
-            updated_at: now,
-        })
+        Ok(record)
+    }
+
+    async fn rebill_expense(
+        &self,
+        expense_id: &str,
+        item: &db::NewBillableItem<'_>,
+    ) -> db::Result<Option<db::BillableItem>> {
+        self.ensure_writable()?;
+        let (row, record) = billable_item_row(item, Some(expense_id));
+        let put_item = Put::builder()
+            .table_name(self.table_name("billable_item"))
+            .set_item(Some(row))
+            .condition_expression("attribute_not_exists(id)")
+            .build()
+            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+        let update_expense = Update::builder()
+            .table_name(self.table_name("expense"))
+            .key("id", AttributeValue::S(expense_id.to_string()))
+            .update_expression("SET billable_item_id = :item_id")
+            .condition_expression("attribute_exists(id) AND attribute_not_exists(billable_item_id)")
+            .expression_attribute_values(":item_id", AttributeValue::S(record.id.clone()))
+            .build()
+            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+        let committed = self
+            .transact_write(
+                "rebill_expense",
+                vec![
+                    TransactWriteItem::builder().put(put_item).build(),
+                    TransactWriteItem::builder().update(update_expense).build(),
+                ],
+            )
+            .await?;
+        Ok(committed.then_some(record))
     }
 
     async fn get_billable_items<T: AsRef<str> + Sync>(
@@ -2858,8 +3060,22 @@ impl db::Handler for Handler {
             description,
             quantity_hundredths,
             unit_price_cents,
+            gst_free,
         } = change;
         let now = crate::clock::now_sec();
+        // Omit-optional-attributes house rule: `gst_free` is only ever
+        // written `true`.
+        let update_expr = format!(
+            "SET #d = :date, description = :description, \
+             quantity_hundredths = :qty, unit_price_cents = :price, \
+             updated_at = :updated_at{}",
+            if gst_free {
+                ", gst_free = :gst_free"
+            } else {
+                " REMOVE gst_free"
+            }
+        );
+        let gst_free_value = gst_free.then_some(AttributeValue::Bool(true));
 
         let Some(invoice_id) = invoice_id else {
             // Unbilled item: unchanged from before invoices existed — a
@@ -2869,11 +3085,7 @@ impl db::Handler for Handler {
                 .update_item()
                 .table_name(self.table_name("billable_item"))
                 .key("id", AttributeValue::S(id.to_string()))
-                .update_expression(
-                    "SET #d = :date, description = :description, \
-                     quantity_hundredths = :qty, unit_price_cents = :price, \
-                     updated_at = :updated_at",
-                )
+                .update_expression(update_expr.clone())
                 .condition_expression("attribute_exists(id) AND attribute_not_exists(invoice_id)")
                 .expression_attribute_names("#d", "date")
                 .expression_attribute_values(":date", AttributeValue::S(date.to_string()))
@@ -2889,10 +3101,14 @@ impl db::Handler for Handler {
                     ":price",
                     AttributeValue::N(unit_price_cents.to_string()),
                 )
-                .expression_attribute_values(":updated_at", AttributeValue::N(now.to_string()))
-                .return_consumed_capacity(ReturnConsumedCapacity::Total)
-                .send()
-                .await;
+                .expression_attribute_values(":updated_at", AttributeValue::N(now.to_string()));
+            let resp = match gst_free_value.clone() {
+                Some(v) => resp.expression_attribute_values(":gst_free", v),
+                None => resp,
+            }
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
             return match resp {
                 Ok(r) => {
                     record_capacity(
@@ -2918,11 +3134,7 @@ impl db::Handler for Handler {
         let update_item = Update::builder()
             .table_name(self.table_name("billable_item"))
             .key("id", AttributeValue::S(id.to_string()))
-            .update_expression(
-                "SET #d = :date, description = :description, \
-                 quantity_hundredths = :qty, unit_price_cents = :price, \
-                 updated_at = :updated_at",
-            )
+            .update_expression(update_expr)
             .condition_expression("attribute_exists(id) AND invoice_id = :invoice_id")
             .expression_attribute_names("#d", "date")
             .expression_attribute_values(":date", AttributeValue::S(date.to_string()))
@@ -2930,9 +3142,13 @@ impl db::Handler for Handler {
             .expression_attribute_values(":qty", AttributeValue::N(quantity_hundredths.to_string()))
             .expression_attribute_values(":price", AttributeValue::N(unit_price_cents.to_string()))
             .expression_attribute_values(":updated_at", AttributeValue::N(now.to_string()))
-            .expression_attribute_values(":invoice_id", AttributeValue::S(invoice_id.to_string()))
-            .build()
-            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+            .expression_attribute_values(":invoice_id", AttributeValue::S(invoice_id.to_string()));
+        let update_item = match gst_free_value {
+            Some(v) => update_item.expression_attribute_values(":gst_free", v),
+            None => update_item,
+        }
+        .build()
+        .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
 
         let update_invoice = Update::builder()
             .table_name(self.table_name("invoice"))
@@ -2957,14 +3173,55 @@ impl db::Handler for Handler {
         .await
     }
 
-    async fn delete_billable_item(&self, id: &str) -> db::Result<bool> {
+    async fn delete_billable_item(
+        &self,
+        id: &str,
+        source_expense_id: Option<&str>,
+    ) -> db::Result<bool> {
         self.ensure_writable()?;
+        if let Some(expense_id) = source_expense_id {
+            // A re-billed expense: free the expense up again in the same
+            // transaction, so it can never point at an item that's gone.
+            let delete_item = Delete::builder()
+                .table_name(self.table_name("billable_item"))
+                .key("id", AttributeValue::S(id.to_string()))
+                .condition_expression(
+                    "attribute_exists(id) AND attribute_not_exists(invoice_id) \
+                     AND source_expense_id = :expense_id",
+                )
+                .expression_attribute_values(
+                    ":expense_id",
+                    AttributeValue::S(expense_id.to_string()),
+                )
+                .build()
+                .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+            let update_expense = Update::builder()
+                .table_name(self.table_name("expense"))
+                .key("id", AttributeValue::S(expense_id.to_string()))
+                .update_expression("REMOVE billable_item_id")
+                .condition_expression("billable_item_id = :item_id")
+                .expression_attribute_values(":item_id", AttributeValue::S(id.to_string()))
+                .build()
+                .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+            return self
+                .transact_write(
+                    "delete_rebilled_item",
+                    vec![
+                        TransactWriteItem::builder().delete(delete_item).build(),
+                        TransactWriteItem::builder().update(update_expense).build(),
+                    ],
+                )
+                .await;
+        }
         let resp = self
             .client
             .delete_item()
             .table_name(self.table_name("billable_item"))
             .key("id", AttributeValue::S(id.to_string()))
-            .condition_expression("attribute_exists(id) AND attribute_not_exists(invoice_id)")
+            .condition_expression(
+                "attribute_exists(id) AND attribute_not_exists(invoice_id) \
+                 AND attribute_not_exists(source_expense_id)",
+            )
             .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
             .await;
@@ -3111,6 +3368,8 @@ impl db::Handler for Handler {
             id,
             instance_id: instance_id.to_string(),
             fields: fields.clone(),
+            billable_item_id: None,
+            receipt: None,
             created_by_user_id: created_by_user_id.to_string(),
             created_at: now,
             updated_at: now,
@@ -3178,7 +3437,7 @@ impl db::Handler for Handler {
             .delete_item()
             .table_name(self.table_name("expense"))
             .key("id", AttributeValue::S(id.to_string()))
-            .condition_expression("attribute_exists(id)")
+            .condition_expression("attribute_exists(id) AND attribute_not_exists(billable_item_id)")
             .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
             .await;
@@ -3194,6 +3453,92 @@ impl db::Handler for Handler {
             }
             Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
         }
+    }
+
+    async fn set_expense_receipt(
+        &self,
+        id: &str,
+        receipt: Option<&db::ExpenseReceipt>,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let now = crate::clock::now_sec();
+        let fields = vec![
+            (
+                "receipt_s3_key",
+                ":key",
+                receipt.map(|r| AttributeValue::S(r.s3_key.clone())),
+            ),
+            (
+                "receipt_filename",
+                ":filename",
+                receipt.map(|r| AttributeValue::S(r.filename.clone())),
+            ),
+            (
+                "receipt_content_type",
+                ":content_type",
+                receipt.map(|r| AttributeValue::S(r.content_type.clone())),
+            ),
+            (
+                "receipt_size",
+                ":size",
+                receipt.map(|r| AttributeValue::N(r.size.to_string())),
+            ),
+        ];
+        let (expr, values) = set_remove_expression(fields, &["updated_at = :updated_at"]);
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("expense"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .condition_expression("attribute_exists(id)")
+            .update_expression(expr)
+            .expression_attribute_values(":updated_at", AttributeValue::N(now.to_string()));
+        for (placeholder, value) in values {
+            req = req.expression_attribute_values(placeholder, value);
+        }
+        let resp = req
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_expense_receipt", resp)
+    }
+
+    async fn list_expenses_in_range(
+        &self,
+        instance_id: &str,
+        from: &str,
+        to: &str,
+    ) -> db::Result<Vec<db::Expense>> {
+        query_all("list_expenses_in_range", || {
+            self.client
+                .query()
+                .table_name(self.table_name("expense"))
+                .index_name("instance_id-date-index")
+                .key_condition_expression("instance_id = :instance_id AND #d BETWEEN :from AND :to")
+                .expression_attribute_names("#d", "date")
+                .expression_attribute_values(
+                    ":instance_id",
+                    AttributeValue::S(instance_id.to_string()),
+                )
+                .expression_attribute_values(":from", AttributeValue::S(from.to_string()))
+                .expression_attribute_values(":to", AttributeValue::S(to.to_string()))
+        })
+        .await
+    }
+
+    async fn list_all_expenses_by_project(&self, project_id: &str) -> db::Result<Vec<db::Expense>> {
+        query_all("list_all_expenses_by_project", || {
+            self.client
+                .query()
+                .table_name(self.table_name("expense"))
+                .index_name("project_id-date-index")
+                .key_condition_expression("project_id = :project_id")
+                .expression_attribute_values(
+                    ":project_id",
+                    AttributeValue::S(project_id.to_string()),
+                )
+        })
+        .await
     }
 
     async fn list_expenses(
@@ -3424,6 +3769,13 @@ impl db::Handler for Handler {
             finalized_by_user_id: None,
             paid_date: None,
             pdf_s3_key: None,
+            due_date: None,
+            gst_cents: None,
+            payments: Vec::new(),
+            credited_cents: 0,
+            credited_gst_cents: 0,
+            sent_at: None,
+            sent_to: Vec::new(),
         }))
     }
 
@@ -3568,11 +3920,7 @@ impl db::Handler for Handler {
         instance_id: &str,
         invoice_id: &str,
         expected_version: u64,
-        number: u32,
-        issue_date: &str,
-        snapshot_json: &str,
-        total_cents: i64,
-        finalized_by_user_id: &str,
+        f: &db::FinalizeInvoice<'_>,
     ) -> db::Result<bool> {
         let now = crate::clock::now_sec();
         let update_invoice = Update::builder()
@@ -3580,9 +3928,9 @@ impl db::Handler for Handler {
             .key("id", AttributeValue::S(invoice_id.to_string()))
             .update_expression(
                 "SET #status = :finalized, #num = :number, issue_date = :issue_date, \
-                 #snap = :snapshot, total_cents = :total_cents, \
-                 finalized_at = :now, finalized_by_user_id = :finalized_by, \
-                 updated_at = :now ADD #v :one",
+                 due_date = :due_date, #snap = :snapshot, total_cents = :total_cents, \
+                 gst_cents = :gst_cents, finalized_at = :now, \
+                 finalized_by_user_id = :finalized_by, updated_at = :now ADD #v :one",
             )
             .condition_expression(
                 "attribute_exists(id) AND #status = :draft AND #v = :expected_version",
@@ -3598,15 +3946,23 @@ impl db::Handler for Handler {
                 ":expected_version",
                 AttributeValue::N(expected_version.to_string()),
             )
-            .expression_attribute_values(":number", AttributeValue::N(number.to_string()))
-            .expression_attribute_values(":issue_date", AttributeValue::S(issue_date.to_string()))
-            .expression_attribute_values(":snapshot", AttributeValue::S(snapshot_json.to_string()))
-            .expression_attribute_values(":total_cents", AttributeValue::N(total_cents.to_string()))
+            .expression_attribute_values(":number", AttributeValue::N(f.number.to_string()))
+            .expression_attribute_values(":issue_date", AttributeValue::S(f.issue_date.to_string()))
+            .expression_attribute_values(":due_date", AttributeValue::S(f.due_date.to_string()))
+            .expression_attribute_values(
+                ":snapshot",
+                AttributeValue::S(f.snapshot_json.to_string()),
+            )
+            .expression_attribute_values(
+                ":total_cents",
+                AttributeValue::N(f.total_cents.to_string()),
+            )
+            .expression_attribute_values(":gst_cents", AttributeValue::N(f.gst_cents.to_string()))
             .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
             .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
             .expression_attribute_values(
                 ":finalized_by",
-                AttributeValue::S(finalized_by_user_id.to_string()),
+                AttributeValue::S(f.finalized_by_user_id.to_string()),
             )
             .build()
             .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
@@ -3618,7 +3974,7 @@ impl db::Handler for Handler {
             .table_name(self.table_name("counter"))
             .key(
                 "id",
-                AttributeValue::S(db::invoice_number_reservation_id(instance_id, number)),
+                AttributeValue::S(db::invoice_number_reservation_id(instance_id, f.number)),
             )
             .update_expression("SET invoice_id = :invoice_id, created_at = :now")
             .condition_expression("attribute_not_exists(id)")
@@ -3637,44 +3993,113 @@ impl db::Handler for Handler {
         .await
     }
 
-    async fn set_invoice_paid(
+    async fn set_invoice_payments(
         &self,
         invoice_id: &str,
+        expected_version: u64,
+        payments: &[db::InvoicePayment],
         paid_date: Option<&str>,
     ) -> db::Result<bool> {
         self.ensure_writable()?;
         let now = crate::clock::now_sec();
+        let payments_json = if payments.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(payments)
+                    .map_err(|e| db::Error::Infrastructure(format!("serializing payments: {e}")))?,
+            )
+        };
+        let (expr, values) = set_remove_expression(
+            vec![
+                (
+                    "payments",
+                    ":payments",
+                    payments_json.map(AttributeValue::S),
+                ),
+                (
+                    "paid_date",
+                    ":paid_date",
+                    paid_date.map(|d| AttributeValue::S(d.to_string())),
+                ),
+            ],
+            &["updated_at = :now"],
+        );
         let mut req = self
             .client
             .update_item()
             .table_name(self.table_name("invoice"))
             .key("id", AttributeValue::S(invoice_id.to_string()))
-            .condition_expression("attribute_exists(id) AND #status = :finalized")
+            .update_expression(format!("{expr} ADD #v :one"))
+            .condition_expression(
+                "attribute_exists(id) AND #status = :finalized AND #v = :expected_version",
+            )
             .expression_attribute_names("#status", "status")
+            .expression_attribute_names("#v", "version")
             .expression_attribute_values(":finalized", AttributeValue::S("finalized".to_string()))
+            .expression_attribute_values(
+                ":expected_version",
+                AttributeValue::N(expected_version.to_string()),
+            )
+            .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
             .expression_attribute_values(":now", AttributeValue::N(now.to_string()));
-        req = match paid_date {
-            Some(d) => req
-                .update_expression("SET paid_date = :paid_date, updated_at = :now")
-                .expression_attribute_values(":paid_date", AttributeValue::S(d.to_string())),
-            None => req.update_expression("REMOVE paid_date SET updated_at = :now"),
-        };
+        for (placeholder, value) in values {
+            req = req.expression_attribute_values(placeholder, value);
+        }
         let resp = req
             .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
             .await;
-        match resp {
-            Ok(r) => {
-                record_capacity("set_invoice_paid", r.consumed_capacity(), CapKind::Write);
-                Ok(true)
-            }
-            Err(SdkError::ServiceError(ref se))
-                if se.err().is_conditional_check_failed_exception() =>
-            {
-                Ok(false)
-            }
-            Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
-        }
+        conditional_write_result("set_invoice_payments", resp)
+    }
+
+    async fn set_invoice_sent(
+        &self,
+        invoice_id: &str,
+        sent_at: u64,
+        to: &[String],
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("invoice"))
+            .key("id", AttributeValue::S(invoice_id.to_string()))
+            .update_expression("SET sent_at = :sent_at, sent_to = :sent_to")
+            .condition_expression("attribute_exists(id) AND #status = :finalized")
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":finalized", AttributeValue::S("finalized".to_string()))
+            .expression_attribute_values(":sent_at", AttributeValue::N(sent_at.to_string()))
+            .expression_attribute_values(":sent_to", AttributeValue::Ss(to.to_vec()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_invoice_sent", resp)
+    }
+
+    async fn list_all_finalized_invoices(
+        &self,
+        scope: db::InvoiceScope<'_>,
+    ) -> db::Result<Vec<db::Invoice>> {
+        let (index_name, key_attr, key_value) = match scope {
+            db::InvoiceScope::Instance(id) => ("instance_id-created_at-index", "instance_id", id),
+            db::InvoiceScope::Project(id) => ("project_id-created_at-index", "project_id", id),
+        };
+        query_all("list_all_finalized_invoices", || {
+            self.client
+                .query()
+                .table_name(self.table_name("invoice"))
+                .index_name(index_name)
+                .key_condition_expression(format!("{key_attr} = :key_value"))
+                .filter_expression("#status = :finalized")
+                .expression_attribute_names("#status", "status")
+                .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
+                .expression_attribute_values(
+                    ":finalized",
+                    AttributeValue::S("finalized".to_string()),
+                )
+        })
+        .await
     }
 
     async fn set_invoice_pdf_key(&self, invoice_id: &str, key: &str) -> db::Result<bool> {
@@ -3880,11 +4305,21 @@ impl db::Handler for Handler {
             db::InvoiceListFilter::Paid => {
                 Some("#status = :status_value AND attribute_exists(paid_date)")
             }
+            db::InvoiceListFilter::Overdue { .. } => Some(
+                "#status = :status_value AND attribute_not_exists(paid_date) \
+                 AND due_date < :today",
+            ),
         };
         let status_value = match filter {
             db::InvoiceListFilter::All => None,
             db::InvoiceListFilter::Draft => Some("draft"),
-            db::InvoiceListFilter::Unpaid | db::InvoiceListFilter::Paid => Some("finalized"),
+            db::InvoiceListFilter::Unpaid
+            | db::InvoiceListFilter::Paid
+            | db::InvoiceListFilter::Overdue { .. } => Some("finalized"),
+        };
+        let today = match &filter {
+            db::InvoiceListFilter::Overdue { today } => Some(today.clone()),
+            _ => None,
         };
 
         let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> =
@@ -3924,6 +4359,12 @@ impl db::Handler for Handler {
                             AttributeValue::S(v.to_string()),
                         );
                     }
+                    if let Some(today) = &today {
+                        builder = builder.expression_attribute_values(
+                            ":today",
+                            AttributeValue::S(today.clone()),
+                        );
+                    }
                 }
                 None => builder = builder.limit(page.limit),
             }
@@ -3943,6 +4384,215 @@ impl db::Handler for Handler {
         }
         items.truncate(fetch_limit);
         Ok(items)
+    }
+
+    // ── credit_note ───────────────────────────────────────────────────────
+
+    async fn create_credit_note(
+        &self,
+        note: &db::CreditNote,
+        invoice_expected_version: u64,
+        settled_date: Option<&str>,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let s = |v: &str| AttributeValue::S(v.to_string());
+        let n = |v: i64| AttributeValue::N(v.to_string());
+        let row: HashMap<String, AttributeValue> = HashMap::from([
+            ("id".to_string(), s(&note.id)),
+            ("instance_id".to_string(), s(&note.instance_id)),
+            ("invoice_id".to_string(), s(&note.invoice_id)),
+            ("project_id".to_string(), s(&note.project_id)),
+            ("number".to_string(), n(i64::from(note.number))),
+            ("issue_date".to_string(), s(&note.issue_date)),
+            ("reason".to_string(), s(&note.reason)),
+            ("snapshot".to_string(), s(&note.snapshot)),
+            ("subtotal_cents".to_string(), n(note.subtotal_cents)),
+            ("gst_cents".to_string(), n(note.gst_cents)),
+            ("total_cents".to_string(), n(note.total_cents)),
+            (
+                "created_by_user_id".to_string(),
+                s(&note.created_by_user_id),
+            ),
+            ("created_at".to_string(), n(note.created_at as i64)),
+        ]);
+        let put_note = Put::builder()
+            .table_name(self.table_name("credit_note"))
+            .set_item(Some(row))
+            .condition_expression("attribute_not_exists(id)")
+            .build()
+            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+        let mut update_expr = String::from("SET updated_at = :now");
+        if settled_date.is_some() {
+            update_expr.push_str(", paid_date = :paid_date");
+        }
+        update_expr.push_str(" ADD credited_cents :total, credited_gst_cents :gst, #v :one");
+        let mut update_invoice = Update::builder()
+            .table_name(self.table_name("invoice"))
+            .key("id", AttributeValue::S(note.invoice_id.clone()))
+            .update_expression(update_expr)
+            .condition_expression(
+                "attribute_exists(id) AND #status = :finalized AND #v = :expected_version",
+            )
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_names("#v", "version")
+            .expression_attribute_values(":finalized", s("finalized"))
+            .expression_attribute_values(
+                ":expected_version",
+                AttributeValue::N(invoice_expected_version.to_string()),
+            )
+            .expression_attribute_values(":now", n(note.created_at as i64))
+            .expression_attribute_values(":total", n(note.total_cents))
+            .expression_attribute_values(":gst", n(note.gst_cents))
+            .expression_attribute_values(":one", n(1));
+        if let Some(d) = settled_date {
+            update_invoice = update_invoice.expression_attribute_values(":paid_date", s(d));
+        }
+        let update_invoice = update_invoice
+            .build()
+            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+        self.transact_write(
+            "create_credit_note",
+            vec![
+                TransactWriteItem::builder().put(put_note).build(),
+                TransactWriteItem::builder().update(update_invoice).build(),
+            ],
+        )
+        .await
+    }
+
+    async fn get_credit_notes<T: AsRef<str> + Sync>(
+        &self,
+        ids: &[T],
+    ) -> db::Result<Vec<Option<db::CreditNote>>> {
+        self.get_records("credit_note", ids).await
+    }
+
+    async fn get_credit_note_consistent(&self, id: &str) -> db::Result<Option<db::CreditNote>> {
+        self.get_record_consistent("get_credit_note_consistent", "credit_note", id)
+            .await
+    }
+
+    async fn list_credit_notes(
+        &self,
+        scope: db::CreditNoteScope<'_>,
+        page: db::ListCreditNotesPage,
+    ) -> db::Result<Vec<db::CreditNote>> {
+        if page.limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let (index_name, key_attr, key_value) = credit_note_index(scope);
+        let exclusive_start_key = page.after.map(|c| {
+            HashMap::from([
+                ("id".to_string(), AttributeValue::S(c.id)),
+                (
+                    key_attr.to_string(),
+                    AttributeValue::S(key_value.to_string()),
+                ),
+                (
+                    "created_at".to_string(),
+                    AttributeValue::N(c.created_at.to_string()),
+                ),
+            ])
+        });
+        let resp = self
+            .client
+            .query()
+            .table_name(self.table_name("credit_note"))
+            .index_name(index_name)
+            .key_condition_expression(format!("{key_attr} = :key_value"))
+            .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
+            .scan_index_forward(false)
+            .limit(page.limit)
+            .set_exclusive_start_key(exclusive_start_key)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        record_capacity("list_credit_notes", resp.consumed_capacity(), CapKind::Read);
+        Ok(hydrate_items(resp.items)?)
+    }
+
+    async fn list_all_credit_notes(
+        &self,
+        scope: db::CreditNoteScope<'_>,
+    ) -> db::Result<Vec<db::CreditNote>> {
+        let (index_name, key_attr, key_value) = credit_note_index(scope);
+        query_all("list_all_credit_notes", || {
+            self.client
+                .query()
+                .table_name(self.table_name("credit_note"))
+                .index_name(index_name)
+                .key_condition_expression(format!("{key_attr} = :key_value"))
+                .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
+        })
+        .await
+    }
+
+    async fn increment_credit_note_counter(&self, instance_id: &str) -> db::Result<u64> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("counter"))
+            .key("id", AttributeValue::S(instance_id.to_string()))
+            .update_expression("ADD next_credit_note_number :one")
+            .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
+            .return_values(ReturnValue::UpdatedNew)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        record_capacity(
+            "increment_credit_note_counter",
+            resp.consumed_capacity(),
+            CapKind::Write,
+        );
+        resp.attributes
+            .as_ref()
+            .and_then(|a| a.get("next_credit_note_number"))
+            .and_then(|v| v.as_n().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .ok_or_else(|| {
+                db::Error::Infrastructure("counter update missing next_credit_note_number".into())
+            })
+    }
+
+    async fn set_credit_note_pdf_key(&self, id: &str, key: &str) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("credit_note"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .update_expression("SET pdf_s3_key = :key")
+            .condition_expression("attribute_exists(id)")
+            .expression_attribute_values(":key", AttributeValue::S(key.to_string()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_credit_note_pdf_key", resp)
+    }
+
+    async fn set_credit_note_sent(
+        &self,
+        id: &str,
+        sent_at: u64,
+        to: &[String],
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("credit_note"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .update_expression("SET sent_at = :sent_at, sent_to = :sent_to")
+            .condition_expression("attribute_exists(id)")
+            .expression_attribute_values(":sent_at", AttributeValue::N(sent_at.to_string()))
+            .expression_attribute_values(":sent_to", AttributeValue::Ss(to.to_vec()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_credit_note_sent", resp)
     }
 
     // ── ticket ────────────────────────────────────────────────────────────
