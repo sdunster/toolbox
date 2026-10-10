@@ -224,6 +224,21 @@ const TABLES: &[Table] = &[
         ttl: None,
     },
     Table {
+        name: "expense",
+        hash: "id",
+        attrs: &[
+            Attr("id", S),
+            Attr("instance_id", S),
+            Attr("project_id", S),
+            Attr("date", S),
+        ],
+        gsis: &[
+            all("instance_id-date-index", "instance_id", Some("date")),
+            all("project_id-date-index", "project_id", Some("date")),
+        ],
+        ttl: None,
+    },
+    Table {
         name: "invoice",
         hash: "id",
         attrs: &[

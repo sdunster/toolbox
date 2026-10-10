@@ -22,7 +22,7 @@ use super::dataloader::DatabaseLoader;
 use super::error::ApiError;
 use super::pagination::{build_connection, pagination_args};
 use super::{InstanceId, InvoiceId, ProjectId, UserId};
-use crate::invoicing::{self, money};
+use crate::invoicing::{self, money, vehicle};
 
 /// Metadata for a stored passkey credential — never the credential itself (no
 /// private key material, no raw `passkey_json`).
@@ -1744,6 +1744,258 @@ fn decode_billable_item_cursor(cursor: &str) -> Result<db::BillableItemCursor> {
     })
 }
 
+/// `expense.category` — the fixed list (CLAUDE.md's "Expenses" house rule).
+/// `VEHICLE_KM` is a cents-per-km trip; every other value is a purchase.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum ExpenseCategoryType {
+    Materials,
+    Subcontractors,
+    ToolsEquipment,
+    VehicleFuel,
+    VehicleKm,
+    Travel,
+    MealsEntertainment,
+    SoftwareSubscriptions,
+    PhoneInternet,
+    OfficeSupplies,
+    ProfessionalFees,
+    Insurance,
+    RentUtilities,
+    AdvertisingMarketing,
+    BankFees,
+    Training,
+    LicencesMemberships,
+    PostageFreight,
+    Other,
+}
+
+impl From<ExpenseCategoryType> for db::ExpenseCategory {
+    fn from(c: ExpenseCategoryType) -> Self {
+        use ExpenseCategoryType as T;
+        match c {
+            T::Materials => Self::Materials,
+            T::Subcontractors => Self::Subcontractors,
+            T::ToolsEquipment => Self::ToolsEquipment,
+            T::VehicleFuel => Self::VehicleFuel,
+            T::VehicleKm => Self::VehicleKm,
+            T::Travel => Self::Travel,
+            T::MealsEntertainment => Self::MealsEntertainment,
+            T::SoftwareSubscriptions => Self::SoftwareSubscriptions,
+            T::PhoneInternet => Self::PhoneInternet,
+            T::OfficeSupplies => Self::OfficeSupplies,
+            T::ProfessionalFees => Self::ProfessionalFees,
+            T::Insurance => Self::Insurance,
+            T::RentUtilities => Self::RentUtilities,
+            T::AdvertisingMarketing => Self::AdvertisingMarketing,
+            T::BankFees => Self::BankFees,
+            T::Training => Self::Training,
+            T::LicencesMemberships => Self::LicencesMemberships,
+            T::PostageFreight => Self::PostageFreight,
+            T::Other => Self::Other,
+        }
+    }
+}
+
+impl From<db::ExpenseCategory> for ExpenseCategoryType {
+    fn from(c: db::ExpenseCategory) -> Self {
+        use db::ExpenseCategory as C;
+        match c {
+            C::Materials => Self::Materials,
+            C::Subcontractors => Self::Subcontractors,
+            C::ToolsEquipment => Self::ToolsEquipment,
+            C::VehicleFuel => Self::VehicleFuel,
+            C::VehicleKm => Self::VehicleKm,
+            C::Travel => Self::Travel,
+            C::MealsEntertainment => Self::MealsEntertainment,
+            C::SoftwareSubscriptions => Self::SoftwareSubscriptions,
+            C::PhoneInternet => Self::PhoneInternet,
+            C::OfficeSupplies => Self::OfficeSupplies,
+            C::ProfessionalFees => Self::ProfessionalFees,
+            C::Insurance => Self::Insurance,
+            C::RentUtilities => Self::RentUtilities,
+            C::AdvertisingMarketing => Self::AdvertisingMarketing,
+            C::BankFees => Self::BankFees,
+            C::Training => Self::Training,
+            C::LicencesMemberships => Self::LicencesMemberships,
+            C::PostageFreight => Self::PostageFreight,
+            C::Other => Self::Other,
+        }
+    }
+}
+
+/// `createExpense`/`updateExpense`'s argument (update is a full replace).
+/// Which fields apply depends on `category` — see
+/// `invoicing::expense::validate_expense_input`:
+///
+/// - A purchase (every category but `VEHICLE_KM`): `supplier` and
+///   `amountCents` (integer cents, **GST-inclusive** — what was paid) are
+///   required; `gstCents` (the GST included in that amount) is optional —
+///   omit it for a GST-free purchase; `distanceKm` is refused.
+/// - A vehicle trip (`VEHICLE_KM`): `distanceKm` (a decimal string, ≤ 1 dp,
+///   `0 < d ≤ 5000`) and `description` (the trip's business purpose) are
+///   required; `supplier`/`amountCents`/`gstCents` are refused — the
+///   amount is distance × the ATO cents-per-km rate for the date's
+///   financial year.
+/// - `projectId` is optional; omit it for an expense that isn't for a
+///   particular job.
+#[derive(InputObject, Clone, Debug)]
+pub struct ExpenseInput {
+    pub project_id: Option<ID>,
+    pub date: String,
+    pub category: ExpenseCategoryType,
+    pub description: Option<String>,
+    pub supplier: Option<String>,
+    pub amount_cents: Option<i64>,
+    pub gst_cents: Option<i64>,
+    pub distance_km: Option<String>,
+}
+
+/// An `expense` row, exposed to its invoicing instance's members. See
+/// `db::Expense`.
+#[derive(Debug, PartialEq)]
+pub struct Expense<A: App + HasDb + Send + Sync> {
+    _marker: PhantomData<A>,
+    rec: db::Expense,
+}
+
+impl<A: App + HasDb + Send + Sync> Expense<A> {
+    pub fn new(rec: db::Expense) -> Self {
+        Self {
+            _marker: PhantomData,
+            rec,
+        }
+    }
+}
+
+impl<A: App + HasDb + Send + Sync> Clone for Expense<A> {
+    fn clone(&self) -> Self {
+        Self::new(self.rec.clone())
+    }
+}
+
+#[Object]
+impl<A: App + HasDb + Send + Sync + 'static> Expense<A> {
+    async fn id(&self) -> ID {
+        ID(self.rec.id.clone())
+    }
+    /// The project this expense is for, or `null`. Dataloaded.
+    async fn project(&self, ctx: &Context<'_>) -> Result<Option<Project<A>>> {
+        let Some(project_id) = &self.rec.fields.project_id else {
+            return Ok(None);
+        };
+        let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+        Ok(loader
+            .load_one(ProjectId(ID(project_id.clone())))
+            .await
+            .map_err(|e| anyhow!("Failed to load project via DataLoader: {}", e))?
+            .map(Project::new))
+    }
+    /// `YYYY-MM-DD`.
+    async fn date(&self) -> &str {
+        &self.rec.fields.date
+    }
+    async fn category(&self) -> ExpenseCategoryType {
+        self.rec.fields.category.into()
+    }
+    /// Optional for a purchase; a trip's business purpose for `VEHICLE_KM`.
+    async fn description(&self) -> Option<&str> {
+        self.rec.fields.description.as_deref()
+    }
+    /// `null` for a vehicle trip.
+    async fn supplier(&self) -> Option<&str> {
+        match &self.rec.fields.detail {
+            db::ExpenseDetail::Purchase { supplier, .. } => Some(supplier),
+            db::ExpenseDetail::VehicleKm { .. } => None,
+        }
+    }
+    /// What it cost, in cents: the GST-inclusive amount paid for a purchase;
+    /// round-half-up(distance × rate) for a trip, computed here, never
+    /// stored.
+    async fn amount_cents(&self) -> i64 {
+        self.rec.amount_cents()
+    }
+    /// The GST included in `amountCents`; `null` when GST-free, and always
+    /// for a trip.
+    async fn gst_cents(&self) -> Option<i64> {
+        match &self.rec.fields.detail {
+            db::ExpenseDetail::Purchase { gst_cents, .. } => *gst_cents,
+            db::ExpenseDetail::VehicleKm { .. } => None,
+        }
+    }
+    /// A trip's distance, as its shortest decimal string (`"12.5"`) —
+    /// the form `ExpenseInput.distanceKm` accepts. `null` for a purchase.
+    async fn distance_km(&self) -> Option<String> {
+        match &self.rec.fields.detail {
+            db::ExpenseDetail::VehicleKm {
+                distance_tenths_km, ..
+            } => Some(vehicle::format_distance_km(*distance_tenths_km)),
+            db::ExpenseDetail::Purchase { .. } => None,
+        }
+    }
+    /// The ATO rate this trip was claimed at, stored when it was written.
+    /// `null` for a purchase.
+    async fn rate_cents_per_km(&self) -> Option<i64> {
+        match &self.rec.fields.detail {
+            db::ExpenseDetail::VehicleKm {
+                rate_cents_per_km, ..
+            } => Some(*rate_cents_per_km),
+            db::ExpenseDetail::Purchase { .. } => None,
+        }
+    }
+    /// Dataloaded — see [`TicketMessage::author`]'s doc comment.
+    async fn created_by(&self, ctx: &Context<'_>) -> Result<Option<User<A>>> {
+        let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+        let rec = loader
+            .load_one(UserId(ID(self.rec.created_by_user_id.clone())))
+            .await
+            .map_err(|e| anyhow!("Failed to load createdBy via DataLoader: {}", e))?;
+        Ok(rec.map(User::new))
+    }
+    async fn created_at(&self) -> i64 {
+        self.rec.created_at as i64
+    }
+    async fn updated_at(&self) -> i64 {
+        self.rec.updated_at as i64
+    }
+}
+
+/// `vehicleKmSummary`: the caller's own cents-per-km trips in one financial
+/// year, against the ATO's 5,000 km cap. Informational — nothing enforces
+/// the cap.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct VehicleKmSummary {
+    /// The calendar year the financial year starts in (`2026` = FY
+    /// 2026–27, 1 July 2026 – 30 June 2027).
+    pub financial_year: i32,
+    /// `"2026–27"`.
+    pub financial_year_label: String,
+    /// Total distance, as a decimal string (`"1240.5"`).
+    pub total_km: String,
+    /// The ATO cap: 5,000 km per car per financial year.
+    pub cap_km: i64,
+    /// This financial year's ATO rate, or `null` if the built-in table has
+    /// none for it yet.
+    pub rate_cents_per_km: Option<i64>,
+}
+
+/// Default/max page size for `expenses` — the same numbers as
+/// `billableItems`.
+const DEFAULT_EXPENSE_PAGE_SIZE: usize = 25;
+const MAX_EXPENSE_PAGE_SIZE: usize = 100;
+
+/// `{date}:{id}` — see `db::ExpenseCursor`'s doc comment.
+fn encode_expense_cursor(e: &db::Expense) -> String {
+    format!("{}:{}", e.fields.date, e.id)
+}
+
+fn decode_expense_cursor(cursor: &str) -> Result<db::ExpenseCursor> {
+    let c = decode_billable_item_cursor(cursor)?;
+    Ok(db::ExpenseCursor {
+        date: c.date,
+        id: c.id,
+    })
+}
+
 /// Default/max page size for `invoices` — the same numbers as
 /// `billableItems`/`tickets`.
 const DEFAULT_INVOICE_PAGE_SIZE: usize = 25;
@@ -2280,6 +2532,131 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             false,
             |i| (encode_billable_item_cursor(i), BillableItem::new(i.clone())),
         ))
+    }
+
+    /// Expenses in an invoicing instance — all of them, or one project's
+    /// when `projectId` is given — as a Relay connection, newest `date`
+    /// first. Same posture as [`Self::billable_items`]: member of
+    /// `instanceId`, support instance rejected with a plain validation
+    /// error, `projectId` from another instance is `NOT_FOUND`, superusers
+    /// get nothing. `category` narrows to one category.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn expenses(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        project_id: Option<ID>,
+        category: Option<ExpenseCategoryType>,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<Connection<String, Expense<A>, EmptyFields, EmptyFields>> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let instance = app
+            .db()
+            .get_instances(&[instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
+            .map_err(|e| anyhow!(e))?;
+        if let Some(project_id) = &project_id {
+            app.db()
+                .get_projects(&[project_id.as_str()])
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .filter(|p| p.instance_id == instance.id)
+                .ok_or_else(|| ApiError::not_found("Project", project_id.as_str()))?;
+        }
+
+        let after_cursor = after.as_deref().map(decode_expense_cursor).transpose()?;
+        let has_after = after_cursor.is_some();
+        let (page_size, _) = pagination_args(
+            first,
+            None,
+            DEFAULT_EXPENSE_PAGE_SIZE,
+            MAX_EXPENSE_PAGE_SIZE,
+        )?;
+        let fetch_limit = i32::try_from(page_size.saturating_add(1))
+            .map_err(|_| anyhow!("Requested page is too large"))?;
+        let scope = match &project_id {
+            Some(p) => db::ExpenseScope::Project(p.as_str()),
+            None => db::ExpenseScope::Instance(instance_id.as_str()),
+        };
+        let expenses = app
+            .db()
+            .list_expenses(
+                scope,
+                category.map(Into::into),
+                db::ListExpensesPage {
+                    after: after_cursor,
+                    limit: fetch_limit,
+                },
+            )
+            .await?;
+
+        Ok(build_connection(
+            expenses,
+            page_size,
+            false,
+            has_after,
+            false,
+            |e| (encode_expense_cursor(e), Expense::new(e.clone())),
+        ))
+    }
+
+    /// The caller's own cents-per-km trips in `instanceId` for one
+    /// financial year (`financialYear` is the year it starts in; defaults to
+    /// the current one, by UTC date) against the ATO's 5,000 km cap.
+    /// Self-only by construction — it only ever sums the caller's trips,
+    /// since the cap applies per person. Member; support instance rejected
+    /// like `expenses`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn vehicle_km_summary(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        financial_year: Option<i32>,
+    ) -> Result<VehicleKmSummary> {
+        let Some(AuthInfo::User { id: user_id, .. }) = ctx.data_opt::<AuthInfo>() else {
+            return Err(ApiError::forbidden("Must be authenticated as a user").into());
+        };
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let instance = app
+            .db()
+            .get_instances(&[instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
+            .map_err(|e| anyhow!(e))?;
+        let financial_year = match financial_year {
+            Some(y) if (2000..=9998).contains(&y) => y,
+            Some(_) => return Err(anyhow!("financialYear is out of range")),
+            None => {
+                let today = chrono::DateTime::from_timestamp(crate::clock::now_sec() as i64, 0)
+                    .ok_or_else(|| anyhow!("System clock is out of range"))?
+                    .date_naive();
+                vehicle::financial_year_of(today)
+            }
+        };
+        let (from, to) = vehicle::financial_year_bounds(financial_year);
+        let tenths = app
+            .db()
+            .sum_vehicle_km_tenths(&instance.id, user_id, &from, &to)
+            .await?;
+        Ok(VehicleKmSummary {
+            financial_year,
+            financial_year_label: vehicle::format_financial_year(financial_year),
+            total_km: vehicle::format_distance_km(tenths),
+            cap_km: vehicle::ANNUAL_CAP_KM,
+            rate_cents_per_km: vehicle::rate_for_financial_year(financial_year).ok(),
+        })
     }
 
     /// Invoices in an invoicing instance — every project's, or one

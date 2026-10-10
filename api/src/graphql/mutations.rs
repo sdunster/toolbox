@@ -29,8 +29,8 @@ use crate::storage::Handler as _;
 use super::auth::{AuthGuard, AuthRequirement, is_member, is_owner};
 use super::error::ApiError;
 use super::query::{
-    ApiTokenInfo, BillableItem, BillableItemInput, CreateProjectInput, CreatedApiToken,
-    InboundAddressInfo, Instance, InstanceKindType, Invoice, InvoicingSettingsInput,
+    ApiTokenInfo, BillableItem, BillableItemInput, CreateProjectInput, CreatedApiToken, Expense,
+    ExpenseInput, InboundAddressInfo, Instance, InstanceKindType, Invoice, InvoicingSettingsInput,
     MembershipInfo, MembershipRoleType, NotificationSettingsInput, PasskeyInfo, Project, Ticket,
     TicketMessage, TicketStatusType, UpdateProjectInput, User,
 };
@@ -292,6 +292,73 @@ async fn require_billable_item_member<A: App + HasDb + Send + Sync>(
         return Err(ApiError::not_found("BillableItem", id).into());
     }
     Ok(item)
+}
+
+/// `updateExpense`/`deleteExpense`'s per-record authorization — the same
+/// shape as [`require_billable_item_member`]: `NOT_FOUND` for a missing
+/// expense and for one in an instance the caller isn't a member of alike.
+/// Superusers get no access.
+async fn require_expense_member<A: App + HasDb + Send + Sync>(
+    ctx: &Context<'_>,
+    app: &A,
+    id: &str,
+) -> Result<db::Expense> {
+    let Some(AuthInfo::User { memberships, .. }) = ctx.data_opt::<AuthInfo>() else {
+        return Err(ApiError::forbidden("Must be authenticated as a user").into());
+    };
+    let expense = app
+        .db()
+        .get_expenses(&[id])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Expense", id))?;
+    if !is_member(memberships, &expense.instance_id) {
+        return Err(ApiError::not_found("Expense", id).into());
+    }
+    Ok(expense)
+}
+
+/// Validate an [`ExpenseInput`] for `instance_id`. A `projectId` must be a
+/// project in the same instance (`NOT_FOUND` otherwise, like
+/// `billableItems`' filter), and an archived project takes no new expenses
+/// — unless `current_project_id` (the expense's project before this
+/// update) is that same project, so editing an expense on a since-archived
+/// job still works.
+async fn validate_expense<A: App + HasDb + Send + Sync>(
+    app: &A,
+    instance_id: &str,
+    input: &ExpenseInput,
+    current_project_id: Option<&str>,
+) -> Result<db::ExpenseFields> {
+    if let Some(project_id) = &input.project_id {
+        let project = app
+            .db()
+            .get_projects(&[project_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .filter(|p| p.instance_id == instance_id)
+            .ok_or_else(|| ApiError::not_found("Project", project_id.as_str()))?;
+        if project.archived && current_project_id != Some(project.id.as_str()) {
+            return Err(anyhow!(
+                "Project is archived — un-archive it to add expenses"
+            ));
+        }
+    }
+    invoicing::expense::validate_expense_input(invoicing::expense::ExpenseInput {
+        project_id: input.project_id.as_ref().map(|p| p.to_string()),
+        date: &input.date,
+        category: Some(input.category.into()),
+        description: input.description.as_deref(),
+        supplier: input.supplier.as_deref(),
+        amount_cents: input.amount_cents,
+        gst_cents: input.gst_cents,
+        distance_km: input.distance_km.as_deref(),
+    })
+    .map_err(|e| anyhow!(e))
 }
 
 /// The per-record authorization check every invoice mutation uses — the
@@ -3491,6 +3558,80 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             .into());
         }
         Ok(ID(item.id))
+    }
+
+    // ── Expenses ──────────────────────────────────────────────────────────────
+
+    /// Record an expense in an invoicing instance, optionally against one
+    /// of its projects. Any member (owner or agent); superusers without a
+    /// membership get nothing. Rejects a support instance. See
+    /// `ExpenseInput` for which fields a purchase and a vehicle trip take.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn create_expense(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        input: ExpenseInput,
+    ) -> Result<Expense<A>> {
+        let Some(AuthInfo::User { id: user_id, .. }) = ctx.data_opt::<AuthInfo>() else {
+            return Err(ApiError::forbidden("Must be authenticated as a user").into());
+        };
+        let instance = self
+            .app
+            .db()
+            .get_instances(&[instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
+            .map_err(|e| anyhow!(e))?;
+        let fields = validate_expense(&*self.app, &instance.id, &input, None).await?;
+        let created = self
+            .app
+            .db()
+            .create_expense(&instance.id, &fields, user_id)
+            .await?;
+        Ok(Expense::new(created))
+    }
+
+    /// Full-replace an expense — including its category (a purchase can
+    /// become a trip and vice versa) and its project (omit `projectId` to
+    /// detach it). Id-only, `NOT_FOUND` for missing or not yours. A trip's
+    /// rate is looked up again from its (possibly new) date.
+    async fn update_expense(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        input: ExpenseInput,
+    ) -> Result<Expense<A>> {
+        let expense = require_expense_member(ctx, &*self.app, id.as_str()).await?;
+        let fields = validate_expense(
+            &*self.app,
+            &expense.instance_id,
+            &input,
+            expense.fields.project_id.as_deref(),
+        )
+        .await?;
+        if !self.app.db().update_expense(&expense.id, &fields).await? {
+            return Err(ApiError::not_found("Expense", id.as_str()).into());
+        }
+        Ok(Expense::new(db::Expense {
+            fields,
+            updated_at: crate::clock::now_sec(),
+            ..expense
+        }))
+    }
+
+    /// Delete an expense, returning its id. Expenses are never on an
+    /// invoice, so nothing else holds on to one.
+    async fn delete_expense(&self, ctx: &Context<'_>, id: ID) -> Result<ID> {
+        let expense = require_expense_member(ctx, &*self.app, id.as_str()).await?;
+        if !self.app.db().delete_expense(&expense.id).await? {
+            return Err(ApiError::not_found("Expense", id.as_str()).into());
+        }
+        Ok(ID(expense.id))
     }
 
     // ── Invoices ──────────────────────────────────────────────────────────────

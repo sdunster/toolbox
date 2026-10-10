@@ -287,6 +287,31 @@ local setup, and `SCHEMA.md` for the data model.
     TTF for Unicode text and both the crate and the font are pure Rust/no native deps, so the
     renderer builds standalone for `cargo lambda`.
 
+- **Expenses (`{prefix}_expense`): what an invoicing instance spends, never invoiced.** Optionally
+  linked to one of the instance's projects (`project_id` omitted when unset, so the sparse
+  `project_id-date-index` drops it). Same guards and kind check as billable items (`Member`,
+  `db::require_instance_kind`, superusers get nothing, `NOT_FOUND` for missing and not-yours alike),
+  and an archived project takes no *new* expenses. Every expense can be edited or deleted — none is
+  ever on an invoice, and v1 deliberately has no rebilling and no receipt uploads.
+  - **Categories are a fixed list in code** (`db::ExpenseCategory`/`ExpenseCategoryType`, labels in
+    `web/src/lib/expenses.ts`), not per-instance configuration, so totals stay comparable. Adding
+    one is adding an enum value in all three places.
+  - **A purchase stores its GST-inclusive `amount_cents` plus an optional `gst_cents`** (the GST
+    in it; absent = GST-free). The web form pre-fills total ÷ 11 until the user overrides it; the
+    API only checks `0 ≤ gst ≤ amount`.
+  - **`VEHICLE_KM` is a cents-per-km trip, not a purchase**: `distanceKm` (≤ 1 dp, ≤ 5,000) plus a
+    required business-purpose `description`; supplier/amount/GST are refused. The rate is **never
+    taken from the caller** — `invoicing::vehicle::ATO_RATES` maps a financial year (1 July start)
+    to the ATO's published cents-per-km rate, looked up from the trip's date on every write and
+    stored on the row; the amount is derived on read. A date in a financial year the table doesn't
+    cover yet is refused, never priced at a guess. **Each July, add the new year's rate** to
+    `ATO_RATES` (with its test row) and to the preview mirror in `web/src/lib/expenses.ts`.
+  - **The ATO's 5,000 km cap is shown, never enforced**: `vehicleKmSummary` sums the *caller's
+    own* trips (`created_by_user_id`) in one financial year — the cap is per person and per car,
+    which Toolbox can't fully know — and the web turns amber past 4,500 km and red past 5,000.
+  - `invoicing::expense::validate_expense_input` is the one place an `ExpenseFields` is built from
+    input, so the category ↔ shape rule can't drift between create and update.
+
 - **OAuth tokens (`mtoa_`/`mtor_`) are for the MCP interface only and never reach GraphQL.**
   `api/src/oauth.rs` holds one `oauth_grant` row per client a user authorizes (access + refresh
   token hashes, audience-bound to `<api base>/mcp`). Like `mta_`, the grant id is embedded in

@@ -4,6 +4,8 @@
 //!   - the whole lifecycle: project -> billable items -> draft invoice -> finalize
 //!     (needs a business name; strictly final afterwards) -> paid -> PDF link;
 //!   - draft editing (add/remove/delete) and `update_project`'s merge semantics;
+//!   - expenses: a purchase and a cents-per-km trip, update/delete, and the
+//!     caller's financial-year km summary;
 //!   - the boundaries: a superuser without a membership sees nothing (and
 //!     someone else's invoice looks exactly like a missing one), and a support
 //!     instance is refused by the resolver's own kind check.
@@ -553,6 +555,11 @@ async fn invoicing_tools_are_listed_and_finalize_warns() {
         "finalize_invoice",
         "set_invoice_paid",
         "get_invoice_pdf_url",
+        "list_expenses",
+        "create_expense",
+        "update_expense",
+        "delete_expense",
+        "get_vehicle_km_summary",
     ] {
         assert!(tools.iter().any(|t| t["name"] == expected), "{expected}");
     }
@@ -583,5 +590,112 @@ async fn invoicing_tools_are_listed_and_finalize_warns() {
         .await
         .is_err(),
         "issueDate is required"
+    );
+}
+
+#[tokio::test]
+async fn expenses_and_vehicle_km() {
+    let Some(w) = world().await else { return };
+    let t = &w.member_token;
+    let project_id = project(&w, "Expenses job").await;
+
+    let bought = call_tool(
+        &w.f,
+        t,
+        "create_expense",
+        json!({"instanceId": w.instance, "projectId": project_id, "date": "2026-09-02",
+               "category": "MATERIALS", "supplier": "Fictional Hardware",
+               "amountCents": 5_500, "gstCents": 500}),
+    )
+    .await
+    .unwrap()["expense"]
+        .clone();
+    assert_eq!(bought["amountCents"], 5_500);
+    assert_eq!(bought["project"]["id"], json!(project_id));
+
+    // A JSON number distance is accepted; 10 km on 2 Sep 2026 at 91c.
+    let trip = call_tool(
+        &w.f,
+        t,
+        "create_expense",
+        json!({"instanceId": w.instance, "date": "2026-09-03", "category": "VEHICLE_KM",
+               "description": "Client meeting", "distanceKm": 10}),
+    )
+    .await
+    .unwrap()["expense"]
+        .clone();
+    assert_eq!(trip["distanceKm"], "10");
+    assert_eq!(trip["rateCentsPerKm"], 91);
+    assert_eq!(trip["amountCents"], 910);
+
+    let refused = call_tool(
+        &w.f,
+        t,
+        "create_expense",
+        json!({"instanceId": w.instance, "date": "2026-09-03", "category": "VEHICLE_KM",
+               "description": "Fuel", "distanceKm": "5", "supplier": "Fictional Fuel"}),
+    )
+    .await;
+    assert!(refused.is_err(), "{refused:?}");
+
+    let updated = call_tool(
+        &w.f,
+        t,
+        "update_expense",
+        json!({"id": id(&trip), "date": "2026-09-03", "category": "VEHICLE_KM",
+               "description": "Client meeting", "distanceKm": "25.5"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated["expense"]["distanceKm"], "25.5");
+
+    let summary = call_tool(
+        &w.f,
+        t,
+        "get_vehicle_km_summary",
+        json!({"instanceId": w.instance, "financialYear": 2026}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary["summary"]["totalKm"], "25.5");
+    assert_eq!(summary["summary"]["capKm"], 5000);
+
+    let trips = call_tool(
+        &w.f,
+        t,
+        "list_expenses",
+        json!({"instanceId": w.instance, "category": "VEHICLE_KM"}),
+    )
+    .await
+    .unwrap();
+    let trips = trips["expenses"].as_array().unwrap();
+    assert_eq!(trips.len(), 1);
+    assert_eq!(trips[0]["id"], json!(id(&trip)));
+
+    let deleted = call_tool(&w.f, t, "delete_expense", json!({"id": id(&bought)}))
+        .await
+        .unwrap();
+    assert_eq!(deleted["deletedId"], json!(id(&bought)));
+
+    // A superuser without a membership sees nothing; a support instance is refused.
+    assert!(
+        call_tool(
+            &w.f,
+            &w.outsider_token,
+            "list_expenses",
+            json!({"instanceId": w.instance}),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        call_tool(
+            &w.f,
+            &w.support_token,
+            "list_expenses",
+            json!({"instanceId": w.support_instance}),
+        )
+        .await
+        .is_err()
     );
 }

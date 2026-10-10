@@ -543,6 +543,105 @@ impl TryInto<db::BillableItem> for Item {
     }
 }
 
+impl TryInto<db::Expense> for Item {
+    type Error = HydrationError;
+    fn try_into(self) -> Result<db::Expense, Self::Error> {
+        let raw_category = self
+            .string_field("category")?
+            .ok_or_else(|| anyhow!("Expense missing category"))?;
+        let category = db::ExpenseCategory::parse(&raw_category)
+            .ok_or_else(|| anyhow!("Expense has unknown category {raw_category:?}"))?;
+        let detail = if category == db::ExpenseCategory::VehicleKm {
+            db::ExpenseDetail::VehicleKm {
+                distance_tenths_km: self
+                    .i64_field("distance_tenths_km")?
+                    .ok_or_else(|| anyhow!("Expense missing distance_tenths_km"))?,
+                rate_cents_per_km: self
+                    .i64_field("rate_cents_per_km")?
+                    .ok_or_else(|| anyhow!("Expense missing rate_cents_per_km"))?,
+            }
+        } else {
+            db::ExpenseDetail::Purchase {
+                supplier: self
+                    .string_field("supplier")?
+                    .ok_or_else(|| anyhow!("Expense missing supplier"))?,
+                amount_cents: self
+                    .i64_field("amount_cents")?
+                    .ok_or_else(|| anyhow!("Expense missing amount_cents"))?,
+                gst_cents: self.i64_field("gst_cents")?,
+            }
+        };
+        Ok(db::Expense {
+            id: self.id()?,
+            instance_id: self
+                .string_field("instance_id")?
+                .ok_or_else(|| anyhow!("Expense missing instance_id"))?,
+            fields: db::ExpenseFields {
+                project_id: self.string_field("project_id")?,
+                date: self
+                    .string_field("date")?
+                    .ok_or_else(|| anyhow!("Expense missing date"))?,
+                category,
+                description: self.string_field("description")?,
+                detail,
+            },
+            created_by_user_id: self
+                .string_field("created_by_user_id")?
+                .ok_or_else(|| anyhow!("Expense missing created_by_user_id"))?,
+            created_at: self
+                .i64_field("created_at")?
+                .ok_or_else(|| anyhow!("Expense missing created_at"))?
+                as u64,
+            updated_at: self
+                .i64_field("updated_at")?
+                .ok_or_else(|| anyhow!("Expense missing updated_at"))?
+                as u64,
+        })
+    }
+}
+
+/// Every editable `expense` attribute, `Some` to write and `None` to leave
+/// absent (`create_expense`) or `REMOVE` (`update_expense`) — the
+/// omit-optional-attributes house rule, in one place for both writes.
+fn expense_attributes(fields: &db::ExpenseFields) -> Vec<(&'static str, Option<AttributeValue>)> {
+    let s = |v: &str| Some(AttributeValue::S(v.to_string()));
+    let n = |v: i64| Some(AttributeValue::N(v.to_string()));
+    let (supplier, amount, gst, distance, rate) = match &fields.detail {
+        db::ExpenseDetail::Purchase {
+            supplier,
+            amount_cents,
+            gst_cents,
+        } => (
+            s(supplier),
+            n(*amount_cents),
+            gst_cents.and_then(n),
+            None,
+            None,
+        ),
+        db::ExpenseDetail::VehicleKm {
+            distance_tenths_km,
+            rate_cents_per_km,
+        } => (
+            None,
+            None,
+            None,
+            n(*distance_tenths_km),
+            n(*rate_cents_per_km),
+        ),
+    };
+    vec![
+        ("project_id", fields.project_id.as_deref().and_then(s)),
+        ("date", s(&fields.date)),
+        ("category", s(fields.category.as_str())),
+        ("description", fields.description.as_deref().and_then(s)),
+        ("supplier", supplier),
+        ("amount_cents", amount),
+        ("gst_cents", gst),
+        ("distance_tenths_km", distance),
+        ("rate_cents_per_km", rate),
+    ]
+}
+
 impl TryInto<db::Invoice> for Item {
     type Error = HydrationError;
     fn try_into(self) -> Result<db::Invoice, Self::Error> {
@@ -2969,6 +3068,257 @@ impl db::Handler for Handler {
         // nothing.
         items.truncate(fetch_limit);
         Ok(items)
+    }
+
+    // ── expense ───────────────────────────────────────────────────────────
+    //
+    // `date` is a DynamoDB reserved word, aliased `#d` as for `billable_item`.
+
+    async fn create_expense(
+        &self,
+        instance_id: &str,
+        fields: &db::ExpenseFields,
+        created_by_user_id: &str,
+    ) -> db::Result<db::Expense> {
+        self.ensure_writable()?;
+        let id = new_id();
+        let now = crate::clock::now_sec();
+        let mut req = self
+            .client
+            .put_item()
+            .table_name(self.table_name("expense"))
+            .item("id", AttributeValue::S(id.clone()))
+            .item("instance_id", AttributeValue::S(instance_id.to_string()))
+            .item(
+                "created_by_user_id",
+                AttributeValue::S(created_by_user_id.to_string()),
+            )
+            .item("created_at", AttributeValue::N(now.to_string()))
+            .item("updated_at", AttributeValue::N(now.to_string()));
+        for (attr, value) in expense_attributes(fields) {
+            if let Some(value) = value {
+                req = req.item(attr, value);
+            }
+        }
+        let resp = req
+            .condition_expression("attribute_not_exists(id)")
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        record_capacity("create_expense", resp.consumed_capacity(), CapKind::Write);
+        Ok(db::Expense {
+            id,
+            instance_id: instance_id.to_string(),
+            fields: fields.clone(),
+            created_by_user_id: created_by_user_id.to_string(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    async fn get_expenses<T: AsRef<str> + Sync>(
+        &self,
+        ids: &[T],
+    ) -> db::Result<Vec<Option<db::Expense>>> {
+        self.get_records("expense", ids).await
+    }
+
+    async fn update_expense(&self, id: &str, fields: &db::ExpenseFields) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let now = crate::clock::now_sec();
+        let mut sets = vec!["updated_at = :updated_at".to_string()];
+        let mut removes: Vec<&str> = Vec::new();
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("expense"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .condition_expression("attribute_exists(id)")
+            .expression_attribute_names("#d", "date")
+            .expression_attribute_values(":updated_at", AttributeValue::N(now.to_string()));
+        for (attr, value) in expense_attributes(fields) {
+            let name = if attr == "date" { "#d" } else { attr };
+            match value {
+                Some(value) => {
+                    sets.push(format!("{name} = :{attr}"));
+                    req = req.expression_attribute_values(format!(":{attr}"), value);
+                }
+                None => removes.push(name),
+            }
+        }
+        let mut update_expr = format!("SET {}", sets.join(", "));
+        if !removes.is_empty() {
+            update_expr.push_str(" REMOVE ");
+            update_expr.push_str(&removes.join(", "));
+        }
+        let resp = req
+            .update_expression(update_expr)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                record_capacity("update_expense", r.consumed_capacity(), CapKind::Write);
+                Ok(true)
+            }
+            Err(SdkError::ServiceError(ref se))
+                if se.err().is_conditional_check_failed_exception() =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
+        }
+    }
+
+    async fn delete_expense(&self, id: &str) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .delete_item()
+            .table_name(self.table_name("expense"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .condition_expression("attribute_exists(id)")
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                record_capacity("delete_expense", r.consumed_capacity(), CapKind::Write);
+                Ok(true)
+            }
+            Err(SdkError::ServiceError(ref se))
+                if se.err().is_conditional_check_failed_exception() =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
+        }
+    }
+
+    async fn list_expenses(
+        &self,
+        scope: db::ExpenseScope<'_>,
+        category: Option<db::ExpenseCategory>,
+        page: db::ListExpensesPage,
+    ) -> db::Result<Vec<db::Expense>> {
+        let fetch_limit = usize::try_from(page.limit).unwrap_or(0);
+        if fetch_limit == 0 {
+            return Ok(Vec::new());
+        }
+        let (index_name, key_attr, key_value) = match scope {
+            db::ExpenseScope::Instance(id) => ("instance_id-date-index", "instance_id", id),
+            db::ExpenseScope::Project(id) => ("project_id-date-index", "project_id", id),
+        };
+        // Same ExclusiveStartKey shape as `list_billable_items`: table key,
+        // GSI hash key (from the scope), GSI sort key (from the cursor).
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> =
+            page.after.map(|c| {
+                HashMap::from([
+                    ("id".to_string(), AttributeValue::S(c.id)),
+                    (
+                        key_attr.to_string(),
+                        AttributeValue::S(key_value.to_string()),
+                    ),
+                    ("date".to_string(), AttributeValue::S(c.date)),
+                ])
+            });
+
+        // `Limit` runs before the filter — keep going until the page is full
+        // or the index is exhausted, exactly as `list_billable_items` does.
+        let mut expenses: Vec<db::Expense> = Vec::new();
+        loop {
+            let mut builder = self
+                .client
+                .query()
+                .table_name(self.table_name("expense"))
+                .index_name(index_name)
+                .key_condition_expression(format!("{key_attr} = :key_value"))
+                .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
+                .scan_index_forward(false)
+                .return_consumed_capacity(ReturnConsumedCapacity::Total);
+            match category {
+                Some(c) => {
+                    builder = builder
+                        .filter_expression("category = :category")
+                        .expression_attribute_values(
+                            ":category",
+                            AttributeValue::S(c.as_str().to_string()),
+                        )
+                }
+                None => builder = builder.limit(page.limit),
+            }
+            if let Some(esk) = exclusive_start_key.take() {
+                builder = builder.set_exclusive_start_key(Some(esk));
+            }
+            let resp = builder
+                .send()
+                .await
+                .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+            record_capacity("list_expenses", resp.consumed_capacity(), CapKind::Read);
+            expenses.extend(hydrate_items::<db::Expense>(resp.items)?);
+            exclusive_start_key = resp.last_evaluated_key;
+            if expenses.len() >= fetch_limit || exclusive_start_key.is_none() {
+                break;
+            }
+        }
+        expenses.truncate(fetch_limit);
+        Ok(expenses)
+    }
+
+    async fn sum_vehicle_km_tenths(
+        &self,
+        instance_id: &str,
+        user_id: &str,
+        from: &str,
+        to: &str,
+    ) -> db::Result<i64> {
+        let mut total: i64 = 0;
+        let mut exclusive_start_key: Option<HashMap<String, AttributeValue>> = None;
+        loop {
+            let resp = self
+                .client
+                .query()
+                .table_name(self.table_name("expense"))
+                .index_name("instance_id-date-index")
+                .key_condition_expression("instance_id = :instance_id AND #d BETWEEN :from AND :to")
+                .filter_expression("category = :category AND created_by_user_id = :user_id")
+                .expression_attribute_names("#d", "date")
+                .expression_attribute_values(
+                    ":instance_id",
+                    AttributeValue::S(instance_id.to_string()),
+                )
+                .expression_attribute_values(":from", AttributeValue::S(from.to_string()))
+                .expression_attribute_values(":to", AttributeValue::S(to.to_string()))
+                .expression_attribute_values(
+                    ":category",
+                    AttributeValue::S(db::ExpenseCategory::VehicleKm.as_str().to_string()),
+                )
+                .expression_attribute_values(":user_id", AttributeValue::S(user_id.to_string()))
+                .projection_expression("distance_tenths_km")
+                .set_exclusive_start_key(exclusive_start_key.take())
+                .return_consumed_capacity(ReturnConsumedCapacity::Total)
+                .send()
+                .await
+                .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+            record_capacity(
+                "sum_vehicle_km_tenths",
+                resp.consumed_capacity(),
+                CapKind::Read,
+            );
+            for raw in resp.items.unwrap_or_default() {
+                let tenths = Item(raw)
+                    .i64_field("distance_tenths_km")
+                    .map_err(|e| db::Error::Hydration(e.to_string()))?
+                    .unwrap_or(0);
+                total = total.saturating_add(tenths);
+            }
+            exclusive_start_key = resp.last_evaluated_key;
+            if exclusive_start_key.is_none() {
+                break;
+            }
+        }
+        Ok(total)
     }
 
     // ── invoice ───────────────────────────────────────────────────────────

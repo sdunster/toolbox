@@ -175,6 +175,137 @@ type CreatedApiToken {
 	apiToken: ApiTokenInfo!
 }
 
+type Expense {
+	id: ID!
+	"""
+	The project this expense is for, or `null`. Dataloaded.
+	"""
+	project: Project
+	"""
+	`YYYY-MM-DD`.
+	"""
+	date: String!
+	category: ExpenseCategoryType!
+	"""
+	Optional for a purchase; a trip's business purpose for `VEHICLE_KM`.
+	"""
+	description: String
+	"""
+	`null` for a vehicle trip.
+	"""
+	supplier: String
+	"""
+	What it cost, in cents: the GST-inclusive amount paid for a purchase;
+	round-half-up(distance × rate) for a trip, computed here, never
+	stored.
+	"""
+	amountCents: Int!
+	"""
+	The GST included in `amountCents`; `null` when GST-free, and always
+	for a trip.
+	"""
+	gstCents: Int
+	"""
+	A trip's distance, as its shortest decimal string (`"12.5"`) —
+	the form `ExpenseInput.distanceKm` accepts. `null` for a purchase.
+	"""
+	distanceKm: String
+	"""
+	The ATO rate this trip was claimed at, stored when it was written.
+	`null` for a purchase.
+	"""
+	rateCentsPerKm: Int
+	"""
+	Dataloaded — see [`TicketMessage::author`]'s doc comment.
+	"""
+	createdBy: User
+	createdAt: Int!
+	updatedAt: Int!
+}
+
+"""
+`expense.category` — the fixed list (CLAUDE.md's "Expenses" house rule).
+`VEHICLE_KM` is a cents-per-km trip; every other value is a purchase.
+"""
+enum ExpenseCategoryType {
+	MATERIALS
+	SUBCONTRACTORS
+	TOOLS_EQUIPMENT
+	VEHICLE_FUEL
+	VEHICLE_KM
+	TRAVEL
+	MEALS_ENTERTAINMENT
+	SOFTWARE_SUBSCRIPTIONS
+	PHONE_INTERNET
+	OFFICE_SUPPLIES
+	PROFESSIONAL_FEES
+	INSURANCE
+	RENT_UTILITIES
+	ADVERTISING_MARKETING
+	BANK_FEES
+	TRAINING
+	LICENCES_MEMBERSHIPS
+	POSTAGE_FREIGHT
+	OTHER
+}
+
+type ExpenseConnection {
+	"""
+	Information to aid in pagination.
+	"""
+	pageInfo: PageInfo!
+	"""
+	A list of edges.
+	"""
+	edges: [ExpenseEdge!]!
+	"""
+	A list of nodes.
+	"""
+	nodes: [Expense!]!
+}
+
+"""
+An edge in a connection.
+"""
+type ExpenseEdge {
+	"""
+	The item at the end of the edge
+	"""
+	node: Expense!
+	"""
+	A cursor for use in pagination
+	"""
+	cursor: String!
+}
+
+"""
+`createExpense`/`updateExpense`'s argument (update is a full replace).
+Which fields apply depends on `category` — see
+`invoicing::expense::validate_expense_input`:
+
+- A purchase (every category but `VEHICLE_KM`): `supplier` and
+`amountCents` (integer cents, **GST-inclusive** — what was paid) are
+required; `gstCents` (the GST included in that amount) is optional —
+omit it for a GST-free purchase; `distanceKm` is refused.
+- A vehicle trip (`VEHICLE_KM`): `distanceKm` (a decimal string, ≤ 1 dp,
+`0 < d ≤ 5000`) and `description` (the trip's business purpose) are
+required; `supplier`/`amountCents`/`gstCents` are refused — the
+amount is distance × the ATO cents-per-km rate for the date's
+financial year.
+- `projectId` is optional; omit it for an expense that isn't for a
+particular job.
+"""
+input ExpenseInput {
+	projectId: ID
+	date: String!
+	category: ExpenseCategoryType!
+	description: String
+	supplier: String
+	amountCents: Int
+	gstCents: Int
+	distanceKm: String
+}
+
 """
 An `inbound_address` row, exposed over GraphQL. Only reachable through
 `Instance.inboundAddresses`, which is owner-guarded — see that field's doc
@@ -989,6 +1120,25 @@ type MutationRoot {
 	"""
 	deleteBillableItem(id: ID!): ID!
 	"""
+	Record an expense in an invoicing instance, optionally against one
+	of its projects. Any member (owner or agent); superusers without a
+	membership get nothing. Rejects a support instance. See
+	`ExpenseInput` for which fields a purchase and a vehicle trip take.
+	"""
+	createExpense(instanceId: ID!, input: ExpenseInput!): Expense!
+	"""
+	Full-replace an expense — including its category (a purchase can
+	become a trip and vice versa) and its project (omit `projectId` to
+	detach it). Id-only, `NOT_FOUND` for missing or not yours. A trip's
+	rate is looked up again from its (possibly new) date.
+	"""
+	updateExpense(id: ID!, input: ExpenseInput!): Expense!
+	"""
+	Delete an expense, returning its id. Expenses are never on an
+	invoice, so nothing else holds on to one.
+	"""
+	deleteExpense(id: ID!): ID!
+	"""
 	Create a draft invoice from a project's unbilled items, in one
 	transaction (`db::Handler::create_invoice`). Authorised through the
 	project like `createBillableItem` — `NOT_FOUND` for a missing
@@ -1302,6 +1452,24 @@ type QueryRoot {
 	"""
 	billableItems(instanceId: ID!, projectId: ID, filter: BillableItemFilterType! = ALL, first: Int, after: String): BillableItemConnection!
 	"""
+	Expenses in an invoicing instance — all of them, or one project's
+	when `projectId` is given — as a Relay connection, newest `date`
+	first. Same posture as [`Self::billable_items`]: member of
+	`instanceId`, support instance rejected with a plain validation
+	error, `projectId` from another instance is `NOT_FOUND`, superusers
+	get nothing. `category` narrows to one category.
+	"""
+	expenses(instanceId: ID!, projectId: ID, category: ExpenseCategoryType, first: Int, after: String): ExpenseConnection!
+	"""
+	The caller's own cents-per-km trips in `instanceId` for one
+	financial year (`financialYear` is the year it starts in; defaults to
+	the current one, by UTC date) against the ATO's 5,000 km cap.
+	Self-only by construction — it only ever sums the caller's trips,
+	since the cap applies per person. Member; support instance rejected
+	like `expenses`.
+	"""
+	vehicleKmSummary(instanceId: ID!, financialYear: Int): VehicleKmSummary!
+	"""
 	Invoices in an invoicing instance — every project's, or one
 	project's when `projectId` is given — as a Relay connection, newest
 	`createdAt` first (see `db::Handler::list_invoices`). Same posture as
@@ -1569,6 +1737,36 @@ type User {
 	belongs to is none of their business.
 	"""
 	memberships: [MembershipInfo!]!
+}
+
+"""
+`vehicleKmSummary`: the caller's own cents-per-km trips in one financial
+year, against the ATO's 5,000 km cap. Informational — nothing enforces
+the cap.
+"""
+type VehicleKmSummary {
+	"""
+	The calendar year the financial year starts in (`2026` = FY
+	2026–27, 1 July 2026 – 30 June 2027).
+	"""
+	financialYear: Int!
+	"""
+	`"2026–27"`.
+	"""
+	financialYearLabel: String!
+	"""
+	Total distance, as a decimal string (`"1240.5"`).
+	"""
+	totalKm: String!
+	"""
+	The ATO cap: 5,000 km per car per financial year.
+	"""
+	capKm: Int!
+	"""
+	This financial year's ATO rate, or `null` if the built-in table has
+	none for it yet.
+	"""
+	rateCentsPerKm: Int
 }
 
 """

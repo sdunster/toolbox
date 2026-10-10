@@ -10,6 +10,7 @@ import { RequireInvoicingInstance } from "./RequireInvoicingInstance";
 import { ProjectEditForm } from "./ProjectEditForm";
 import { ProjectBillableItems } from "./ProjectBillableItems";
 import { ProjectInvoices } from "./ProjectInvoices";
+import { ProjectExpenses } from "./ProjectExpenses";
 
 const projectDetailPageQuery = graphql`
   query ProjectDetailPageQuery($id: ID!) @throwOnFieldError {
@@ -84,6 +85,12 @@ function Content({ id }: { id: string }) {
       <ProjectInvoices
         instanceId={project.instance.id}
         projectId={project.id}
+      />
+      <ProjectExpenses
+        instanceId={project.instance.id}
+        projectId={project.id}
+        currency={project.instance.invoicingSettings?.currency ?? "AUD"}
+        archived={project.archived}
       />
     </div>
   );

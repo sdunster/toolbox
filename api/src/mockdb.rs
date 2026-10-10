@@ -352,6 +352,51 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    // ── expense ───────────────────────────────────────────────────────────
+
+    async fn create_expense(
+        &self,
+        _instance_id: &str,
+        _fields: &db::ExpenseFields,
+        _created_by_user_id: &str,
+    ) -> db::Result<db::Expense> {
+        Self::unsupported()
+    }
+
+    async fn get_expenses<T: AsRef<str> + Sync>(
+        &self,
+        _ids: &[T],
+    ) -> db::Result<Vec<Option<db::Expense>>> {
+        Self::unsupported()
+    }
+
+    async fn update_expense(&self, _id: &str, _fields: &db::ExpenseFields) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn delete_expense(&self, _id: &str) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn list_expenses(
+        &self,
+        _scope: db::ExpenseScope<'_>,
+        _category: Option<db::ExpenseCategory>,
+        _page: db::ListExpensesPage,
+    ) -> db::Result<Vec<db::Expense>> {
+        Self::unsupported()
+    }
+
+    async fn sum_vehicle_km_tenths(
+        &self,
+        _instance_id: &str,
+        _user_id: &str,
+        _from: &str,
+        _to: &str,
+    ) -> db::Result<i64> {
+        Self::unsupported()
+    }
+
     // ── invoice ───────────────────────────────────────────────────────────
 
     async fn get_invoices<T: AsRef<str> + Sync>(
