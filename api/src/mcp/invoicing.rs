@@ -6,10 +6,12 @@
 //! nothing (the same boundary as tickets), and a support instance is refused by
 //! the resolver's own kind check.
 //!
-//! **No invoicing tool sends email.** The one thing to be careful with is
-//! `finalize_invoice`: it is strictly one-way (no void, no un-finalize), assigns
-//! the next invoice number, and freezes what the invoice prints, so its
-//! description says so and it takes an explicit `issueDate` with no default.
+//! **Only `send_invoice` and `send_credit_note` send email** (to the client,
+//! with the PDF attached), and their descriptions say so. The other things to
+//! be careful with are `finalize_invoice` and `issue_credit_note`: both are
+//! strictly one-way (no void, no un-finalize, no deleting a credit note),
+//! assign the next number in their sequence, and freeze what they print, so
+//! their descriptions say so and they take an explicit date with no default.
 //!
 //! **Importing existing invoices** needs nothing extra: billable-item dates,
 //! `issueDate` and `paidDate` all accept any past date, and `finalize_invoice`
@@ -32,14 +34,19 @@ use crate::app::{App, HasDb, HasMail, HasStorage};
 
 use super::tool::{ToolContext, ToolOutcome, missing_argument};
 
-const PROJECT_FIELDS: &str = "id name clientName clientAbn clientAddress reference archived \
-     createdAt updatedAt";
+const PROJECT_FIELDS: &str = "id name clientName clientAbn clientAddress clientEmail reference \
+     paymentTermsDays effectivePaymentTermsDays defaultUnitPriceCents archived createdAt updatedAt";
 
-const ITEM_FIELDS: &str = "id date description quantity unitPriceCents amountCents status \
+const ITEM_FIELDS: &str = "id date description quantity unitPriceCents amountCents gstFree status \
      project { id name }";
 
 const EXPENSE_FIELDS: &str = "id date category description supplier amountCents gstCents \
-     distanceKm rateCentsPerKm project { id name }";
+     distanceKm rateCentsPerKm project { id name } rebilledItem { id status } \
+     receipt { filename contentType size }";
+
+const CREDIT_NOTE_FIELDS: &str = "id displayNumber issueDate reason title subtotalCents gstCents \
+     totalCents currency createdAt sentAt sentTo invoice { id displayNumber } \
+     lines { description amountCents gstFree }";
 
 /// `ExpenseCategoryType`'s values, for the tools' input schemas.
 const EXPENSE_CATEGORIES: [&str; 19] = [
@@ -72,19 +79,24 @@ const EXPENSE_WRITE_DESCRIPTION: &str = "Record an expense in an INVOICING insta
      purpose, and must not have supplier/amount/GST — its amount is distance x the ATO \
      cents-per-km rate for the trip date's financial year, looked up for you. A car claimed \
      by cents per km can't also claim its fuel (VEHICLE_FUEL). Expenses are never \
-     invoiced and send no email.";
+     invoiced; one on a project can be passed on to the client with `rebill_expense`. \
+     Sends no email.";
 
 /// What a list of invoices shows. `get_invoice` adds the frozen-or-live detail.
-const INVOICE_SUMMARY_FIELDS: &str = "id status number displayNumber issueDate paidDate title \
-     reference subtotalCents gstCents totalCents currency createdAt finalizedAt \
+const INVOICE_SUMMARY_FIELDS: &str = "id status number displayNumber issueDate dueDate paidDate \
+     overdue daysOverdue title reference subtotalCents gstCents totalCents paidCents \
+     creditedCents balanceCents currency createdAt finalizedAt sentAt \
      project { id name clientName }";
 
-const INVOICE_DETAIL_FIELDS: &str = "id status number displayNumber issueDate paidDate title \
-     reference subtotalCents gstCents totalCents currency gstRegistered paymentDetails \
-     createdAt finalizedAt project { id name clientName } \
+const INVOICE_DETAIL_FIELDS: &str = "id status number displayNumber issueDate dueDate paidDate \
+     overdue daysOverdue title reference subtotalCents gstCents totalCents paidCents \
+     creditedCents balanceCents currency gstRegistered paymentDetails createdAt finalizedAt \
+     sentAt sentTo project { id name clientName clientEmail } \
      billTo { name abn address } seller { name abn address phone email } \
-     lines { date description quantity unitPriceCents amountCents } \
-     items { id date description quantity unitPriceCents amountCents status }";
+     lines { date description quantity unitPriceCents amountCents gstFree } \
+     items { id date description quantity unitPriceCents amountCents gstFree status } \
+     payments { id date amountCents note } \
+     creditNotes { id displayNumber issueDate reason totalCents }";
 
 const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 50;
@@ -99,6 +111,10 @@ fn project_schema() -> Value {
             "clientAbn": { "type": ["string", "null"] },
             "clientAddress": { "type": ["string", "null"] },
             "reference": { "type": ["string", "null"] },
+            "clientEmail": { "type": ["string", "null"], "description": "Where send_invoice mails by default." },
+            "paymentTermsDays": { "type": ["integer", "null"], "description": "This project's own payment terms; null uses the instance's." },
+            "effectivePaymentTermsDays": { "type": "integer", "description": "The terms its invoices actually get." },
+            "defaultUnitPriceCents": { "type": ["integer", "null"], "description": "GST-exclusive rate a new item gets when it names no price." },
             "archived": { "type": "boolean" },
             "createdAt": { "type": "integer", "description": "Unix seconds." },
             "updatedAt": { "type": "integer", "description": "Unix seconds." },
@@ -116,6 +132,7 @@ fn item_schema() -> Value {
             "quantity": { "type": "string", "description": "Decimal string, e.g. \"1.5\"." },
             "unitPriceCents": { "type": "integer", "description": "GST-exclusive, in cents." },
             "amountCents": { "type": "integer", "description": "round-half-up(quantity x unit price), in cents." },
+            "gstFree": { "type": "boolean", "description": "No GST on this line." },
             "status": { "type": "string", "enum": ["UNBILLED", "DRAFT", "INVOICED"] },
             "project": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
         },
@@ -131,7 +148,14 @@ fn invoice_schema() -> Value {
             "number": { "type": ["integer", "null"], "description": "Null for a draft." },
             "displayNumber": { "type": ["string", "null"], "description": "Zero-padded, e.g. \"008\"; null for a draft." },
             "issueDate": { "type": ["string", "null"], "description": "YYYY-MM-DD; null for a draft." },
-            "paidDate": { "type": ["string", "null"], "description": "YYYY-MM-DD; null means unpaid." },
+            "dueDate": { "type": ["string", "null"], "description": "YYYY-MM-DD; null for a draft." },
+            "paidDate": { "type": ["string", "null"], "description": "YYYY-MM-DD the balance reached zero (payments and credit notes); null while anything is owed." },
+            "overdue": { "type": "boolean" },
+            "daysOverdue": { "type": ["integer", "null"] },
+            "paidCents": { "type": "integer" },
+            "creditedCents": { "type": "integer", "description": "Sum of its credit notes, GST-inclusive." },
+            "balanceCents": { "type": "integer", "description": "total - credited - paid." },
+            "sentAt": { "type": ["integer", "null"], "description": "Unix seconds send_invoice last mailed it." },
             "title": { "type": "string" },
             "reference": { "type": ["string", "null"] },
             "subtotalCents": { "type": "integer" },
@@ -173,7 +197,8 @@ pub fn catalogue() -> Vec<Value> {
         "date": { "type": "string", "description": "YYYY-MM-DD." },
         "description": { "type": "string", "description": "Multi-line; lines starting `* ` or `- ` print as bullets." },
         "quantity": { "type": "string", "description": "Decimal, at most 2 decimal places, > 0 and <= 1,000,000. e.g. \"1.5\"." },
-        "unitPriceCents": { "type": "integer", "description": "GST-exclusive price in cents, 0 to 1,000,000,000." },
+        "unitPriceCents": { "type": "integer", "description": "GST-exclusive price in cents, 0 to 1,000,000,000. Optional: a new item takes its project's defaultUnitPriceCents; an update keeps the current price." },
+        "gstFree": { "type": "boolean", "default": false, "description": "No GST on this line even when the business is GST-registered." },
     });
     let mut update_item_props = item_input.clone();
     update_item_props["id"] = json!({ "type": "string" });
@@ -225,7 +250,10 @@ pub fn catalogue() -> Vec<Value> {
                     "clientName": { "type": "string" },
                     "clientAbn": { "type": "string" },
                     "clientAddress": { "type": "string" },
+                    "clientEmail": { "type": "string", "description": "Where send_invoice mails by default." },
                     "reference": { "type": "string", "description": "e.g. a client PO number; prints on the invoice." },
+                    "paymentTermsDays": { "type": "integer", "description": "0-365. Overrides the instance's terms for this project's invoices." },
+                    "defaultUnitPriceCents": { "type": "integer", "description": "GST-exclusive rate new items get when they name no price." },
                 },
                 "required": ["instanceId", "name", "clientName"],
             },
@@ -248,6 +276,9 @@ pub fn catalogue() -> Vec<Value> {
                     "clientAbn": { "type": "string", "description": "Empty string clears it." },
                     "clientAddress": { "type": "string", "description": "Empty string clears it." },
                     "reference": { "type": "string", "description": "Empty string clears it." },
+                    "clientEmail": { "type": "string", "description": "Empty string clears it." },
+                    "paymentTermsDays": { "type": ["integer", "null"], "description": "null clears it (the instance's terms apply)." },
+                    "defaultUnitPriceCents": { "type": ["integer", "null"], "description": "null clears it." },
                     "archived": { "type": "boolean" },
                 },
                 "required": ["id"],
@@ -291,8 +322,9 @@ pub fn catalogue() -> Vec<Value> {
                     "description": item_input["description"].clone(),
                     "quantity": item_input["quantity"].clone(),
                     "unitPriceCents": item_input["unitPriceCents"].clone(),
+                    "gstFree": item_input["gstFree"].clone(),
                 },
-                "required": ["projectId", "date", "description", "quantity", "unitPriceCents"],
+                "required": ["projectId", "date", "description", "quantity"],
             },
             "outputSchema": wrap("item", item_schema()),
             "annotations": { "title": "Create billable item", "idempotentHint": false },
@@ -300,13 +332,14 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "update_billable_item",
             "title": "Update billable item",
-            "description": "Replace a billable item's date, description, quantity and unit price \
-                (pass all four — this is a full replace). Refused if the item is on a FINALIZED \
+            "description": "Replace a billable item's date, description, quantity, unit price and \
+                GST-free flag (a full replace: an omitted gstFree becomes false; an omitted \
+                unitPriceCents keeps the current price). Refused if the item is on a FINALIZED \
                 invoice; an item on a draft invoice can still be edited and the draft updates.",
             "inputSchema": {
                 "type": "object",
                 "properties": update_item_props,
-                "required": ["id", "date", "description", "quantity", "unitPriceCents"],
+                "required": ["id", "date", "description", "quantity"],
             },
             "outputSchema": wrap("item", item_schema()),
             "annotations": { "title": "Update billable item", "idempotentHint": true },
@@ -315,7 +348,8 @@ pub fn catalogue() -> Vec<Value> {
             "name": "delete_billable_item",
             "title": "Delete billable item",
             "description": "Permanently delete a billable item. Refused if it is on any invoice, \
-                draft or finalized — remove it from the draft first.",
+                draft or finalized — remove it from the draft first. Deleting an item made by \
+                rebill_expense frees that expense to be re-billed.",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "string" } },
@@ -374,7 +408,8 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "delete_expense",
             "title": "Delete expense",
-            "description": "Permanently delete an expense.",
+            "description": "Permanently delete an expense. Refused while it is re-billed (delete \
+                its billable item first).",
             "inputSchema": {
                 "type": "object",
                 "properties": { "id": { "type": "string" } },
@@ -415,7 +450,8 @@ pub fn catalogue() -> Vec<Value> {
             "name": "list_invoices",
             "title": "List invoices",
             "description": "List invoices in an INVOICING instance, newest first, optionally for \
-                one project. `filter`: DRAFT, UNPAID (finalized, not yet paid), PAID or ALL. \
+                one project. `filter`: DRAFT, UNPAID (finalized, something still owed), OVERDUE \
+                (unpaid and past its due date), PAID or ALL. \
                 Summaries only — use `get_invoice` for the lines and seller/bill-to detail. \
                 Results are paged: pass `endCursor` as `after` for the next page.",
             "inputSchema": {
@@ -423,7 +459,7 @@ pub fn catalogue() -> Vec<Value> {
                 "properties": {
                     "instanceId": { "type": "string" },
                     "projectId": { "type": "string" },
-                    "filter": { "type": "string", "enum": ["ALL", "DRAFT", "UNPAID", "PAID"], "default": "ALL" },
+                    "filter": { "type": "string", "enum": ["ALL", "DRAFT", "UNPAID", "OVERDUE", "PAID"], "default": "ALL" },
                     "first": paging_props()["first"].clone(),
                     "after": paging_props()["after"].clone(),
                 },
@@ -435,8 +471,9 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "get_invoice",
             "title": "Get invoice",
-            "description": "Fetch one invoice in full: totals, the printed lines, seller and \
-                bill-to blocks, payment details, and its current items. A FINALIZED invoice \
+            "description": "Fetch one invoice in full: totals, due date, payments, credit notes, \
+                balance, the printed lines, seller and bill-to blocks, payment details, and its \
+                current items. A FINALIZED invoice \
                 shows exactly what was frozen when it was finalized; a DRAFT shows a live \
                 preview that changes as items and settings change.",
             "inputSchema": {
@@ -525,7 +562,9 @@ pub fn catalogue() -> Vec<Value> {
                 no invoice in the instance already has, in any order; a used one is refused and \
                 leaves the invoice a draft. Automatic numbering carries on after the highest \
                 number used. Without `number`, the next number in sequence is used. The seller \
-                details and payment text printed are the instance's CURRENT invoicing settings.",
+                details and payment text printed are the instance's CURRENT invoicing settings. \
+                `dueDate` defaults to issueDate + the project's (else the instance's) payment \
+                terms. A mistake is corrected afterwards with issue_credit_note. Sends no email.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -537,6 +576,7 @@ pub fn catalogue() -> Vec<Value> {
                         "description": "Owner-only: use exactly this invoice number (e.g. 8 for \"008\") \
                             instead of the next in sequence. For importing existing invoices; omit otherwise.",
                     },
+                    "dueDate": { "type": "string", "description": "YYYY-MM-DD, on or after issueDate. Optional." },
                 },
                 "required": ["invoiceId", "issueDate"],
             },
@@ -546,9 +586,10 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "set_invoice_paid",
             "title": "Set invoice paid date",
-            "description": "Mark a FINALIZED invoice paid on `paidDate` (YYYY-MM-DD), or clear it \
-                (mark unpaid) by omitting `paidDate`. Not printed on the invoice. Refused on a \
-                draft.",
+            "description": "Mark a FINALIZED invoice paid in full on `paidDate` (YYYY-MM-DD) — \
+                records one payment of its whole remaining balance — or remove every recorded \
+                payment by omitting `paidDate`. For part-payments use record_invoice_payment. \
+                Refused on a draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -573,6 +614,224 @@ pub fn catalogue() -> Vec<Value> {
             },
             "outputSchema": wrap("url", json!({ "type": "string" })),
             "annotations": { "title": "Get invoice PDF link", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "record_invoice_payment",
+            "title": "Record invoice payment",
+            "description": "Record money received against a FINALIZED invoice: `amountCents` \
+                (GST-inclusive, no more than the balance owing) on `date` (YYYY-MM-DD), with an \
+                optional `note`. The invoice becomes PAID when its balance reaches zero. Sends no email.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invoiceId": { "type": "string" },
+                    "date": { "type": "string" },
+                    "amountCents": { "type": "integer" },
+                    "note": { "type": "string" },
+                },
+                "required": ["invoiceId", "date", "amountCents"],
+            },
+            "outputSchema": wrap("invoice", invoice_schema()),
+            "annotations": { "title": "Record invoice payment", "idempotentHint": false },
+        }),
+        json!({
+            "name": "delete_invoice_payment",
+            "title": "Delete invoice payment",
+            "description": "Remove one recorded payment (get its id from get_invoice's \
+                `payments`). The invoice goes back to UNPAID if anything is then owed.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invoiceId": { "type": "string" },
+                    "paymentId": { "type": "string" },
+                },
+                "required": ["invoiceId", "paymentId"],
+            },
+            "outputSchema": wrap("invoice", invoice_schema()),
+            "annotations": { "title": "Delete invoice payment", "destructiveHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "send_invoice",
+            "title": "Email invoice to client",
+            "description": "**SENDS EMAIL to the client, which cannot be unsent.** Email a \
+                FINALIZED invoice with its PDF attached: to `to` (default: the project's client \
+                email) and `cc`, at most 10 addresses, with an optional covering `message`. It \
+                comes from the business name with replies going to the business email. Can be \
+                sent again as a reminder. Only do this when the user has asked to send this \
+                specific invoice, and confirm the recipients with them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invoiceId": { "type": "string" },
+                    "to": { "type": "array", "items": { "type": "string" } },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "message": { "type": "string" },
+                },
+                "required": ["invoiceId"],
+            },
+            "outputSchema": wrap("invoice", invoice_schema()),
+            "annotations": { "title": "Email invoice to client", "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        }),
+        json!({
+            "name": "issue_credit_note",
+            "title": "Issue credit note",
+            "description": "**IRREVERSIBLE.** Issue a credit note (an \"Adjustment Note\" for a \
+                tax invoice) against a FINALIZED invoice — the only way to correct one. It gets \
+                the next CN- number and can never be edited or deleted. `lines` are GST-exclusive \
+                amounts to credit ({description, amountCents, gstFree}); omit them to credit the \
+                whole invoice (only while nothing has been credited yet). GST is added at the \
+                invoice's own rate. The credit can't exceed what's left uncredited; it reduces \
+                the invoice's balance and marks it PAID if that reaches zero. `issueDate` and \
+                `reason` are required: confirm them with the user. Sends no email.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invoiceId": { "type": "string" },
+                    "issueDate": { "type": "string", "description": "YYYY-MM-DD, not before the invoice's issue date." },
+                    "reason": { "type": "string", "description": "Printed on the credit note." },
+                    "lines": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": { "type": "string" },
+                                "amountCents": { "type": "integer" },
+                                "gstFree": { "type": "boolean" },
+                            },
+                            "required": ["description", "amountCents"],
+                        },
+                    },
+                },
+                "required": ["invoiceId", "issueDate", "reason"],
+            },
+            "outputSchema": wrap("creditNote", credit_note_schema()),
+            "annotations": { "title": "Issue credit note", "destructiveHint": true, "idempotentHint": false },
+        }),
+        json!({
+            "name": "list_credit_notes",
+            "title": "List credit notes",
+            "description": "List credit notes in an INVOICING instance, newest first, optionally \
+                for one invoice. Paged: pass `endCursor` as `after` for the next page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "invoiceId": { "type": "string" },
+                    "first": paging_props()["first"].clone(),
+                    "after": paging_props()["after"].clone(),
+                },
+                "required": ["instanceId"],
+            },
+            "outputSchema": listing_schema("creditNotes", credit_note_schema()),
+            "annotations": { "title": "List credit notes", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "get_credit_note_pdf_url",
+            "title": "Get credit note PDF link",
+            "description": "Get a time-limited download link for a credit note's PDF. Hand it to \
+                the user; don't fetch it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "creditNoteId": { "type": "string" } },
+                "required": ["creditNoteId"],
+            },
+            "outputSchema": wrap("url", json!({ "type": "string" })),
+            "annotations": { "title": "Get credit note PDF link", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "send_credit_note",
+            "title": "Email credit note to client",
+            "description": "**SENDS EMAIL to the client, which cannot be unsent.** send_invoice \
+                for a credit note: emails it with its PDF to `to` (default: the project's client \
+                email) and `cc`. Only when the user has asked; confirm the recipients.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "creditNoteId": { "type": "string" },
+                    "to": { "type": "array", "items": { "type": "string" } },
+                    "cc": { "type": "array", "items": { "type": "string" } },
+                    "message": { "type": "string" },
+                },
+                "required": ["creditNoteId"],
+            },
+            "outputSchema": wrap("creditNote", credit_note_schema()),
+            "annotations": { "title": "Email credit note to client", "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+        }),
+        json!({
+            "name": "rebill_expense",
+            "title": "Re-bill expense to client",
+            "description": "Pass an expense on to its project's client: creates an UNBILLED \
+                billable item for the expense's GST-exclusive cost plus `markupPercent` (default \
+                0), dated like the expense and linked to it so it can't be billed twice. \
+                `description` defaults to the category and supplier. Refused for an expense \
+                with no project or one already re-billed. Sends no email.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "expenseId": { "type": "string" },
+                    "markupPercent": { "type": "string", "description": "e.g. \"10\" or \"12.5\"; 0-1000." },
+                    "description": { "type": "string" },
+                    "gstFree": { "type": "boolean", "default": false },
+                },
+                "required": ["expenseId"],
+            },
+            "outputSchema": wrap("item", item_schema()),
+            "annotations": { "title": "Re-bill expense to client", "idempotentHint": false },
+        }),
+        json!({
+            "name": "get_gst_report",
+            "title": "GST / BAS report",
+            "description": "The BAS figures for an INVOICING instance over `from`..`to` \
+                (YYYY-MM-DD, at most two years): G1 total sales and 1A GST on sales (from \
+                finalized invoices and credit notes by issue date for ACCRUAL, or from payments \
+                received for CASH, with GST apportioned per payment), and purchases and 1B GST \
+                on purchases from expenses by date. Figures are in cents. Informational — check \
+                with an accountant before lodging.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                    "basis": { "type": "string", "enum": ["CASH", "ACCRUAL"] },
+                },
+                "required": ["instanceId", "from", "to", "basis"],
+            },
+            "outputSchema": wrap("report", json!({ "type": "object" })),
+            "annotations": { "title": "GST / BAS report", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "get_receivables",
+            "title": "Aged receivables",
+            "description": "What clients owe an INVOICING instance: the outstanding total, \
+                bucketed by days past due (current, 1-30, 31-60, 61-90, over 90), and every \
+                invoice with a balance, most overdue first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "instanceId": { "type": "string" } },
+                "required": ["instanceId"],
+            },
+            "outputSchema": wrap("receivables", json!({ "type": "object" })),
+            "annotations": { "title": "Aged receivables", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "export_csv",
+            "title": "Export CSV",
+            "description": "A CSV export for an accountant over `from`..`to` (YYYY-MM-DD, at \
+                most two years): INVOICES (by issue date), CREDIT_NOTES, PAYMENTS (by payment \
+                date) or EXPENSES (by date). Returns the CSV text.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["INVOICES", "CREDIT_NOTES", "PAYMENTS", "EXPENSES"] },
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                },
+                "required": ["instanceId", "kind", "from", "to"],
+            },
+            "outputSchema": wrap("csv", json!({ "type": "string" })),
+            "annotations": { "title": "Export CSV", "readOnlyHint": true, "idempotentHint": true },
         }),
     ]
 }
@@ -792,13 +1051,21 @@ where
                 },
             };
             let doc = format!(
-                "mutation McpFinalize($id: ID!, $date: String!, $number: Int) {{ \
-                 finalizeInvoice(invoiceId: $id, issueDate: $date, number: $number) \
+                "mutation McpFinalize($id: ID!, $date: String!, $number: Int, $due: String) {{ \
+                 finalizeInvoice(invoiceId: $id, issueDate: $date, number: $number, dueDate: $due) \
                  {{ {INVOICE_DETAIL_FIELDS} }} }}"
             );
             rename(
-                ctx.run(&doc, json!({ "id": id, "date": date, "number": number }))
-                    .await,
+                ctx.run(
+                    &doc,
+                    json!({
+                        "id": id,
+                        "date": date,
+                        "number": number,
+                        "due": string_arg(arguments, "dueDate"),
+                    }),
+                )
+                .await,
                 "finalizeInvoice",
                 "invoice",
             )
@@ -833,6 +1100,223 @@ where
                 .await,
                 "downloadInvoicePdf",
                 "url",
+            )
+        }
+        "record_invoice_payment" => {
+            let (Some(id), Some(date), Some(amount)) = (
+                string_arg(arguments, "invoiceId"),
+                string_arg(arguments, "date"),
+                arguments.get("amountCents").and_then(Value::as_i64),
+            ) else {
+                return Some(missing_argument("invoiceId/date/amountCents"));
+            };
+            let doc = format!(
+                "mutation McpPay($id: ID!, $input: RecordPaymentInput!) {{ \
+                 recordInvoicePayment(invoiceId: $id, input: $input) {{ {INVOICE_DETAIL_FIELDS} }} }}"
+            );
+            let input = json!({ "date": date, "amountCents": amount, "note": string_arg(arguments, "note") });
+            rename(
+                ctx.run(&doc, json!({ "id": id, "input": input })).await,
+                "recordInvoicePayment",
+                "invoice",
+            )
+        }
+        "delete_invoice_payment" => {
+            let (Some(id), Some(payment_id)) = (
+                string_arg(arguments, "invoiceId"),
+                string_arg(arguments, "paymentId"),
+            ) else {
+                return Some(missing_argument("invoiceId/paymentId"));
+            };
+            let doc = format!(
+                "mutation McpUnpay($id: ID!, $p: ID!) {{ \
+                 deleteInvoicePayment(invoiceId: $id, paymentId: $p) {{ {INVOICE_DETAIL_FIELDS} }} }}"
+            );
+            rename(
+                ctx.run(&doc, json!({ "id": id, "p": payment_id })).await,
+                "deleteInvoicePayment",
+                "invoice",
+            )
+        }
+        "send_invoice" | "send_credit_note" => {
+            let (arg, field, fields, out) = if name == "send_invoice" {
+                (
+                    "invoiceId",
+                    "sendInvoice",
+                    INVOICE_SUMMARY_FIELDS,
+                    "invoice",
+                )
+            } else {
+                (
+                    "creditNoteId",
+                    "sendCreditNote",
+                    CREDIT_NOTE_FIELDS,
+                    "creditNote",
+                )
+            };
+            let Some(id) = string_arg(arguments, arg) else {
+                return Some(missing_argument(arg));
+            };
+            let input = json!({
+                "to": id_list(arguments, "to").unwrap_or_default(),
+                "cc": id_list(arguments, "cc").unwrap_or_default(),
+                "message": string_arg(arguments, "message"),
+            });
+            let doc = format!(
+                "mutation McpSend($id: ID!, $input: SendDocumentInput) {{ \
+                 {field}({arg}: $id, input: $input) {{ {fields} }} }}"
+            );
+            rename(
+                ctx.run(&doc, json!({ "id": id, "input": input })).await,
+                field,
+                out,
+            )
+        }
+        "issue_credit_note" => {
+            let (Some(id), Some(date), Some(reason)) = (
+                string_arg(arguments, "invoiceId"),
+                string_arg(arguments, "issueDate"),
+                string_arg(arguments, "reason"),
+            ) else {
+                return Some(missing_argument("invoiceId/issueDate/reason"));
+            };
+            let doc = format!(
+                "mutation McpCredit($id: ID!, $input: CreditNoteInput!) {{ \
+                 issueCreditNote(invoiceId: $id, input: $input) {{ {CREDIT_NOTE_FIELDS} }} }}"
+            );
+            let lines = arguments.get("lines").filter(|l| l.is_array()).cloned();
+            let input = json!({ "issueDate": date, "reason": reason, "lines": lines });
+            rename(
+                ctx.run(&doc, json!({ "id": id, "input": input })).await,
+                "issueCreditNote",
+                "creditNote",
+            )
+        }
+        "list_credit_notes" => {
+            let Some(instance_id) = string_arg(arguments, "instanceId") else {
+                return Some(missing_argument("instanceId"));
+            };
+            let doc = format!(
+                "query McpCreditNotes($instanceId: ID!, $invoiceId: ID, $first: Int!, $after: String) {{ \
+                 creditNotes(instanceId: $instanceId, invoiceId: $invoiceId, first: $first, after: $after) {{ \
+                 edges {{ node {{ {CREDIT_NOTE_FIELDS} }} }} pageInfo {{ hasNextPage endCursor }} }} }}"
+            );
+            unwrap_connection(
+                ctx.run(
+                    &doc,
+                    json!({
+                        "instanceId": instance_id,
+                        "invoiceId": string_arg(arguments, "invoiceId"),
+                        "first": page_size(arguments),
+                        "after": string_arg(arguments, "after"),
+                    }),
+                )
+                .await,
+                "creditNotes",
+                "creditNotes",
+            )
+        }
+        "get_credit_note_pdf_url" => {
+            let Some(id) = string_arg(arguments, "creditNoteId") else {
+                return Some(missing_argument("creditNoteId"));
+            };
+            rename(
+                ctx.run(
+                    "mutation McpCreditPdf($id: ID!) { downloadCreditNotePdf(creditNoteId: $id) }",
+                    json!({ "id": id }),
+                )
+                .await,
+                "downloadCreditNotePdf",
+                "url",
+            )
+        }
+        "rebill_expense" => {
+            let Some(id) = string_arg(arguments, "expenseId") else {
+                return Some(missing_argument("expenseId"));
+            };
+            let markup = match arguments.get("markupPercent") {
+                Some(Value::String(s)) => Some(s.clone()),
+                Some(Value::Number(n)) => Some(n.to_string()),
+                _ => None,
+            };
+            let doc = format!(
+                "mutation McpRebill($id: ID!, $markup: String, $description: String, $gstFree: Boolean!) {{ \
+                 rebillExpense(expenseId: $id, markupPercent: $markup, description: $description, \
+                 gstFree: $gstFree) {{ {ITEM_FIELDS} }} }}"
+            );
+            rename(
+                ctx.run(
+                    &doc,
+                    json!({
+                        "id": id,
+                        "markup": markup,
+                        "description": string_arg(arguments, "description"),
+                        "gstFree": arguments.get("gstFree").and_then(Value::as_bool).unwrap_or(false),
+                    }),
+                )
+                .await,
+                "rebillExpense",
+                "item",
+            )
+        }
+        "get_gst_report" => {
+            let (Some(instance_id), Some(from), Some(to), Some(basis)) = (
+                string_arg(arguments, "instanceId"),
+                string_arg(arguments, "from"),
+                string_arg(arguments, "to"),
+                string_arg(arguments, "basis"),
+            ) else {
+                return Some(missing_argument("instanceId/from/to/basis"));
+            };
+            rename(
+                ctx.run(
+                    "query McpGst($i: ID!, $from: String!, $to: String!, $basis: ReportBasisType!) { \
+                     gstReport(instanceId: $i, from: $from, to: $to, basis: $basis) { from to basis \
+                     gstRegistered currency salesCents gstOnSalesCents purchasesCents \
+                     gstOnPurchasesCents netGstCents invoiceCount creditNoteCount paymentCount \
+                     expenseCount } }",
+                    json!({ "i": instance_id, "from": from, "to": to, "basis": basis }),
+                )
+                .await,
+                "gstReport",
+                "report",
+            )
+        }
+        "get_receivables" => {
+            let Some(instance_id) = string_arg(arguments, "instanceId") else {
+                return Some(missing_argument("instanceId"));
+            };
+            rename(
+                ctx.run(
+                    "query McpReceivables($i: ID!) { receivables(instanceId: $i) { asOf currency \
+                     totalCents currentCents days1To30Cents days31To60Cents days61To90Cents \
+                     daysOver90Cents invoices { id displayNumber issueDate dueDate daysOverdue \
+                     totalCents balanceCents project { id name clientName } } } }",
+                    json!({ "i": instance_id }),
+                )
+                .await,
+                "receivables",
+                "receivables",
+            )
+        }
+        "export_csv" => {
+            let (Some(instance_id), Some(kind), Some(from), Some(to)) = (
+                string_arg(arguments, "instanceId"),
+                string_arg(arguments, "kind"),
+                string_arg(arguments, "from"),
+                string_arg(arguments, "to"),
+            ) else {
+                return Some(missing_argument("instanceId/kind/from/to"));
+            };
+            rename(
+                ctx.run(
+                    "query McpExport($i: ID!, $kind: CsvExportType!, $from: String!, $to: String!) { \
+                     invoicingExport(instanceId: $i, kind: $kind, from: $from, to: $to) }",
+                    json!({ "i": instance_id, "kind": kind, "from": from, "to": to }),
+                )
+                .await,
+                "invoicingExport",
+                "csv",
             )
         }
         _ => return None,
@@ -885,7 +1369,10 @@ where
         "clientName": client_name,
         "clientAbn": string_arg(arguments, "clientAbn"),
         "clientAddress": string_arg(arguments, "clientAddress"),
+        "clientEmail": string_arg(arguments, "clientEmail"),
         "reference": string_arg(arguments, "reference"),
+        "paymentTermsDays": arguments.get("paymentTermsDays").and_then(Value::as_i64),
+        "defaultUnitPriceCents": arguments.get("defaultUnitPriceCents").and_then(Value::as_i64),
     });
     rename(
         ctx.run(&doc, json!({ "instanceId": instance_id, "input": input }))
@@ -922,12 +1409,22 @@ where
             None => current[field].clone(),
         }
     };
+    // A number field: an explicit `null` clears it, absent keeps it.
+    let pick_number = |field: &str| -> Value {
+        match arguments.get(field) {
+            Some(v) if v.is_null() || v.is_i64() => v.clone(),
+            _ => current[field].clone(),
+        }
+    };
     let input = json!({
         "name": arguments.get("name").and_then(Value::as_str).map(Value::from).unwrap_or_else(|| current["name"].clone()),
         "clientName": arguments.get("clientName").and_then(Value::as_str).map(Value::from).unwrap_or_else(|| current["clientName"].clone()),
         "clientAbn": pick("clientAbn"),
         "clientAddress": pick("clientAddress"),
         "reference": pick("reference"),
+        "clientEmail": pick("clientEmail"),
+        "paymentTermsDays": pick_number("paymentTermsDays"),
+        "defaultUnitPriceCents": pick_number("defaultUnitPriceCents"),
         "archived": arguments.get("archived").and_then(Value::as_bool).unwrap_or_else(|| current["archived"].as_bool().unwrap_or(false)),
     });
     let doc = format!(
@@ -975,21 +1472,22 @@ async fn create_item<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutc
 where
     A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
 {
-    let (Some(project_id), Some(date), Some(description), Some(quantity), Some(price)) = (
+    let (Some(project_id), Some(date), Some(description), Some(quantity)) = (
         string_arg(arguments, "projectId"),
         string_arg(arguments, "date"),
         string_arg(arguments, "description"),
         quantity_arg(arguments),
-        arguments.get("unitPriceCents").and_then(Value::as_i64),
     ) else {
-        return missing_argument("projectId/date/description/quantity/unitPriceCents");
+        return missing_argument("projectId/date/description/quantity");
     };
+    let price = arguments.get("unitPriceCents").and_then(Value::as_i64);
     let doc = format!(
         "mutation McpCreateItem($projectId: ID!, $input: BillableItemInput!) {{ \
          createBillableItem(projectId: $projectId, input: $input) {{ {ITEM_FIELDS} }} }}"
     );
     let input = json!({
         "date": date, "description": description, "quantity": quantity, "unitPriceCents": price,
+        "gstFree": arguments.get("gstFree").and_then(Value::as_bool).unwrap_or(false),
     });
     rename(
         ctx.run(&doc, json!({ "projectId": project_id, "input": input }))
@@ -1003,21 +1501,22 @@ async fn update_item<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutc
 where
     A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
 {
-    let (Some(id), Some(date), Some(description), Some(quantity), Some(price)) = (
+    let (Some(id), Some(date), Some(description), Some(quantity)) = (
         string_arg(arguments, "id"),
         string_arg(arguments, "date"),
         string_arg(arguments, "description"),
         quantity_arg(arguments),
-        arguments.get("unitPriceCents").and_then(Value::as_i64),
     ) else {
-        return missing_argument("id/date/description/quantity/unitPriceCents");
+        return missing_argument("id/date/description/quantity");
     };
+    let price = arguments.get("unitPriceCents").and_then(Value::as_i64);
     let doc = format!(
         "mutation McpUpdateItem($id: ID!, $input: BillableItemInput!) {{ \
          updateBillableItem(id: $id, input: $input) {{ {ITEM_FIELDS} }} }}"
     );
     let input = json!({
         "date": date, "description": description, "quantity": quantity, "unitPriceCents": price,
+        "gstFree": arguments.get("gstFree").and_then(Value::as_bool).unwrap_or(false),
     });
     rename(
         ctx.run(&doc, json!({ "id": id, "input": input })).await,
@@ -1070,6 +1569,27 @@ fn expense_schema() -> Value {
             "distanceKm": { "type": ["string", "null"], "description": "A trip's km, e.g. \"12.5\"; null for a purchase." },
             "rateCentsPerKm": { "type": ["integer", "null"], "description": "The ATO rate the trip was claimed at." },
             "project": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
+            "rebilledItem": { "type": ["object", "null"], "description": "The billable item rebill_expense made from it." },
+            "receipt": { "type": ["object", "null"], "description": "The uploaded receipt's filename/contentType/size." },
+        },
+    })
+}
+
+fn credit_note_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "displayNumber": { "type": "string", "description": "e.g. \"CN-001\"." },
+            "issueDate": { "type": "string" },
+            "reason": { "type": "string" },
+            "title": { "type": "string", "description": "\"Adjustment Note\" or \"Credit Note\"." },
+            "subtotalCents": { "type": "integer" },
+            "gstCents": { "type": "integer" },
+            "totalCents": { "type": "integer", "description": "GST-inclusive amount taken off the invoice's balance." },
+            "currency": { "type": "string" },
+            "invoice": { "type": "object" },
+            "lines": { "type": "array" },
         },
     })
 }

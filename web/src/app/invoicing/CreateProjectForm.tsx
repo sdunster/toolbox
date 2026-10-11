@@ -8,6 +8,8 @@ import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
 import { inputBase } from "../../components/ui/inputStyles";
+import { ProjectBillingFields } from "./ProjectBillingFields";
+import { billingInput, initialBillingValues } from "../../lib/projectBilling";
 
 /**
  * Create a project in the selected invoicing instance, then go straight to
@@ -23,6 +25,7 @@ export function CreateProjectForm({ instanceId }: { instanceId: string }) {
   const [clientAbn, setClientAbn] = useState("");
   const [clientAddress, setClientAddress] = useState("");
   const [reference, setReference] = useState("");
+  const [billing, setBilling] = useState(() => initialBillingValues());
   const [error, setError] = useState<string | null>(null);
 
   const [commit, isSaving] = useMutation<CreateProjectFormMutation>(graphql`
@@ -40,6 +43,11 @@ export function CreateProjectForm({ instanceId }: { instanceId: string }) {
     e.preventDefault();
     if (isSaving) return;
     setError(null);
+    const parsed = billingInput(billing);
+    if (!parsed.ok) {
+      setError(parsed.error);
+      return;
+    }
     commit({
       variables: {
         instanceId,
@@ -49,6 +57,7 @@ export function CreateProjectForm({ instanceId }: { instanceId: string }) {
           clientAbn: clientAbn.trim(),
           clientAddress: clientAddress.trim(),
           reference: reference.trim(),
+          ...parsed.input,
         },
       },
       onCompleted: (data) => {
@@ -110,6 +119,11 @@ export function CreateProjectForm({ instanceId }: { instanceId: string }) {
             placeholder="e.g. the site address"
           />
         </FormField>
+        <ProjectBillingFields
+          idPrefix="new-project"
+          values={billing}
+          onChange={setBilling}
+        />
 
         {error && (
           <p role="alert" className="text-sm text-red-600 dark:text-red-400">

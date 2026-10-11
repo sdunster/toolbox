@@ -54,7 +54,7 @@ Tools:
 | `update_ticket_recipients` | Add/remove one requester or CC | no |
 | `list_instance_members` | Members of an instance the caller owns (to find an id to assign to) | — |
 
-Invoicing tools (INVOICING instances only; none send email):
+Invoicing tools (INVOICING instances only; only `send_invoice`/`send_credit_note` send email):
 
 | Tool | What |
 |---|---|
@@ -62,8 +62,13 @@ Invoicing tools (INVOICING instances only; none send email):
 | `list_billable_items` / `create_billable_item` / `update_billable_item` / `delete_billable_item` | Work to be invoiced. Quantity is a decimal string (≤ 2 dp), price is GST-exclusive integer cents; the amount is computed server-side |
 | `list_invoices` / `get_invoice` | Summaries, and the full invoice (lines, seller, bill-to, items) |
 | `create_invoice` / `add_invoice_items` / `remove_invoice_items` / `delete_invoice` | Draft invoices |
-| `finalize_invoice` | **Irreversible**: numbers and freezes the invoice; requires an explicit `issueDate` |
-| `set_invoice_paid` / `get_invoice_pdf_url` | Paid date (omit to clear); presigned PDF link for a finalized invoice |
+| `finalize_invoice` | **Irreversible**: numbers and freezes the invoice; requires an explicit `issueDate`; `dueDate` defaults from payment terms |
+| `set_invoice_paid` / `get_invoice_pdf_url` | Pay the whole balance on a date (omit to remove every payment); presigned PDF link for a finalized invoice |
+| `record_invoice_payment` / `delete_invoice_payment` | Part-payments; the invoice is PAID once the balance reaches zero |
+| `send_invoice` / `send_credit_note` | **Sends email** to the client with the PDF attached |
+| `issue_credit_note` / `list_credit_notes` / `get_credit_note_pdf_url` | **Irreversible** credit (adjustment) notes against a finalized invoice |
+| `rebill_expense` | Turn a project expense into a billable item, optionally marked up |
+| `get_gst_report` / `get_receivables` / `export_csv` | BAS figures (cash or accrual), aged receivables, accountant CSVs |
 | `list_expenses` / `create_expense` / `update_expense` / `delete_expense` | Money spent, optionally against a project. A purchase takes supplier + GST-inclusive cents (+ optional GST); a `VEHICLE_KM` trip takes distance + purpose and is priced at the ATO cents-per-km rate for its date |
 | `get_vehicle_km_summary` | The caller's own trip km for a financial year against the ATO's 5,000 km cap |
 

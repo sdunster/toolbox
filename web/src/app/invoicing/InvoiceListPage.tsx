@@ -38,6 +38,12 @@ const FILTERS: Array<{
     empty: "Nothing unpaid — every finalized invoice is settled.",
   },
   {
+    value: "OVERDUE",
+    param: "overdue",
+    label: "Overdue",
+    empty: "Nothing overdue.",
+  },
+  {
     value: "PAID",
     param: "paid",
     label: "Paid",
@@ -50,7 +56,7 @@ function filterFromParam(param: string | null) {
 }
 
 /**
- * All / Draft / Unpaid / Paid. Buttons with `aria-pressed` rather than a
+ * All / Draft / Unpaid / Overdue / Paid. Buttons with `aria-pressed` rather than a
  * tablist — they filter one list in place, they don't switch panels, same
  * convention as `BillableItemListPage`'s tabs.
  */
@@ -122,7 +128,7 @@ function Content({
 
 /**
  * `/app/invoices` — every invoice in the selected invoicing instance,
- * newest first, filterable by status (`?filter=` `draft`/`unpaid`/`paid`,
+ * newest first, filterable by status (`?filter=` `draft`/`unpaid`/`overdue`/`paid`,
  * so a filtered view can be bookmarked). Invoices are created from a
  * project's unbilled items; this list links to each one's detail page.
  */

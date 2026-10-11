@@ -70,6 +70,8 @@ instance record, so projecting more into the index would just be wasted storage.
   registered for GST, same omit convention as `deleted` below.
 - `currency` (S) — invoicing setting; absent means `"AUD"` (`db::Instance::currency_or_default`).
   A non-blank value must be 3 uppercase ASCII letters (`db::validate_currency_code`).
+- `payment_terms_days` (N) — invoicing setting, `0..=365`; absent means 14
+  (`db::DEFAULT_PAYMENT_TERMS_DAYS`). A project's own `payment_terms_days` overrides it.
 - `deleted` (Bool) — soft-delete marker, same omit convention: only ever
   written `true`; absent means active. Set/cleared only via
   `InstanceUpdateShape::SetDeleted` (`setInstanceDeleted`/`bin/cli.rs`'s
@@ -320,6 +322,9 @@ the finalized invoice it records. Invoices finalized before reservation rows exi
   `InvoicingSettingsInfo.nextInvoiceNumber` reads this lazily (a single `GetItem`, not carried on
   every `Instance` fetch) and reports `this + 1`. See "Known issues and risks" for the same
   gap-not-duplicate reasoning as `next_ticket_number`.
+- `next_credit_note_number` (N) — the credit-note sequence (`CN-001`, …), incremented by
+  `issueCreditNote` (`db::Handler::increment_credit_note_counter`) before its transaction, so a
+  failed issue leaves a gap, never a duplicate — the same rule as `next_invoice_number`.
 
 ---
 
@@ -510,6 +515,12 @@ user-generated table, and every field is rendered directly from the list.
   condition/projection expression — a literal `reference = :v` fails with
   `ValidationException: ... reserved keyword: reference`. `update_project` already does this;
   don't regress it.
+- `client_email` (S) — optional; normalized lowercase. Where `sendInvoice`/`sendCreditNote` mail
+  when not given recipients.
+- `payment_terms_days` (N) — optional, `0..=365`; overrides `instance.payment_terms_days` for this
+  project's invoices.
+- `default_unit_price_cents` (N) — optional; the GST-exclusive rate a new billable item on this
+  project gets when `createBillableItem` names no price.
 - `archived` (Bool) — only ever written `true`; absent means active, same omit convention as
   `instance.deleted`/`instance.gst_registered`. There is no delete in v1.
 - `created_at`, `updated_at` (N)
@@ -571,6 +582,11 @@ page is full or the index is exhausted, and `billable_items_dynamodb_local.rs` p
   that (unbilled) or, when the item is on a *draft* invoice, on the invoice still being a draft
   (checked atomically in the same transaction that bumps the invoice's `version` — see
   `db::Handler::update_billable_item`'s doc comment).
+- `gst_free` (Bool) — only ever written `true`; no GST on this line even when the instance is
+  GST-registered.
+- `source_expense_id` (S) — optional; set only by `rebillExpense`, together (one transaction)
+  with the expense's `billable_item_id`. Deleting such an item clears that link in the same
+  transaction; a plain delete is conditioned on `attribute_not_exists(source_expense_id)`.
 - `created_by_user_id` (S), `created_at`, `updated_at` (N)
 
 The line amount is **not stored** — the API derives it (round-half-up of `quantity_hundredths ×
@@ -656,6 +672,24 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   invoice, never a real race. Along with `paid_date`, the only attributes that may still change on
   a finalized invoice.
 
+- `due_date` (S) — optional; `YYYY-MM-DD`, set once at finalization (explicit, or issue date +
+  payment terms) and frozen into the snapshot too. Drives the OVERDUE filter
+  (`due_date < :today`, UTC).
+- `gst_cents` (N) — optional; absent for a draft. Denormalised from the snapshot like
+  `total_cents`, for reports.
+- `payments` (S) — optional; a JSON array of `db::InvoicePayment` (`id`, `date`, `amount_cents`,
+  `note`, `recorded_by_user_id`, `recorded_at`), absent when there are none. Written only by
+  `set_invoice_payments`, conditioned on `status = finalized AND version = :expected` and bumping
+  `version`, together with the recomputed `paid_date`. At most 100 entries.
+- `credited_cents`, `credited_gst_cents` (N) — optional (absent = 0); the GST-inclusive total and
+  GST of every credit note against this invoice, `ADD`ed by `create_credit_note`'s transaction.
+- `sent_at` (N), `sent_to` (SS) — optional; when `sendInvoice` last mailed it, and to whom.
+
+**`paid_date` now means "settled"**: present exactly when `total_cents − credited_cents − Σ
+payments ≤ 0`, dated by whatever settled it — see CLAUDE.md's "Due dates, payments and credit
+notes" house rule. Snapshot `schema_version` is 2 (adds `due_date`, per-line `gst_free`, and the
+`credit_note` block a credit note's snapshot carries).
+
 **Attach/detach/finalize/delete use `TransactWriteItems`** (`Put`/`Update`/`Delete` items only — IAM has no
 `TransactWriteItems` action; each item is authorised by the existing `PutItem`/`UpdateItem`/
 `DeleteItem` grants, and with no `ConditionCheck` no `dynamodb:ConditionCheckItem` grant is needed)
@@ -671,10 +705,51 @@ finalize or mark paid; superusers get no access — same boundary as `project`/`
 
 ---
 
+### `{prefix}_credit_note`
+
+An adjustment/credit note against one finalized invoice — see CLAUDE.md's "Due dates, payments and
+credit notes" house rule. Never updated after it's issued, except to cache its PDF key and record a
+send; never deleted.
+
+| Attribute     | Type | Role                                   |
+| ------------- | ---- | -------------------------------------- |
+| `id`          | S    | Hash key (PK) — nanoid                 |
+| `instance_id` | S    | GSI hash key                           |
+| `invoice_id`  | S    | GSI hash key                           |
+| `created_at`  | N    | GSI sort key (both GSIs)               |
+
+**GSIs:**
+
+| GSI                           | Hash key      | Sort key     | Projection | Purpose                                        |
+| ----------------------------- | ------------- | ------------ | ---------- | ---------------------------------------------- |
+| `instance_id-created_at-index` | `instance_id` | `created_at` | ALL        | The instance-wide list; reports and CSV export |
+| `invoice_id-created_at-index`  | `invoice_id`  | `created_at` | ALL        | One invoice's credit notes (the invoice page)   |
+
+**Non-obvious attributes:**
+
+- `project_id` (S) — denormalised from the invoice.
+- `number` (N) — from `counter.next_credit_note_number`; displayed `CN-001`. A reserved word
+  (`#num`).
+- `issue_date` (S) — `YYYY-MM-DD`, not before the invoice's issue date.
+- `reason` (S) — required, ≤ 500 chars; printed.
+- `snapshot` (S) — frozen `InvoiceSnapshot` JSON with its `credit_note` block set, built from the
+  invoice's own snapshot. A reserved word (`#snap`).
+- `subtotal_cents`, `gst_cents`, `total_cents` (N) — denormalised from the snapshot.
+- `pdf_s3_key` (S) — optional; `credit-notes/{instance_id}/{id}/Credit-Note-CN-{n}.pdf` once
+  rendered.
+- `sent_at` (N), `sent_to` (SS) — optional; the last `sendCreditNote`.
+- `created_by_user_id` (S), `created_at` (N)
+
+Written by `create_credit_note` in one `TransactWriteItems` with the invoice's `Update` (`Put` +
+`Update`, no `ConditionCheck`, so the existing IAM grants cover it).
+
+---
+
 ### `{prefix}_expense`
 
 Money an invoicing instance spent — a purchase, or a cents-per-km vehicle trip — optionally against
-one of its projects. See CLAUDE.md's "Expenses" house rule. Never linked to an invoice.
+one of its projects. See CLAUDE.md's "Expenses" house rule. Linked to an invoice only indirectly,
+through the billable item `rebillExpense` makes from it.
 
 | Attribute     | Type | Role                                   |
 | ------------- | ---- | -------------------------------------- |
@@ -714,6 +789,10 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
   × rate / 10`) on read.
 - `description` (S) — optional for a purchase; required for a trip (its business purpose). ≤ 2000.
 - `project_id` (S) — optional; absent (never `Null`) when the expense isn't for a project.
+- `billable_item_id` (S) — optional; the item `rebillExpense` made from it (see
+  `billable_item.source_expense_id`). `delete_expense` is conditioned on its absence.
+- `receipt_s3_key`, `receipt_filename`, `receipt_content_type` (S), `receipt_size` (N) — optional,
+  all present or all absent; the attached receipt (`receipts/{instance_id}/{id}/…`).
 - `created_by_user_id` (S) — whoever logged it; also whose km running total a trip counts toward.
 - `created_at`, `updated_at` (N)
 

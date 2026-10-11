@@ -22,17 +22,22 @@ export const invoiceStatusBadgeBase = tw`inline-flex items-center rounded-full p
 export function invoiceStatusLabel(
   status: string,
   paidDate: string | null | undefined,
+  overdue = false,
 ): string {
   if (status !== "FINALIZED") return "Draft";
-  return paidDate ? `Paid ${formatDate(paidDate)}` : "Unpaid";
+  if (paidDate) return `Paid ${formatDate(paidDate)}`;
+  return overdue ? "Overdue" : "Unpaid";
 }
 
 export function invoiceStatusBadgeClass(
   status: string,
   paidDate: string | null | undefined,
+  overdue = false,
 ): string {
   if (status !== "FINALIZED") return tw`bg-surface-sunken text-ink-muted`;
-  return paidDate
-    ? tw`bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300`
+  if (paidDate)
+    return tw`bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300`;
+  return overdue
+    ? tw`bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300`
     : tw`bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300`;
 }

@@ -14,7 +14,7 @@ import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
 import { relayMutationErrorMessage } from "../../lib/relayMutationError";
-import { formatDate, localToday } from "../../lib/dates";
+import { addDays, formatDate, localToday } from "../../lib/dates";
 import { formatCents } from "../../lib/money";
 import { BillableItemRow } from "./BillableItemRow";
 
@@ -30,6 +30,7 @@ const invoiceDraftPanelFragment = graphql`
     currency
     project {
       id
+      effectivePaymentTermsDays
     }
     items {
       id
@@ -202,6 +203,13 @@ export function InvoiceDraftPanel({
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
   const [issueDate, setIssueDate] = useState(() => localToday());
+  // `null` until the user picks one: the default follows the issue date.
+  const [dueDateChoice, setDueDateChoice] = useState<string | null>(null);
+  const defaultDueDate = addDays(
+    issueDate,
+    data.project.effectivePaymentTermsDays,
+  );
+  const dueDate = dueDateChoice ?? defaultDueDate;
   const [error, setError] = useState<string | null>(null);
 
   const [commitRemove] = useMutation<InvoiceDraftPanelRemoveMutation>(graphql`
@@ -230,8 +238,13 @@ export function InvoiceDraftPanel({
       mutation InvoiceDraftPanelFinalizeMutation(
         $invoiceId: ID!
         $issueDate: String!
+        $dueDate: String
       ) {
-        finalizeInvoice(invoiceId: $invoiceId, issueDate: $issueDate) {
+        finalizeInvoice(
+          invoiceId: $invoiceId
+          issueDate: $issueDate
+          dueDate: $dueDate
+        ) {
           id
           status
           items {
@@ -240,6 +253,8 @@ export function InvoiceDraftPanel({
           }
           ...InvoicePreview_invoice
           ...InvoicePaidControl_invoice
+          ...InvoiceSendPanel_invoice
+          ...InvoiceCreditNotes_invoice
         }
       }
     `);
@@ -301,7 +316,7 @@ export function InvoiceDraftPanel({
     e.preventDefault();
     setError(null);
     commitFinalize({
-      variables: { invoiceId: data.id, issueDate },
+      variables: { invoiceId: data.id, issueDate, dueDate },
       onCompleted: () => setShowFinalize(false),
       onError: (err) =>
         setError(relayMutationErrorMessage(err, "Failed to finalize invoice.")),
@@ -408,6 +423,22 @@ export function InvoiceDraftPanel({
                   required
                 />
               </FormField>
+            </div>
+            <div className="w-48">
+              <FormField label="Due date" htmlFor="finalize-due-date">
+                <TextInput
+                  id="finalize-due-date"
+                  type="date"
+                  value={dueDate}
+                  min={issueDate}
+                  onChange={(e) => setDueDateChoice(e.target.value || null)}
+                  required
+                />
+              </FormField>
+              <p className="mt-1 text-xs text-ink-muted">
+                {data.project.effectivePaymentTermsDays} days&apos; terms by
+                default.
+              </p>
             </div>
             <p className="text-sm text-amber-700 dark:text-amber-400">
               Finalizing assigns the next invoice number and makes this invoice

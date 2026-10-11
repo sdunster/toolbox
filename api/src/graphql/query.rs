@@ -20,9 +20,13 @@ use crate::storage::Handler as _;
 use super::auth::{AuthGuard, AuthRequirement, is_member, is_owner};
 use super::dataloader::DatabaseLoader;
 use super::error::ApiError;
+use super::finance::{
+    CreditNote, CsvExportType, ExpenseReceiptInfo, GstReport, InvoicePaymentInfo,
+    ProjectFinancialsInfo, ReceivablesReport, ReportBasisType,
+};
 use super::pagination::{build_connection, pagination_args};
 use super::{InstanceId, InvoiceId, ProjectId, UserId};
-use crate::invoicing::{self, money, vehicle};
+use crate::invoicing::{self, money, report, vehicle};
 
 /// Metadata for a stored passkey credential — never the credential itself (no
 /// private key material, no raw `passkey_json`).
@@ -262,6 +266,11 @@ impl<A: App + HasDb + Send + Sync + 'static> InvoicingSettingsInfo<A> {
     async fn currency(&self) -> String {
         self.rec.currency_or_default().to_string()
     }
+    /// Days after issue an invoice falls due, unless its project says
+    /// otherwise. Defaults to 14.
+    async fn payment_terms_days(&self) -> i32 {
+        self.rec.payment_terms_days_or_default() as i32
+    }
     /// `(counter value, or 0 if never finalized) + 1` — the number
     /// `finalizeInvoice` will assign next, and `setNextInvoiceNumber`'s
     /// argument shape. Read lazily here (a `counter` `GetItem`), not
@@ -290,26 +299,41 @@ pub struct InvoicingSettingsInput {
     pub payment_details: String,
     pub gst_registered: bool,
     pub currency: String,
+    /// `0..=365`; `null` resets to the default (14).
+    pub payment_terms_days: Option<i32>,
 }
 
 /// `createProject`'s argument.
+///
+/// - `clientEmail`: where `sendInvoice` mails by default.
+/// - `paymentTermsDays`: `0..=365`, overriding the instance's terms for
+///   this project's invoices; `null` uses the instance's.
+/// - `defaultUnitPriceCents`: the GST-exclusive rate a new billable item on
+///   this project gets when it doesn't name one.
 #[derive(InputObject, Clone, Debug)]
 pub struct CreateProjectInput {
     pub name: String,
     pub client_name: String,
     pub client_abn: Option<String>,
     pub client_address: Option<String>,
+    pub client_email: Option<String>,
     pub reference: Option<String>,
+    pub payment_terms_days: Option<i32>,
+    pub default_unit_price_cents: Option<i64>,
 }
 
-/// `updateProject`'s argument — full-replace, including `archived`.
+/// `updateProject`'s argument — full-replace, including `archived`: an
+/// omitted optional field is cleared.
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateProjectInput {
     pub name: String,
     pub client_name: String,
     pub client_abn: Option<String>,
     pub client_address: Option<String>,
+    pub client_email: Option<String>,
     pub reference: Option<String>,
+    pub payment_terms_days: Option<i32>,
+    pub default_unit_price_cents: Option<i64>,
     pub archived: bool,
 }
 
@@ -1221,6 +1245,52 @@ impl<A: App + HasDb + Send + Sync + 'static> Project<A> {
     async fn reference(&self) -> Option<&str> {
         self.rec.reference.as_deref()
     }
+    async fn client_email(&self) -> Option<&str> {
+        self.rec.client_email.as_deref()
+    }
+    /// This project's own payment terms override; `null` means the
+    /// instance's apply — see `effectivePaymentTermsDays`.
+    async fn payment_terms_days(&self) -> Option<i32> {
+        self.rec.payment_terms_days.map(|d| d as i32)
+    }
+    /// The terms this project's invoices actually get: its own override,
+    /// else the instance's.
+    async fn effective_payment_terms_days(&self, ctx: &Context<'_>) -> Result<i32> {
+        let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+        let instance = loader
+            .load_one(InstanceId(ID(self.rec.instance_id.clone())))
+            .await
+            .map_err(|e| anyhow!("Failed to load instance via DataLoader: {}", e))?
+            .ok_or_else(|| anyhow!("Instance with ID {} missing", self.rec.instance_id))?;
+        Ok(self.rec.payment_terms_days(&instance) as i32)
+    }
+    /// GST-exclusive cents a new billable item gets when it names no price.
+    async fn default_unit_price_cents(&self) -> Option<i64> {
+        self.rec.default_unit_price_cents
+    }
+    /// What this project has invoiced, been paid, and cost — computed from
+    /// every finalized invoice, expense and unbilled item on it. Reads all
+    /// of them, so ask for it on one project at a time, not on a list.
+    async fn financials(&self, ctx: &Context<'_>) -> Result<ProjectFinancialsInfo> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let invoices = app
+            .db()
+            .list_all_finalized_invoices(db::InvoiceScope::Project(&self.rec.id))
+            .await?;
+        let expenses = app.db().list_all_expenses_by_project(&self.rec.id).await?;
+        let unbilled = app
+            .db()
+            .list_billable_items(
+                db::BillableItemScope::Project(&self.rec.id),
+                db::BillableItemFilter::Unbilled,
+                db::ListBillableItemsPage {
+                    after: None,
+                    limit: i32::MAX,
+                },
+            )
+            .await?;
+        Ok(report::project_financials(&invoices, &expenses, &unbilled).into())
+    }
     async fn archived(&self) -> bool {
         self.rec.archived
     }
@@ -1272,12 +1342,19 @@ impl From<BillableItemFilterType> for db::BillableItemFilter {
 ///   (`"2"`, `"1.5"`, `"0.25"`) — a string so no client float ever gets
 ///   near it; the server is the one parser (`invoicing::money::parse_quantity`).
 /// - `unitPriceCents`: integer cents, GST-exclusive, `0 ≤ p ≤ 1,000,000,000`.
+///   Optional: omitted, a new item takes its project's
+///   `defaultUnitPriceCents` (an error if the project has none), and an
+///   update keeps the item's current price.
+/// - `gstFree`: no GST on this line even when the instance is
+///   GST-registered (e.g. a re-billed GST-free cost). Defaults to `false`.
 #[derive(InputObject, Clone, Debug)]
 pub struct BillableItemInput {
     pub date: String,
     pub description: String,
     pub quantity: String,
-    pub unit_price_cents: i64,
+    pub unit_price_cents: Option<i64>,
+    #[graphql(default)]
+    pub gst_free: bool,
 }
 
 /// A `billable_item` row, exposed over GraphQL to its invoicing instance's
@@ -1373,6 +1450,25 @@ impl<A: App + HasDb + Send + Sync + 'static> BillableItem<A> {
     async fn amount_cents(&self) -> i64 {
         money::line_amount_cents(self.rec.quantity_hundredths, self.rec.unit_price_cents)
     }
+    /// No GST is charged on this line.
+    async fn gst_free(&self) -> bool {
+        self.rec.gst_free
+    }
+    /// The expense this item re-bills, when `rebillExpense` made it.
+    async fn source_expense(&self, ctx: &Context<'_>) -> Result<Option<Expense<A>>> {
+        let Some(expense_id) = &self.rec.source_expense_id else {
+            return Ok(None);
+        };
+        let app = ctx.data_unchecked::<Arc<A>>();
+        Ok(app
+            .db()
+            .get_expenses(&[expense_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .map(Expense::new))
+    }
     /// `UNBILLED` when not on an invoice; otherwise `DRAFT`/`INVOICED`
     /// according to that invoice's own status, dataloaded — a page of items
     /// resolves this once per node, same as [`Self::project`]. Falls back to
@@ -1453,15 +1549,20 @@ pub enum InvoiceFilterType {
     Draft,
     Unpaid,
     Paid,
+    /// Unpaid and past its due date (by today's UTC date).
+    Overdue,
 }
 
-impl From<InvoiceFilterType> for db::InvoiceListFilter {
-    fn from(f: InvoiceFilterType) -> Self {
-        match f {
-            InvoiceFilterType::All => Self::All,
-            InvoiceFilterType::Draft => Self::Draft,
-            InvoiceFilterType::Unpaid => Self::Unpaid,
-            InvoiceFilterType::Paid => Self::Paid,
+impl InvoiceFilterType {
+    fn to_db(self, today: &str) -> db::InvoiceListFilter {
+        match self {
+            InvoiceFilterType::All => db::InvoiceListFilter::All,
+            InvoiceFilterType::Draft => db::InvoiceListFilter::Draft,
+            InvoiceFilterType::Unpaid => db::InvoiceListFilter::Unpaid,
+            InvoiceFilterType::Paid => db::InvoiceListFilter::Paid,
+            InvoiceFilterType::Overdue => db::InvoiceListFilter::Overdue {
+                today: today.to_string(),
+            },
         }
     }
 }
@@ -1516,6 +1617,8 @@ pub struct InvoiceLineInfo {
     pub quantity: String,
     pub unit_price_cents: i64,
     pub amount_cents: i64,
+    /// No GST on this line.
+    pub gst_free: bool,
 }
 
 impl From<invoicing::snapshot::InvoiceSnapshotLine> for InvoiceLineInfo {
@@ -1526,6 +1629,7 @@ impl From<invoicing::snapshot::InvoiceSnapshotLine> for InvoiceLineInfo {
             quantity: l.quantity,
             unit_price_cents: l.unit_price_cents,
             amount_cents: l.amount_cents,
+            gst_free: l.gst_free,
         }
     }
 }
@@ -1607,7 +1711,7 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
                         .collect()
                 };
                 Ok(invoicing::snapshot::build_snapshot(
-                    &instance, &project, &items, None, None,
+                    &instance, &project, &items, None, None, None,
                 ))
             }
         }
@@ -1634,9 +1738,72 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
     async fn issue_date(&self) -> Option<&str> {
         self.rec.issue_date.as_deref()
     }
-    /// `YYYY-MM-DD`; `null` means unpaid. Never printed on the invoice.
+    /// `YYYY-MM-DD`: when the invoice was settled — paid in full, or
+    /// paid and credited down to nothing. `null` while anything is owed.
+    /// Never printed on the invoice.
     async fn paid_date(&self) -> Option<&str> {
         self.rec.paid_date.as_deref()
+    }
+    /// `YYYY-MM-DD`; `null` for a draft. Frozen at finalization.
+    async fn due_date(&self) -> Option<&str> {
+        self.rec.due_date.as_deref()
+    }
+    /// Unpaid and past its due date, by today's UTC date.
+    async fn overdue(&self) -> bool {
+        self.rec.is_overdue(&invoicing::today_utc())
+    }
+    /// Whole days past due (by today's UTC date) while unpaid; `null` when
+    /// it isn't overdue.
+    async fn days_overdue(&self) -> Option<i32> {
+        let today = invoicing::today_utc();
+        if !self.rec.is_overdue(&today) {
+            return None;
+        }
+        let due = self.rec.due_date.as_deref()?;
+        Some(report::days_between(due, &today) as i32)
+    }
+    /// Payments recorded against it, oldest first.
+    async fn payments(&self) -> Vec<InvoicePaymentInfo> {
+        let mut payments: Vec<InvoicePaymentInfo> = self
+            .rec
+            .payments
+            .iter()
+            .map(InvoicePaymentInfo::from)
+            .collect();
+        payments.sort_by(|a, b| a.date.cmp(&b.date));
+        payments
+    }
+    async fn paid_cents(&self) -> i64 {
+        self.rec.paid_cents()
+    }
+    /// Sum of its credit notes, GST-inclusive.
+    async fn credited_cents(&self) -> i64 {
+        self.rec.credited_cents
+    }
+    /// Total − credited − paid. Negative when overpaid. `0` for a draft.
+    async fn balance_cents(&self) -> i64 {
+        self.rec.balance_cents()
+    }
+    /// Credit notes issued against it, newest (highest number) first.
+    async fn credit_notes(&self, ctx: &Context<'_>) -> Result<Vec<CreditNote<A>>> {
+        if self.rec.status != db::InvoiceStatus::Finalized {
+            return Ok(vec![]);
+        }
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let mut notes = app
+            .db()
+            .list_all_credit_notes(db::CreditNoteScope::Invoice(&self.rec.id))
+            .await?;
+        notes.sort_by_key(|n| std::cmp::Reverse(n.number));
+        Ok(notes.into_iter().map(CreditNote::new).collect())
+    }
+    /// When `sendInvoice` last mailed it (Unix seconds); `null` if never.
+    async fn sent_at(&self) -> Option<i64> {
+        self.rec.sent_at.map(|t| t as i64)
+    }
+    /// Who it was last mailed to.
+    async fn sent_to(&self) -> &[String] {
+        &self.rec.sent_to
     }
     /// Dataloaded — see `TicketMessage::author`'s doc comment.
     async fn project(&self, ctx: &Context<'_>) -> Result<Project<A>> {
@@ -1718,6 +1885,45 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
     async fn finalized_at(&self) -> Option<i64> {
         self.rec.finalized_at.map(|t| t as i64)
     }
+}
+
+/// Fetch `instance_id` and require it to be an invoicing instance —
+/// `NOT_FOUND` when missing, a plain validation error for a support
+/// instance (the caller is a real member of a real instance, just the
+/// wrong kind), like `projects`.
+async fn require_invoicing_instance<A: App + HasDb + Send + Sync>(
+    app: &A,
+    instance_id: &ID,
+) -> Result<db::Instance> {
+    let instance = app
+        .db()
+        .get_instances(&[instance_id.as_str()])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+    db::require_instance_kind(&instance, db::InstanceKind::Invoicing).map_err(|e| anyhow!(e))?;
+    Ok(instance)
+}
+
+/// The longest period a report or export covers, in days — enough for two
+/// financial years side by side, small enough to keep one request bounded.
+const MAX_REPORT_RANGE_DAYS: i64 = 731;
+
+/// Validate a report's `from..=to` (`YYYY-MM-DD`, `from ≤ to`, at most
+/// [`MAX_REPORT_RANGE_DAYS`] apart).
+fn validate_report_range(from: &str, to: &str) -> Result<(String, String)> {
+    let from = invoicing::validate_item_date(from).map_err(|e| anyhow!(e))?;
+    let to = invoicing::validate_item_date(to).map_err(|e| anyhow!(e))?;
+    let days = report::days_between(&from, &to);
+    if days < 0 {
+        return Err(anyhow!("from must be on or before to"));
+    }
+    if days > MAX_REPORT_RANGE_DAYS {
+        return Err(anyhow!("A report can cover at most two years"));
+    }
+    Ok((from, to))
 }
 
 /// Default/max page size for `billableItems` — the same numbers as
@@ -1941,6 +2147,27 @@ impl<A: App + HasDb + Send + Sync + 'static> Expense<A> {
             } => Some(*rate_cents_per_km),
             db::ExpenseDetail::Purchase { .. } => None,
         }
+    }
+    /// The billable item `rebillExpense` made from this expense, if any.
+    /// An expense that has been re-billed can't be deleted.
+    async fn rebilled_item(&self, ctx: &Context<'_>) -> Result<Option<BillableItem<A>>> {
+        let Some(item_id) = &self.rec.billable_item_id else {
+            return Ok(None);
+        };
+        let app = ctx.data_unchecked::<Arc<A>>();
+        Ok(app
+            .db()
+            .get_billable_items(&[item_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .map(BillableItem::new))
+    }
+    /// The uploaded receipt, if any — download it with
+    /// `downloadExpenseReceipt`.
+    async fn receipt(&self) -> Option<ExpenseReceiptInfo> {
+        self.rec.receipt.as_ref().map(ExpenseReceiptInfo::from)
     }
     /// Dataloaded — see [`TicketMessage::author`]'s doc comment.
     async fn created_by(&self, ctx: &Context<'_>) -> Result<Option<User<A>>> {
@@ -2715,7 +2942,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .db()
             .list_invoices(
                 scope,
-                filter.into(),
+                filter.to_db(&invoicing::today_utc()),
                 db::ListInvoicesPage {
                     after: after_cursor,
                     limit: fetch_limit,
@@ -2765,6 +2992,235 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             return Ok(None);
         }
         Ok(Some(Invoice::new(rec)))
+    }
+
+    /// Credit notes in an invoicing instance — all of them, or one
+    /// invoice's when `invoiceId` is given — as a Relay connection, newest
+    /// first. Same posture as [`Self::invoices`].
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn credit_notes(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        invoice_id: Option<ID>,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<Connection<String, CreditNote<A>, EmptyFields, EmptyFields>> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        if let Some(invoice_id) = &invoice_id {
+            app.db()
+                .get_invoices(&[invoice_id.as_str()])
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .filter(|i| i.instance_id == instance.id)
+                .ok_or_else(|| ApiError::not_found("Invoice", invoice_id.as_str()))?;
+        }
+        let after_cursor = after
+            .as_deref()
+            .map(decode_invoice_cursor)
+            .transpose()?
+            .map(|c| db::CreditNoteCursor {
+                created_at: c.created_at,
+                id: c.id,
+            });
+        let has_after = after_cursor.is_some();
+        let (page_size, _) = pagination_args(
+            first,
+            None,
+            DEFAULT_INVOICE_PAGE_SIZE,
+            MAX_INVOICE_PAGE_SIZE,
+        )?;
+        let fetch_limit = i32::try_from(page_size.saturating_add(1))
+            .map_err(|_| anyhow!("Requested page is too large"))?;
+        let scope = match &invoice_id {
+            Some(i) => db::CreditNoteScope::Invoice(i.as_str()),
+            None => db::CreditNoteScope::Instance(instance.id.as_str()),
+        };
+        let notes = app
+            .db()
+            .list_credit_notes(
+                scope,
+                db::ListCreditNotesPage {
+                    after: after_cursor,
+                    limit: fetch_limit,
+                },
+            )
+            .await?;
+        Ok(build_connection(
+            notes,
+            page_size,
+            false,
+            has_after,
+            false,
+            |n| {
+                (
+                    format!("{}:{}", n.created_at, n.id),
+                    CreditNote::new(n.clone()),
+                )
+            },
+        ))
+    }
+
+    /// One credit note by id — `null` for missing, not-yours and a support
+    /// instance alike, like [`Self::invoice`].
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Authenticated)")]
+    async fn credit_note(&self, ctx: &Context<'_>, id: ID) -> Result<Option<CreditNote<A>>> {
+        let Some(AuthInfo::User { memberships, .. }) = ctx.data_opt::<AuthInfo>() else {
+            return Err(ApiError::forbidden("Must be authenticated as a user").into());
+        };
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let Some(rec) = app.db().get_credit_note_consistent(id.as_str()).await? else {
+            return Ok(None);
+        };
+        if !is_member(memberships, &rec.instance_id) {
+            return Ok(None);
+        }
+        Ok(Some(CreditNote::new(rec)))
+    }
+
+    /// The BAS figures for `from..=to` (`YYYY-MM-DD`, at most 2 years
+    /// apart): sales and GST on sales (G1/1A) from finalized invoices,
+    /// credit notes and payments on the chosen `basis`, and purchases and
+    /// GST on purchases (1B) from expenses by their date. See
+    /// `invoicing::report::gst_summary` for exactly how each basis counts.
+    /// Member; a support instance is rejected.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn gst_report(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        from: String,
+        to: String,
+        basis: ReportBasisType,
+    ) -> Result<GstReport> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        let (from, to) = validate_report_range(&from, &to)?;
+        let invoices = app
+            .db()
+            .list_all_finalized_invoices(db::InvoiceScope::Instance(&instance.id))
+            .await?;
+        let credit_notes = app
+            .db()
+            .list_all_credit_notes(db::CreditNoteScope::Instance(&instance.id))
+            .await?;
+        let expenses = app
+            .db()
+            .list_expenses_in_range(&instance.id, &from, &to)
+            .await?;
+        let summary = report::gst_summary(
+            basis.into(),
+            &from,
+            &to,
+            &invoices,
+            &credit_notes,
+            &expenses,
+        );
+        Ok(GstReport {
+            net_gst_cents: summary.net_gst_cents(),
+            from,
+            to,
+            basis,
+            gst_registered: instance.gst_registered,
+            currency: instance.currency_or_default().to_string(),
+            sales_cents: summary.sales_cents,
+            gst_on_sales_cents: summary.gst_on_sales_cents,
+            purchases_cents: summary.purchases_cents,
+            gst_on_purchases_cents: summary.gst_on_purchases_cents,
+            invoice_count: summary.invoice_count as i32,
+            credit_note_count: summary.credit_note_count as i32,
+            payment_count: summary.payment_count as i32,
+            expense_count: summary.expense_count as i32,
+        })
+    }
+
+    /// Aged receivables: every finalized invoice with a balance owing,
+    /// bucketed by days past due as of today (UTC). Member; a support
+    /// instance is rejected.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn receivables(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+    ) -> Result<ReceivablesReport<A>> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        let invoices = app
+            .db()
+            .list_all_finalized_invoices(db::InvoiceScope::Instance(&instance.id))
+            .await?;
+        let today = invoicing::today_utc();
+        let (aging, outstanding) = report::aging(&invoices, &today);
+        Ok(ReceivablesReport {
+            invoices: outstanding.into_iter().cloned().collect(),
+            as_of: today,
+            currency: instance.currency_or_default().to_string(),
+            aging,
+            _marker: PhantomData,
+        })
+    }
+
+    /// A CSV export for `from..=to` (`YYYY-MM-DD`, at most 2 years apart):
+    /// finalized invoices by issue date, credit notes by issue date,
+    /// payments by payment date, or expenses by date. Returned as the CSV
+    /// text itself; the web app saves it as a file. Member; a support
+    /// instance is rejected. See `invoicing::csv`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn invoicing_export(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        kind: CsvExportType,
+        from: String,
+        to: String,
+    ) -> Result<String> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        let (from, to) = validate_report_range(&from, &to)?;
+        let projects: std::collections::HashMap<String, db::Project> = app
+            .db()
+            .list_projects_by_instance(&instance.id)
+            .await?
+            .into_iter()
+            .map(|p| (p.id.clone(), p))
+            .collect();
+        Ok(match invoicing::csv::Export::from(kind) {
+            invoicing::csv::Export::Expenses => {
+                let expenses = app
+                    .db()
+                    .list_expenses_in_range(&instance.id, &from, &to)
+                    .await?;
+                invoicing::csv::expenses(&expenses, &projects, &from, &to)
+            }
+            export => {
+                let invoices = app
+                    .db()
+                    .list_all_finalized_invoices(db::InvoiceScope::Instance(&instance.id))
+                    .await?;
+                match export {
+                    invoicing::csv::Export::Invoices => {
+                        invoicing::csv::invoices(&invoices, &projects, &from, &to)
+                    }
+                    invoicing::csv::Export::Payments => {
+                        invoicing::csv::payments(&invoices, &projects, &from, &to)
+                    }
+                    _ => {
+                        let notes = app
+                            .db()
+                            .list_all_credit_notes(db::CreditNoteScope::Instance(&instance.id))
+                            .await?;
+                        let numbers = invoices
+                            .iter()
+                            .filter_map(|i| i.number.map(|n| (i.id.clone(), format!("{n:03}"))))
+                            .collect();
+                        invoicing::csv::credit_notes(&notes, &numbers, &projects, &from, &to)
+                    }
+                }
+            }
+        })
     }
 
     // ── Admin (superuser-only) ──────────────────────────────────────────────

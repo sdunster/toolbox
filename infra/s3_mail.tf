@@ -19,6 +19,16 @@
 #                                                   PDF is a permanent
 #                                                   financial record, not
 #                                                   transient mail.
+#   credit-notes/{instance_id}/{credit_note_id}/Credit-Note-CN-{n}.pdf
+#                                                   the same, for a credit
+#                                                   note — also permanent.
+#   receipts/{instance_id}/{expense_id}/{nanoid}/{filename}
+#                                                   an expense's receipt,
+#                                                   uploaded straight here
+#                                                   by presigned PUT
+#                                                   (createExpenseReceiptUpload)
+#                                                   — kept, like the PDFs:
+#                                                   it backs a tax claim.
 
 resource "aws_s3_bucket" "mail" {
   bucket = "toolbox-mail-${var.aws_account_id}"

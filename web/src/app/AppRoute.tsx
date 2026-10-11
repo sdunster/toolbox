@@ -16,6 +16,7 @@ import { ExpenseListPage } from "./invoicing/ExpenseListPage";
 import { InvoiceListPage } from "./invoicing/InvoiceListPage";
 import { InvoiceDetailPage } from "./invoicing/InvoiceDetailPage";
 import { InvoicingSettingsPage } from "./invoicing/InvoicingSettingsPage";
+import { ReportsPage } from "./invoicing/ReportsPage";
 import { useSelectedInstance } from "./SelectedInstanceContext";
 import { homePathForKind } from "./selectedInstance";
 
@@ -125,6 +126,7 @@ export default function AppRoute() {
           <Route path="projects/:id" element={<ProjectDetailPage />} />
           <Route path="billable-items" element={<BillableItemListPage />} />
           <Route path="expenses" element={<ExpenseListPage />} />
+          <Route path="reports" element={<ReportsPage />} />
           <Route
             path="invoicing-settings"
             element={<InvoicingSettingsPage />}

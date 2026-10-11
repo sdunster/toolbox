@@ -10,6 +10,7 @@ import { tw } from "../../lib/tw";
 import { centsToInput, formatCents } from "../../lib/money";
 import { VEHICLE_KM, categoryLabel } from "../../lib/expenses";
 import { ExpenseForm } from "./ExpenseForm";
+import { ExpenseExtras } from "./ExpenseExtras";
 
 const expenseRowFragment = graphql`
   fragment ExpenseRow_expense on Expense {
@@ -25,6 +26,12 @@ const expenseRowFragment = graphql`
     project {
       id
       name
+    }
+    rebilledItem {
+      id
+    }
+    receipt {
+      filename
     }
   }
 `;
@@ -66,8 +73,8 @@ export function ExpenseHeader({
 /**
  * One expense: a grid row at lg+, a stacked card below (the same
  * `lg:contents` technique as `BillableItemRow`). Inline Edit swaps in an
- * {@link ExpenseForm}; Delete asks for a second click. Expenses are never
- * on an invoice, so every one stays editable.
+ * {@link ExpenseForm}; Delete asks for a second click. Below the details,
+ * {@link ExpenseExtras} handles the receipt and re-billing.
  *
  * `projects` feeds the edit form's project picker; on a project's own page
  * it's omitted and the expense keeps its project.
@@ -205,6 +212,13 @@ export function ExpenseRow({
             )}
           </>
         )}
+        <ExpenseExtras
+          expenseId={data.id}
+          hasProject={data.project != null}
+          rebilled={data.rebilledItem != null}
+          receiptFilename={data.receipt?.filename ?? null}
+          onChanged={onChanged}
+        />
       </div>
 
       <div className="text-sm tabular-nums lg:text-right">

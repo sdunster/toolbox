@@ -230,6 +230,7 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String, 
             payment_details: Some("BSB 000-000 Acc 00000000"),
             gst_registered: false,
             currency: None,
+            payment_terms_days: None,
         },
     )
     .await
@@ -251,11 +252,11 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String, 
     let project = db
         .create_project(
             &instance.id,
-            "Fictional Job",
-            "Fictional Client Pty Ltd",
-            None,
-            None,
-            None,
+            &db::ProjectFields {
+                name: "Fictional Job".into(),
+                client_name: "Fictional Client Pty Ltd".into(),
+                ..Default::default()
+            },
         )
         .await
         .expect("create_project");
@@ -272,15 +273,16 @@ async fn create_items(
     let mut ids = Vec::with_capacity(count);
     for n in 0..count {
         let item = db
-            .create_billable_item(
+            .create_billable_item(&db::NewBillableItem {
                 instance_id,
                 project_id,
-                "2026-08-19",
-                &format!("Line {n}"),
-                200,
-                10_000,
-                user_id,
-            )
+                date: "2026-08-19",
+                description: &format!("Line {n}"),
+                quantity_hundredths: 200,
+                unit_price_cents: 10_000,
+                gst_free: false,
+                created_by_user_id: user_id,
+            })
             .await
             .expect("create_billable_item");
         ids.push(item.id);
@@ -707,7 +709,14 @@ async fn item_from_another_project_or_already_billed_is_a_conflict() {
     let db = dynamodb::Handler::new(&prefix, false).await;
     let (instance_id, _owner_id, agent_id, project_a) = setup(&db, "wrongproj").await;
     let project_b = db
-        .create_project(&instance_id, "Other Job", "Other Client", None, None, None)
+        .create_project(
+            &instance_id,
+            &db::ProjectFields {
+                name: "Other Job".into(),
+                client_name: "Other Client".into(),
+                ..Default::default()
+            },
+        )
         .await
         .expect("create_project b");
     let schema = build_schema(db.clone());
@@ -1321,7 +1330,14 @@ async fn finalize_requires_business_name_to_be_set_first() {
         .await
         .expect("create_membership");
     let project = db
-        .create_project(&instance.id, "Job", "Client", None, None, None)
+        .create_project(
+            &instance.id,
+            &db::ProjectFields {
+                name: "Job".into(),
+                client_name: "Client".into(),
+                ..Default::default()
+            },
+        )
         .await
         .expect("create_project");
     let schema = build_schema(db.clone());
@@ -1373,11 +1389,15 @@ async fn invoice_list_filters_and_paginates() {
                 &instance_id,
                 &inv.id,
                 inv.version,
-                number as u32,
-                "2026-08-19",
-                "{}",
-                0,
-                &agent_id,
+                &db::FinalizeInvoice {
+                    number: number as u32,
+                    issue_date: "2026-08-19",
+                    due_date: "2026-08-19",
+                    snapshot_json: "{}",
+                    total_cents: 0,
+                    gst_cents: 0,
+                    finalized_by_user_id: &agent_id,
+                },
             )
             .await
             .expect("finalize_invoice");
@@ -1385,10 +1405,15 @@ async fn invoice_list_filters_and_paginates() {
         finalized_ids.push(inv.id);
     }
     // mark the first finalized invoice paid
+    let first = db
+        .get_invoice_consistent(&finalized_ids[0])
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        db.set_invoice_paid(&finalized_ids[0], Some("2026-08-20"))
+        db.set_invoice_payments(&first.id, first.version, &[], Some("2026-08-20"))
             .await
-            .expect("set_invoice_paid")
+            .expect("set_invoice_payments")
     );
 
     let schema = build_schema(db.clone());
@@ -1622,6 +1647,7 @@ mod db_level_conflicts {
                     description: "Edited while draft",
                     quantity_hundredths: 300,
                     unit_price_cents: 5_000,
+                    gst_free: false,
                 },
             )
             .await
@@ -1634,11 +1660,15 @@ mod db_level_conflicts {
                 &instance_id,
                 &invoice.id,
                 invoice.version,
-                1,
-                "2026-08-19",
-                "{}",
-                0,
-                &agent_id,
+                &db::FinalizeInvoice {
+                    number: 1,
+                    issue_date: "2026-08-19",
+                    due_date: "2026-08-19",
+                    snapshot_json: "{}",
+                    total_cents: 0,
+                    gst_cents: 0,
+                    finalized_by_user_id: &agent_id,
+                },
             )
             .await
             .expect("finalize_invoice");
@@ -1656,11 +1686,15 @@ mod db_level_conflicts {
                 &instance_id,
                 &invoice.id,
                 current.version,
-                1,
-                "2026-08-19",
-                "{}",
-                0,
-                &agent_id,
+                &db::FinalizeInvoice {
+                    number: 1,
+                    issue_date: "2026-08-19",
+                    due_date: "2026-08-19",
+                    snapshot_json: "{}",
+                    total_cents: 0,
+                    gst_cents: 0,
+                    finalized_by_user_id: &agent_id,
+                },
             )
             .await
             .expect("finalize_invoice");
@@ -1700,11 +1734,15 @@ mod db_level_conflicts {
                 &instance_id,
                 &invoice.id,
                 wrong_version,
-                1,
-                "2026-08-19",
-                "{}",
-                0,
-                &agent_id
+                &db::FinalizeInvoice {
+                    number: 1,
+                    issue_date: "2026-08-19",
+                    due_date: "2026-08-19",
+                    snapshot_json: "{}",
+                    total_cents: 0,
+                    gst_cents: 0,
+                    finalized_by_user_id: &agent_id,
+                },
             )
             .await
             .expect("finalize_invoice")

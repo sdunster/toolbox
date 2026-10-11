@@ -69,6 +69,7 @@ async fn set_business_name(w: &World) {
                 payment_details: Some("BSB 000-000 Acct 12345678"),
                 gst_registered: true,
                 currency: None,
+                payment_terms_days: None,
             },
         )
         .await
@@ -817,5 +818,139 @@ async fn owner_can_import_an_invoice_with_its_original_number_and_dates() {
         .await
         .unwrap_err()
         .contains("whole number")
+    );
+}
+
+#[tokio::test]
+async fn payments_credit_notes_sending_and_reports() {
+    let Some(w) = world().await else { return };
+    let t = &w.member_token;
+    set_business_name(&w).await;
+    let pid = call_tool(
+        &w.f,
+        t,
+        "create_project",
+        json!({"instanceId": w.instance, "name": "Fitout", "clientName": "Acme Pty Ltd",
+               "clientEmail": "accounts@acme.example", "paymentTermsDays": 7,
+               "defaultUnitPriceCents": 10_000}),
+    )
+    .await
+    .unwrap()["project"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // No price: the project's default rate applies.
+    let it = call_tool(
+        &w.f,
+        t,
+        "create_billable_item",
+        json!({"projectId": pid, "date": "2026-09-01", "description": "Labour", "quantity": "2"}),
+    )
+    .await
+    .unwrap()["item"]
+        .clone();
+    assert_eq!(it["unitPriceCents"], 10_000);
+    let inv = call_tool(
+        &w.f,
+        t,
+        "create_invoice",
+        json!({"projectId": pid, "itemIds": [id(&it)]}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    let fin = call_tool(
+        &w.f,
+        t,
+        "finalize_invoice",
+        json!({"invoiceId": id(&inv), "issueDate": "2026-09-01"}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert_eq!(fin["dueDate"], "2026-09-08");
+    assert_eq!(fin["totalCents"], 22_000); // GST-registered via set_business_name
+
+    let paid = call_tool(
+        &w.f,
+        t,
+        "record_invoice_payment",
+        json!({"invoiceId": id(&fin), "date": "2026-09-05", "amountCents": 11_000}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert_eq!(paid["balanceCents"], 11_000);
+    assert!(paid["paidDate"].is_null());
+
+    let note = call_tool(
+        &w.f,
+        t,
+        "issue_credit_note",
+        json!({"invoiceId": id(&fin), "issueDate": "2026-09-06", "reason": "Discount",
+               "lines": [{"description": "Discount", "amountCents": 10_000}]}),
+    )
+    .await
+    .unwrap()["creditNote"]
+        .clone();
+    assert_eq!(note["totalCents"], 11_000);
+    assert!(note["displayNumber"].as_str().unwrap().starts_with("CN-"));
+    let after = call_tool(&w.f, t, "get_invoice", json!({"invoiceId": id(&fin)}))
+        .await
+        .unwrap()["invoice"]
+        .clone();
+    assert_eq!(after["balanceCents"], 0);
+    assert_eq!(after["paidDate"], "2026-09-06");
+
+    let sent = call_tool(&w.f, t, "send_invoice", json!({"invoiceId": id(&fin)}))
+        .await
+        .unwrap()["invoice"]
+        .clone();
+    assert!(sent["sentAt"].is_i64());
+    assert_eq!(
+        w.f.app.mail.sent_raw().last().unwrap().to,
+        vec!["accounts@acme.example"]
+    );
+
+    let report = call_tool(
+        &w.f,
+        t,
+        "get_gst_report",
+        json!({"instanceId": w.instance, "from": "2026-07-01", "to": "2026-09-30", "basis": "ACCRUAL"}),
+    )
+    .await
+    .unwrap()["report"]
+        .clone();
+    assert_eq!(report["salesCents"], 11_000);
+    let csv = call_tool(
+        &w.f,
+        t,
+        "export_csv",
+        json!({"instanceId": w.instance, "kind": "PAYMENTS", "from": "2026-09-01", "to": "2026-09-30"}),
+    )
+    .await
+    .unwrap()["csv"]
+        .clone();
+    assert!(csv.as_str().unwrap().contains("110.00"));
+    let receivables = call_tool(
+        &w.f,
+        t,
+        "get_receivables",
+        json!({"instanceId": w.instance}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receivables["receivables"]["totalCents"], 0);
+
+    // An outsider can't credit someone else's invoice.
+    assert!(
+        call_tool(
+            &w.f,
+            &w.outsider_token,
+            "issue_credit_note",
+            json!({"invoiceId": id(&fin), "issueDate": "2026-09-07", "reason": "x"}),
+        )
+        .await
+        .is_err()
     );
 }

@@ -24,6 +24,7 @@ const billableItemRowFragment = graphql`
     quantity
     unitPriceCents
     amountCents
+    gstFree
     status
     invoice {
       id
@@ -219,6 +220,7 @@ export function BillableItemRow({
             description: data.description,
             quantity: data.quantity,
             price: centsToInput(data.unitPriceCents),
+            gstFree: data.gstFree,
           }}
           submitLabel="Save"
           savingLabel="Saving…"
@@ -288,6 +290,11 @@ export function BillableItemRow({
 
       <div className="min-w-0 lg:order-3">
         <Description text={data.description} />
+        {data.gstFree && (
+          <span className="mt-0.5 inline-block text-xs text-ink-muted">
+            GST-free
+          </span>
+        )}
       </div>
 
       <div className="flex items-baseline justify-between gap-3 lg:contents">
