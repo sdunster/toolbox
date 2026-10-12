@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { rawGraphQL } from "../lib/rawGraphQL";
+import { useTurnstile } from "../lib/turnstile";
 import { Card } from "../components/ui/Card";
 import { Button } from "../components/ui/Button";
 import { ButtonLink } from "../components/ui/Button";
@@ -41,6 +42,16 @@ export function SubmitForm({
     null,
   );
   const [now, setNow] = useState(() => Date.now());
+  const {
+    enabled: turnstileEnabled,
+    token: currentTurnstileToken,
+    failed: turnstileFailed,
+    mountWidget: mountTurnstile,
+    consume: consumeTurnstileToken,
+  } = useTurnstile();
+  // Same gate as `auth/LoginPage`: with Turnstile on, a send waits for a
+  // passed challenge.
+  const turnstileReady = !turnstileEnabled || currentTurnstileToken !== null;
 
   useEffect(() => {
     if (resendAvailableAt === null || now >= resendAvailableAt) return;
@@ -50,17 +61,19 @@ export function SubmitForm({
 
   const resendRemainingMs =
     resendAvailableAt !== null ? Math.max(0, resendAvailableAt - now) : 0;
-  const canResend = resendAvailableAt !== null && resendRemainingMs <= 0;
+  const canResend =
+    resendAvailableAt !== null && resendRemainingMs <= 0 && turnstileReady;
 
   async function sendCode() {
     setStep({ kind: "sending_code" });
     setError(null);
+    const turnstileToken = consumeTurnstileToken();
     try {
       await rawGraphQL(
         `mutation RequestSubmitCode($slug: String!, $email: String!, $turnstileToken: String) {
           requestSubmitCode(slug: $slug, email: $email, turnstileToken: $turnstileToken)
         }`,
-        { slug, email, turnstileToken: null },
+        { slug, email, turnstileToken },
       );
       const sentAt = Date.now();
       setNow(sentAt);
@@ -155,7 +168,7 @@ export function SubmitForm({
           </FormField>
           <Button
             type="submit"
-            disabled={!email || step.kind === "sending_code"}
+            disabled={!email || step.kind === "sending_code" || !turnstileReady}
           >
             {step.kind === "sending_code" ? "Sending…" : "Send code"}
           </Button>
@@ -210,6 +223,18 @@ export function SubmitForm({
               : `Resend code in ${Math.ceil(resendRemainingMs / 1000)}s`}
           </Button>
         </form>
+      )}
+
+      {/* Mounted across the email/code steps so a resend has a fresh
+          token ready; gone once the code is verified. */}
+      {turnstileEnabled && step.kind !== "ticket_form" && (
+        <div ref={mountTurnstile} className="mt-4" />
+      )}
+      {turnstileFailed && step.kind !== "ticket_form" && (
+        <p role="alert" className="mt-2 text-sm text-red-600 dark:text-red-400">
+          Couldn&apos;t confirm you&apos;re not a bot. Reload the page and try
+          again.
+        </p>
       )}
 
       {step.kind === "ticket_form" && (

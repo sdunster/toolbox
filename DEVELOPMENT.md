@@ -235,7 +235,7 @@ cp infra/terraform.tfvars.example infra/terraform.tfvars   # gitignored — neve
 | `allowed_origins` | CORS origins for the API Lambda Function URL — normally just `["https://<support_domain>"]` |
 | `alert_email` | Subscribed to the operational alert SNS topic (`monitoring.tf`) — verify you can receive at this address before applying, or the SNS subscription sits unconfirmed |
 | `inbound_retention_days` | How long raw inbound MIME is kept in S3 before lifecycle expiry |
-| `turnstile_secret_key` | Optional — leave blank to skip Cloudflare Turnstile verification entirely |
+| `turnstile_secret_key` | Optional — leave blank to skip Cloudflare Turnstile verification entirely. If you set it, deploy the web app with the `VITE_TURNSTILE_SITE_KEY` repo variable (below) **first**: once the API has a secret, a code request without a token is rejected, so applying this before the site key is live locks everyone out of email-code login |
 | `oauth_client_id_secret` | Optional — signs the client ids MCP clients register with (`openssl rand -base64 48`); leave blank and dynamic client registration answers `503`, so no MCP client can connect |
 
 ### 9.4 Import anything that already exists
@@ -302,6 +302,7 @@ Secrets — none of these are sensitive on their own):
 | `VITE_API_URL` | `api_url` (`https://<web_domain>/graphql`, served same-origin by CloudFront; `api_function_url` also still works) |
 | `WEB_BUCKET_NAME` | `web_bucket_name` |
 | `CLOUDFRONT_DISTRIBUTION_ID` | `cloudfront_distribution_id` |
+| `VITE_TURNSTILE_SITE_KEY` | Optional — not a Terraform output; the site key of a Cloudflare Turnstile widget for `<web_domain>`. Pairs with `turnstile_secret_key` above; leave unset to build without the widget |
 
 Pushing to the `prod` branch (after these are set) runs `deploy-prod.yml`: all four `_check-*.yml`
 gates, then `deploy_lambdas` (builds both binaries with `cargo lambda build`, assumes the OIDC role

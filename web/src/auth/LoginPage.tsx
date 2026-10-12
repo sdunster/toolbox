@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { rawGraphQL } from "../lib/rawGraphQL";
+import { useTurnstile } from "../lib/turnstile";
 import {
   loginWithPasskey,
   browserSupportsWebAuthn,
@@ -39,6 +40,16 @@ export default function LoginPage({
   const [passkeySigningIn, setPasskeySigningIn] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
   const passkeySupported = browserSupportsWebAuthn();
+  const {
+    enabled: turnstileEnabled,
+    token: currentTurnstileToken,
+    failed: turnstileFailed,
+    mountWidget: mountTurnstile,
+    consume: consumeTurnstileToken,
+  } = useTurnstile();
+  // With Turnstile on, a send waits for a passed challenge; the server
+  // would otherwise silently drop it (see `lib/turnstile.ts`).
+  const turnstileReady = !turnstileEnabled || currentTurnstileToken !== null;
 
   const onNewTokenReceivedRef = useRef(onNewTokenReceived);
   useEffect(() => {
@@ -127,21 +138,21 @@ export default function LoginPage({
 
   const resendRemainingMs =
     resendAvailableAt !== null ? Math.max(0, resendAvailableAt - now) : 0;
-  const canResend = resendAvailableAt !== null && resendRemainingMs <= 0;
+  const canResend =
+    resendAvailableAt !== null && resendRemainingMs <= 0 && turnstileReady;
 
   async function sendCode() {
     setStep("sending");
     setCodeError(null);
+    // `null` when Turnstile is off for this build — which the API accepts
+    // only while it has no `TURNSTILE_SECRET_KEY` either.
+    const turnstileToken = consumeTurnstileToken();
     try {
-      // Turnstile: the API accepts a nullable `turnstileToken` and skips
-      // verification when `TURNSTILE_SECRET_KEY` is unset server-side (the
-      // default for a fork). We deliberately don't add a Turnstile
-      // dependency here — just send `null`.
       await rawGraphQL(
         `mutation RequestAuthCode($email: String!, $turnstileToken: String) {
           requestAuthCode(email: $email, turnstileToken: $turnstileToken)
         }`,
-        { email, turnstileToken: null },
+        { email, turnstileToken },
       );
       const sentAt = Date.now();
       setNow(sentAt);
@@ -263,7 +274,7 @@ export default function LoginPage({
                 {codeError}
               </p>
             )}
-            <Button type="submit" disabled={!email}>
+            <Button type="submit" disabled={!email || !turnstileReady}>
               Send code
             </Button>
           </form>
@@ -326,6 +337,18 @@ export default function LoginPage({
 
         {step === "verifying" && (
           <p className="text-sm text-ink-muted">Verifying…</p>
+        )}
+
+        {/* Mounted across every step so a resend has a fresh token ready. */}
+        {turnstileEnabled && <div ref={mountTurnstile} className="mt-4" />}
+        {turnstileFailed && (
+          <p
+            role="alert"
+            className="mt-2 text-sm text-red-600 dark:text-red-400"
+          >
+            Couldn&apos;t confirm you&apos;re not a bot. Reload the page and try
+            again.
+          </p>
         )}
       </Card>
     </div>
