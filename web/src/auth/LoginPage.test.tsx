@@ -8,7 +8,7 @@ import {
   it,
   vi,
 } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import UserEvent from "@testing-library/user-event";
 import { setupServer } from "msw/node";
 import { graphql, HttpResponse } from "msw";
@@ -207,5 +207,95 @@ describe("LoginPage — passkey", () => {
     expect(screen.getByLabelText("Email address")).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(onNewTokenReceived).not.toHaveBeenCalled();
+  });
+});
+
+describe("LoginPage — Turnstile", () => {
+  // A stand-in for Cloudflare's explicit-render API: each render or reset
+  // issues the next token straight away, as a challenge that needs no
+  // interaction would.
+  let issued = 0;
+  let onToken: ((token: string) => void) | undefined;
+  const fakeTurnstile = {
+    render: vi.fn(
+      (_el: HTMLElement, opts: { callback?: (t: string) => void }) => {
+        onToken = opts.callback;
+        queueMicrotask(() => onToken?.(`token-${++issued}`));
+        return "widget-1";
+      },
+    ),
+    reset: vi.fn(() => {
+      queueMicrotask(() => onToken?.(`token-${++issued}`));
+    }),
+    remove: vi.fn(),
+  };
+
+  beforeEach(() => {
+    issued = 0;
+    onToken = undefined;
+    vi.stubEnv("VITE_TURNSTILE_SITE_KEY", "test-site-key");
+    window.turnstile = fakeTurnstile;
+    vi.useFakeTimers({ toFake: ["Date"] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    delete window.turnstile;
+  });
+
+  it("sends the challenge token, and a fresh one on resend", async () => {
+    const requestCodeCalls: unknown[] = [];
+    server.use(
+      relayEndpoint.mutation("RequestAuthCode", ({ variables }) => {
+        requestCodeCalls.push(variables);
+        return HttpResponse.json({ data: { requestAuthCode: true } });
+      }),
+    );
+
+    const user = UserEvent.setup({ delay: null });
+    render(<LoginPage onNewTokenReceived={vi.fn()} />);
+
+    await waitFor(() =>
+      expect(fakeTurnstile.render).toHaveBeenCalledWith(
+        expect.any(HTMLElement),
+        expect.objectContaining({ sitekey: "test-site-key" }),
+      ),
+    );
+
+    await user.type(
+      screen.getByLabelText("Email address"),
+      "owner@example.com",
+    );
+    const send = screen.getByRole("button", { name: "Send code" });
+    await waitFor(() => expect(send).toBeEnabled());
+    await user.click(send);
+
+    await waitFor(() => expect(requestCodeCalls).toHaveLength(1));
+    expect(requestCodeCalls[0]).toMatchObject({ turnstileToken: "token-1" });
+    expect(fakeTurnstile.reset).toHaveBeenCalledWith("widget-1");
+
+    vi.setSystemTime(Date.now() + 30_000);
+    await user.click(
+      await screen.findByRole(
+        "button",
+        { name: "Resend code" },
+        { timeout: 3000 },
+      ),
+    );
+
+    await waitFor(() => expect(requestCodeCalls).toHaveLength(2));
+    expect(requestCodeCalls[1]).toMatchObject({ turnstileToken: "token-2" });
+  });
+
+  it("holds the send button until the challenge passes", () => {
+    fakeTurnstile.render.mockImplementationOnce((_el, opts) => {
+      onToken = opts.callback; // never fires: the challenge hasn't passed
+      return "widget-1";
+    });
+    render(<LoginPage onNewTokenReceived={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("Email address"), {
+      target: { value: "owner@example.com" },
+    });
+    expect(screen.getByRole("button", { name: "Send code" })).toBeDisabled();
   });
 });
