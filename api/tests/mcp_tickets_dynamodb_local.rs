@@ -293,6 +293,18 @@ async fn only_a_reply_and_a_close_or_reopen_email_the_customer() {
     .unwrap();
     assert_eq!(customer_mail(&w), before + 3);
 
+    // A quiet close changes the status but emails nobody.
+    let quiet = call_tool(
+        &w.f,
+        &w.agent_token,
+        "set_ticket_status",
+        json!({"ticketId": id, "status": "CLOSED", "quiet": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(quiet["ticket"]["status"], "CLOSED");
+    assert_eq!(customer_mail(&w), before + 3);
+
     // Deleting is housekeeping: nothing to the customer.
     let deleted = call_tool(
         &w.f,

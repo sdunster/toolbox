@@ -20,6 +20,9 @@ const statusControlFragment = graphql`
  * `store.invalidateStore()`. The result is fully predictable (we know
  * exactly which status we asked for), so this also uses an optimistic
  * response.
+ *
+ * "Close quietly" passes `quiet: true`, which skips the closure email the
+ * requesters/CCs would otherwise get (staff notifications are unaffected).
  */
 export function StatusControl({
   ticket,
@@ -29,8 +32,12 @@ export function StatusControl({
   const data = useFragment(statusControlFragment, ticket);
   const [error, setError] = useState<string | null>(null);
   const [commit, isInFlight] = useMutation<StatusControlMutation>(graphql`
-    mutation StatusControlMutation($ticketId: ID!, $status: TicketStatusType!) {
-      setTicketStatus(ticketId: $ticketId, status: $status) {
+    mutation StatusControlMutation(
+      $ticketId: ID!
+      $status: TicketStatusType!
+      $quiet: Boolean!
+    ) {
+      setTicketStatus(ticketId: $ticketId, status: $status, quiet: $quiet) {
         id
         status
         updatedAt
@@ -39,10 +46,10 @@ export function StatusControl({
     }
   `);
 
-  function setStatus(status: "OPEN" | "CLOSED") {
+  function setStatus(status: "OPEN" | "CLOSED", quiet = false) {
     setError(null);
     commit({
-      variables: { ticketId: data.id, status },
+      variables: { ticketId: data.id, status, quiet },
       optimisticResponse: {
         setTicketStatus: {
           id: data.id,
@@ -64,13 +71,23 @@ export function StatusControl({
           {data.status.toLowerCase()}
         </span>
         {data.status === "OPEN" && (
-          <Button
-            variant="secondary"
-            disabled={isInFlight}
-            onClick={() => setStatus("CLOSED")}
-          >
-            Close
-          </Button>
+          <>
+            <Button
+              variant="ghost"
+              disabled={isInFlight}
+              title="Close without emailing the requesters and CCs"
+              onClick={() => setStatus("CLOSED", true)}
+            >
+              Close quietly
+            </Button>
+            <Button
+              variant="secondary"
+              disabled={isInFlight}
+              onClick={() => setStatus("CLOSED")}
+            >
+              Close
+            </Button>
+          </>
         )}
         {data.status === "CLOSED" && (
           <Button
