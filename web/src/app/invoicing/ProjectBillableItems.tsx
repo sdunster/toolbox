@@ -72,10 +72,13 @@ function Items({
 export function AddBillableItemForm({
   projectId,
   currency,
+  defaultPrice = "",
   onCreated,
 }: {
   projectId: string;
   currency: string;
+  /** The project's default rate, pre-filled into each new item. */
+  defaultPrice?: string;
   onCreated: () => void;
 }) {
   const [formKey, setFormKey] = useState(0);
@@ -104,7 +107,12 @@ export function AddBillableItemForm({
         key={formKey}
         idPrefix="new-item"
         currency={currency}
-        initial={{ date: lastDate, description: "", quantity: "", price: "" }}
+        initial={{
+          date: lastDate,
+          description: "",
+          quantity: "",
+          price: defaultPrice,
+        }}
         submitLabel="Add item"
         savingLabel="Adding…"
         isSaving={isSaving}
@@ -206,11 +214,14 @@ export function ProjectBillableItems({
   projectId,
   currency,
   archived,
+  defaultPrice = "",
 }: {
   instanceId: string;
   projectId: string;
   currency: string;
   archived: boolean;
+  /** The project's default rate as typed, or "" for none. */
+  defaultPrice?: string;
 }) {
   const [refreshKey, setRefreshKey] = useState(0);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -298,6 +309,7 @@ export function ProjectBillableItems({
           <AddBillableItemForm
             projectId={projectId}
             currency={currency}
+            defaultPrice={defaultPrice}
             onCreated={() => setRefreshKey((k) => k + 1)}
           />
         </div>

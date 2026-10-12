@@ -53,6 +53,7 @@ function baseItem() {
     quantity: "12.5",
     unitPriceCents: 9876,
     amountCents: 123450,
+    gstFree: false,
     status: "UNBILLED",
     invoice: null,
     project: {
@@ -307,6 +308,7 @@ describe("BillableItemList", () => {
         description: "Front-end build",
         quantity: "2",
         unitPriceCents: 150000,
+        gstFree: false,
       },
     });
     expect(await screen.findByText("3,000.00")).toBeInTheDocument();

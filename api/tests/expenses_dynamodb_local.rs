@@ -213,11 +213,11 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) 
     let project = db
         .create_project(
             &instance.id,
-            "Fictional Job",
-            "Fictional Client Pty Ltd",
-            None,
-            None,
-            None,
+            &db::ProjectFields {
+                name: "Fictional Job".into(),
+                client_name: "Fictional Client Pty Ltd".into(),
+                ..Default::default()
+            },
         )
         .await
         .expect("create_project");
@@ -623,11 +623,11 @@ async fn a_foreign_or_archived_project_is_refused() {
         .update_project(
             &project_id,
             db::ProjectUpdateShape::Fields {
-                name: "Fictional Job",
-                client_name: "Fictional Client Pty Ltd",
-                client_abn: None,
-                client_address: None,
-                reference: None,
+                fields: &db::ProjectFields {
+                    name: "Fictional Job".into(),
+                    client_name: "Fictional Client Pty Ltd".into(),
+                    ..Default::default()
+                },
                 archived: true,
             },
         )

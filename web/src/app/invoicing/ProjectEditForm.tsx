@@ -8,6 +8,8 @@ import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
 import { inputBase } from "../../components/ui/inputStyles";
+import { ProjectBillingFields } from "./ProjectBillingFields";
+import { billingInput, initialBillingValues } from "../../lib/projectBilling";
 
 const projectEditFormFragment = graphql`
   fragment ProjectEditForm_project on Project {
@@ -17,6 +19,9 @@ const projectEditFormFragment = graphql`
     clientAbn
     clientAddress
     reference
+    clientEmail
+    paymentTermsDays
+    defaultUnitPriceCents
     archived
   }
 `;
@@ -40,6 +45,13 @@ export function ProjectEditForm({
   const [clientAddress, setClientAddress] = useState(data.clientAddress ?? "");
   const [reference, setReference] = useState(data.reference ?? "");
   const [archived, setArchived] = useState(data.archived);
+  const [billing, setBilling] = useState(() =>
+    initialBillingValues({
+      clientEmail: data.clientEmail,
+      paymentTermsDays: data.paymentTermsDays,
+      defaultUnitPriceCents: data.defaultUnitPriceCents,
+    }),
+  );
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
@@ -56,6 +68,11 @@ export function ProjectEditForm({
     if (isSaving) return;
     setError(null);
     setSaved(false);
+    const parsed = billingInput(billing);
+    if (!parsed.ok) {
+      setError(parsed.error);
+      return;
+    }
     commit({
       variables: {
         id: data.id,
@@ -65,6 +82,7 @@ export function ProjectEditForm({
           clientAbn: clientAbn.trim(),
           clientAddress: clientAddress.trim(),
           reference: reference.trim(),
+          ...parsed.input,
           archived,
         },
       },
@@ -125,6 +143,11 @@ export function ProjectEditForm({
             placeholder="e.g. the site address"
           />
         </FormField>
+        <ProjectBillingFields
+          idPrefix="project"
+          values={billing}
+          onChange={setBilling}
+        />
         <label className="flex items-center gap-2 text-sm text-ink">
           <input
             type="checkbox"

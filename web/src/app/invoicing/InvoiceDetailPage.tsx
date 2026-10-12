@@ -10,6 +10,8 @@ import { RequireInvoicingInstance } from "./RequireInvoicingInstance";
 import { InvoicePreview } from "./InvoicePreview";
 import { InvoiceDraftPanel } from "./InvoiceDraftPanel";
 import { InvoicePaidControl } from "./InvoicePaidControl";
+import { InvoiceSendPanel } from "./InvoiceSendPanel";
+import { InvoiceCreditNotes } from "./InvoiceCreditNotes";
 
 const invoiceDetailPageQuery = graphql`
   query InvoiceDetailPageQuery($id: ID!) @throwOnFieldError {
@@ -27,6 +29,8 @@ const invoiceDetailPageQuery = graphql`
       ...InvoicePreview_invoice
       ...InvoiceDraftPanel_invoice
       ...InvoicePaidControl_invoice
+      ...InvoiceSendPanel_invoice
+      ...InvoiceCreditNotes_invoice
     }
   }
 `;
@@ -86,7 +90,11 @@ function Content({ id, isOwner }: { id: string; isOwner: boolean }) {
           isOwner={isOwner}
         />
       ) : (
-        <InvoicePaidControl invoice={invoice} />
+        <>
+          <InvoicePaidControl invoice={invoice} />
+          <InvoiceSendPanel invoice={invoice} />
+          <InvoiceCreditNotes invoice={invoice} />
+        </>
       )}
     </div>
   );
@@ -95,8 +103,9 @@ function Content({ id, isOwner }: { id: string; isOwner: boolean }) {
 /**
  * `/app/invoices/:id` — one invoice's printed preview plus its
  * status-appropriate actions: a draft gets item management, delete and
- * finalize (`InvoiceDraftPanel`); a finalized invoice is otherwise
- * read-only and only gets the paid/unpaid toggle (`InvoicePaidControl`).
+ * finalize (`InvoiceDraftPanel`); a finalized invoice is read-only, and gets
+ * its payments (`InvoicePaidControl`), emailing (`InvoiceSendPanel`) and
+ * credit notes (`InvoiceCreditNotes`) instead.
  * `invoice(id)` is `null` for a missing invoice and for one the caller
  * can't reach alike (see its doc comment), so both show the same "not
  * found" panel. `RequireInvoicingInstance` gates on the *switcher's*

@@ -7,15 +7,18 @@
 //! and the frozen finalized version can never diverge in shape.
 //!
 //! `schema_version` exists so a future change to this shape has somewhere
-//! to branch on old rows without a migration.
+//! to branch on old rows without a migration. Version 2 added `due_date`,
+//! per-line `gst_free`, and the `credit_note` block — a credit note is the
+//! same printable shape with that block set (see
+//! [`build_credit_note_snapshot`]).
 
 use serde::{Deserialize, Serialize};
 
 use crate::db;
 use crate::invoicing::money;
 
-/// The current (and, so far, only) snapshot shape.
-pub const SCHEMA_VERSION: u32 = 1;
+/// The current snapshot shape.
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InvoiceSnapshotSeller {
@@ -45,6 +48,29 @@ pub struct InvoiceSnapshotLine {
     pub quantity_hundredths: i64,
     pub unit_price_cents: i64,
     pub amount_cents: i64,
+    /// No GST on this line, even on a GST-registered invoice.
+    #[serde(default)]
+    pub gst_free: bool,
+}
+
+/// What a credit note prints about the invoice it adjusts. Present only on
+/// a credit note's snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CreditNoteSnapshotInfo {
+    /// The adjusted invoice's display number (`"008"`).
+    pub invoice_display_number: String,
+    /// `YYYY-MM-DD`.
+    pub invoice_issue_date: String,
+    pub reason: String,
+}
+
+/// One line of a credit note, as `issueCreditNote` takes it: a GST-exclusive
+/// amount being credited.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreditLine {
+    pub description: String,
+    pub amount_cents: i64,
+    pub gst_free: bool,
 }
 
 /// Everything an invoice prints, frozen at finalization (or built live, for
@@ -74,6 +100,12 @@ pub struct InvoiceSnapshot {
     pub gst_cents: i64,
     pub total_cents: i64,
     pub payment_details: Option<String>,
+    /// `YYYY-MM-DD`. `None` for a draft preview and for a credit note.
+    #[serde(default)]
+    pub due_date: Option<String>,
+    /// Set only on a credit note's snapshot.
+    #[serde(default)]
+    pub credit_note: Option<CreditNoteSnapshotInfo>,
     /// `true` iff `!gst_registered` — "No GST has been charged." is printed
     /// exactly when this is `true`. Carried as its own field (rather than
     /// making every reader re-derive it from `gst_registered`) since it's
@@ -111,6 +143,7 @@ pub fn build_snapshot(
     items: &[db::BillableItem],
     number: Option<u32>,
     issue_date: Option<&str>,
+    due_date: Option<&str>,
 ) -> InvoiceSnapshot {
     let gst_registered = instance.gst_registered;
     let title = if gst_registered {
@@ -132,16 +165,11 @@ pub fn build_snapshot(
             quantity_hundredths: item.quantity_hundredths,
             unit_price_cents: item.unit_price_cents,
             amount_cents: money::line_amount_cents(item.quantity_hundredths, item.unit_price_cents),
+            gst_free: item.gst_free,
         })
         .collect();
 
-    let subtotal_cents: i64 = lines.iter().map(|l| l.amount_cents).sum();
-    let gst_cents = if gst_registered {
-        money::gst_cents(subtotal_cents)
-    } else {
-        0
-    };
-    let total_cents = subtotal_cents + gst_cents;
+    let (subtotal_cents, gst_cents, total_cents) = totals(&lines, gst_registered);
 
     InvoiceSnapshot {
         schema_version: SCHEMA_VERSION,
@@ -168,6 +196,97 @@ pub fn build_snapshot(
         gst_cents,
         total_cents,
         payment_details: instance.payment_details.clone(),
+        due_date: due_date.map(str::to_string),
+        credit_note: None,
+        no_gst_note: !gst_registered,
+    }
+}
+
+/// Subtotal, GST and total for a set of lines: GST is 10% (round-half-up)
+/// of the subtotal of the lines that *aren't* GST-free, and only when the
+/// seller is GST-registered.
+pub fn totals(lines: &[InvoiceSnapshotLine], gst_registered: bool) -> (i64, i64, i64) {
+    let subtotal_cents: i64 = lines.iter().map(|l| l.amount_cents).sum();
+    let taxable_cents: i64 = lines
+        .iter()
+        .filter(|l| !l.gst_free)
+        .map(|l| l.amount_cents)
+        .sum();
+    let gst_cents = if gst_registered {
+        money::gst_cents(taxable_cents)
+    } else {
+        0
+    };
+    (subtotal_cents, gst_cents, subtotal_cents + gst_cents)
+}
+
+/// The lines a full credit of `invoice` would carry: one per invoice line,
+/// same description, amount and GST treatment.
+pub fn full_credit_lines(invoice: &InvoiceSnapshot) -> Vec<CreditLine> {
+    invoice
+        .lines
+        .iter()
+        .map(|l| CreditLine {
+            description: l.description.clone(),
+            amount_cents: l.amount_cents,
+            gst_free: l.gst_free,
+        })
+        .collect()
+}
+
+/// Build a credit note's frozen content from the snapshot of the invoice it
+/// adjusts — the seller, bill-to, reference, currency and GST registration
+/// all come from that invoice as it was finalized, never from today's
+/// settings, so the two documents always agree. Titled "Adjustment Note"
+/// when the invoice was a tax invoice (the ATO's name for it), else "Credit
+/// Note"; numbered `CN-001`; no due date or payment details.
+pub fn build_credit_note_snapshot(
+    invoice: &InvoiceSnapshot,
+    number: u32,
+    issue_date: &str,
+    reason: &str,
+    credit_lines: &[CreditLine],
+) -> InvoiceSnapshot {
+    let gst_registered = invoice.gst_registered;
+    let lines: Vec<InvoiceSnapshotLine> = credit_lines
+        .iter()
+        .map(|l| InvoiceSnapshotLine {
+            date: issue_date.to_string(),
+            description: l.description.clone(),
+            quantity: money::format_quantity(100),
+            quantity_hundredths: 100,
+            unit_price_cents: l.amount_cents,
+            amount_cents: l.amount_cents,
+            gst_free: l.gst_free,
+        })
+        .collect();
+    let (subtotal_cents, gst_cents, total_cents) = totals(&lines, gst_registered);
+    InvoiceSnapshot {
+        schema_version: SCHEMA_VERSION,
+        title: if gst_registered {
+            "Adjustment Note"
+        } else {
+            "Credit Note"
+        }
+        .to_string(),
+        display_number: Some(db::credit_note_display_number(number)),
+        issue_date: Some(issue_date.to_string()),
+        seller: invoice.seller.clone(),
+        bill_to: invoice.bill_to.clone(),
+        reference: invoice.reference.clone(),
+        currency: invoice.currency.clone(),
+        gst_registered,
+        lines,
+        subtotal_cents,
+        gst_cents,
+        total_cents,
+        payment_details: None,
+        due_date: None,
+        credit_note: Some(CreditNoteSnapshotInfo {
+            invoice_display_number: invoice.display_number.clone().unwrap_or_default(),
+            invoice_issue_date: invoice.issue_date.clone().unwrap_or_default(),
+            reason: reason.to_string(),
+        }),
         no_gst_note: !gst_registered,
     }
 }
@@ -195,6 +314,7 @@ mod tests {
             payment_details: Some("BSB 000-000 Acc 00000000".into()),
             gst_registered,
             currency: None,
+            payment_terms_days: None,
         }
     }
 
@@ -207,6 +327,9 @@ mod tests {
             client_abn: Some("55 666 777 888".into()),
             client_address: Some("2 Client Ave\nElsewhere NSW 2000".into()),
             reference: Some("42 Site Road".into()),
+            client_email: None,
+            payment_terms_days: None,
+            default_unit_price_cents: None,
             archived: false,
             created_at: 0,
             updated_at: 0,
@@ -229,6 +352,8 @@ mod tests {
             quantity_hundredths: qty_hundredths,
             unit_price_cents: price_cents,
             invoice_id: None,
+            gst_free: false,
+            source_expense_id: None,
             created_by_user_id: "user1".into(),
             created_at,
             updated_at: created_at,
@@ -238,13 +363,13 @@ mod tests {
     #[test]
     fn title_reflects_gst_registration() {
         let instance = fictional_instance(false);
-        let snap = build_snapshot(&instance, &fictional_project(), &[], None, None);
+        let snap = build_snapshot(&instance, &fictional_project(), &[], None, None, None);
         assert_eq!(snap.title, "Invoice");
         assert!(snap.no_gst_note);
         assert_eq!(snap.gst_cents, 0);
 
         let instance = fictional_instance(true);
-        let snap = build_snapshot(&instance, &fictional_project(), &[], None, None);
+        let snap = build_snapshot(&instance, &fictional_project(), &[], None, None, None);
         assert_eq!(snap.title, "Tax Invoice");
         assert!(!snap.no_gst_note);
     }
@@ -254,19 +379,19 @@ mod tests {
         let instance = fictional_instance(false);
         let project = fictional_project();
         assert_eq!(
-            build_snapshot(&instance, &project, &[], Some(8), None).display_number,
+            build_snapshot(&instance, &project, &[], Some(8), None, None).display_number,
             Some("008".to_string())
         );
         assert_eq!(
-            build_snapshot(&instance, &project, &[], Some(42), None).display_number,
+            build_snapshot(&instance, &project, &[], Some(42), None, None).display_number,
             Some("042".to_string())
         );
         assert_eq!(
-            build_snapshot(&instance, &project, &[], Some(1234), None).display_number,
+            build_snapshot(&instance, &project, &[], Some(1234), None, None).display_number,
             Some("1234".to_string())
         );
         assert_eq!(
-            build_snapshot(&instance, &project, &[], None, None).display_number,
+            build_snapshot(&instance, &project, &[], None, None, None).display_number,
             None
         );
     }
@@ -280,7 +405,14 @@ mod tests {
             item("a", "2026-08-19", 100, 100, 1000),
             item("b", "2026-08-19", 200, 100, 1000),
         ];
-        let snap = build_snapshot(&instance, &project, &items, Some(1), Some("2026-08-20"));
+        let snap = build_snapshot(
+            &instance,
+            &project,
+            &items,
+            Some(1),
+            Some("2026-08-20"),
+            None,
+        );
         let descriptions: Vec<&str> = snap.lines.iter().map(|l| l.description.as_str()).collect();
         assert_eq!(descriptions, vec!["Line a", "Line b", "Line c"]);
     }
@@ -293,7 +425,14 @@ mod tests {
             item("a", "2026-08-19", 1, 200, 40_000), // 2 x 400.00 = 800.00
             item("b", "2026-08-19", 2, 150, 333),    // 1.5 x 3.33 = 4.995 -> 5.00
         ];
-        let snap = build_snapshot(&instance, &project, &items, Some(1), Some("2026-08-19"));
+        let snap = build_snapshot(
+            &instance,
+            &project,
+            &items,
+            Some(1),
+            Some("2026-08-19"),
+            Some("2026-09-02"),
+        );
         assert_eq!(snap.subtotal_cents, 80_500);
         assert_eq!(snap.gst_cents, 0);
         assert_eq!(snap.total_cents, 80_500);
@@ -304,7 +443,14 @@ mod tests {
         let instance = fictional_instance(true);
         let project = fictional_project();
         let items = vec![item("a", "2026-08-19", 1, 100, 12_345)]; // subtotal 123.45
-        let snap = build_snapshot(&instance, &project, &items, Some(1), Some("2026-08-19"));
+        let snap = build_snapshot(
+            &instance,
+            &project,
+            &items,
+            Some(1),
+            Some("2026-08-19"),
+            Some("2026-09-02"),
+        );
         assert_eq!(snap.subtotal_cents, 12_345);
         assert_eq!(snap.gst_cents, 1_235); // 12.345 -> 1,234.5c -> 1,235c half-up
         assert_eq!(snap.total_cents, 13_580);
@@ -314,7 +460,14 @@ mod tests {
     fn bill_to_and_seller_come_from_project_and_instance() {
         let instance = fictional_instance(true);
         let project = fictional_project();
-        let snap = build_snapshot(&instance, &project, &[], Some(1), Some("2026-08-19"));
+        let snap = build_snapshot(
+            &instance,
+            &project,
+            &[],
+            Some(1),
+            Some("2026-08-19"),
+            Some("2026-09-02"),
+        );
         assert_eq!(snap.bill_to.name, "Fictional Client Pty Ltd");
         assert_eq!(snap.bill_to.abn.as_deref(), Some("55 666 777 888"));
         assert_eq!(snap.reference.as_deref(), Some("42 Site Road"));
@@ -331,10 +484,99 @@ mod tests {
         let instance = fictional_instance(true);
         let project = fictional_project();
         let items = vec![item("a", "2026-08-19", 1, 100, 12_345)];
-        let snap = build_snapshot(&instance, &project, &items, Some(8), Some("2026-08-19"));
+        let snap = build_snapshot(
+            &instance,
+            &project,
+            &items,
+            Some(8),
+            Some("2026-08-19"),
+            Some("2026-09-02"),
+        );
         let json = serde_json::to_string(&snap).expect("serialize");
         let round_tripped: InvoiceSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(snap, round_tripped);
-        assert_eq!(round_tripped.schema_version, 1);
+        assert_eq!(round_tripped.schema_version, 2);
+        assert_eq!(round_tripped.due_date.as_deref(), Some("2026-09-02"));
+    }
+
+    #[test]
+    fn gst_free_lines_are_left_out_of_the_gst() {
+        let instance = fictional_instance(true);
+        let project = fictional_project();
+        let mut free = item("b", "2026-08-19", 2, 100, 5_000);
+        free.gst_free = true;
+        let items = vec![item("a", "2026-08-19", 1, 100, 10_000), free];
+        let snap = build_snapshot(
+            &instance,
+            &project,
+            &items,
+            Some(1),
+            Some("2026-08-19"),
+            None,
+        );
+        assert_eq!(snap.subtotal_cents, 15_000);
+        assert_eq!(snap.gst_cents, 1_000);
+        assert_eq!(snap.total_cents, 16_000);
+        assert!(snap.lines[1].gst_free);
+    }
+
+    #[test]
+    fn a_full_credit_mirrors_the_invoice() {
+        let instance = fictional_instance(true);
+        let project = fictional_project();
+        let mut free = item("b", "2026-08-19", 2, 100, 5_000);
+        free.gst_free = true;
+        let items = vec![item("a", "2026-08-19", 1, 100, 10_000), free];
+        let invoice = build_snapshot(
+            &instance,
+            &project,
+            &items,
+            Some(7),
+            Some("2026-08-19"),
+            Some("2026-09-02"),
+        );
+        let note = build_credit_note_snapshot(
+            &invoice,
+            3,
+            "2026-08-25",
+            "Duplicate billing",
+            &full_credit_lines(&invoice),
+        );
+        assert_eq!(note.title, "Adjustment Note");
+        assert_eq!(note.display_number.as_deref(), Some("CN-003"));
+        assert_eq!(note.total_cents, invoice.total_cents);
+        assert_eq!(note.gst_cents, invoice.gst_cents);
+        assert_eq!(note.bill_to, invoice.bill_to);
+        assert_eq!(note.payment_details, None);
+        assert_eq!(note.due_date, None);
+        let info = note.credit_note.expect("credit note block");
+        assert_eq!(info.invoice_display_number, "007");
+        assert_eq!(info.invoice_issue_date, "2026-08-19");
+    }
+
+    #[test]
+    fn a_credit_note_against_a_non_gst_invoice_is_a_plain_credit_note() {
+        let invoice = build_snapshot(
+            &fictional_instance(false),
+            &fictional_project(),
+            &[item("a", "2026-08-19", 1, 100, 10_000)],
+            Some(1),
+            Some("2026-08-19"),
+            Some("2026-09-02"),
+        );
+        let note = build_credit_note_snapshot(
+            &invoice,
+            1,
+            "2026-08-20",
+            "Discount",
+            &[CreditLine {
+                description: "Discount".into(),
+                amount_cents: 2_500,
+                gst_free: false,
+            }],
+        );
+        assert_eq!(note.title, "Credit Note");
+        assert_eq!(note.gst_cents, 0);
+        assert_eq!(note.total_cents, 2_500);
     }
 }

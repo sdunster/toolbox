@@ -12,10 +12,20 @@
 //!   changes an invoice's item set.
 //! - [`expense`]: expense input validation (`createExpense`/`updateExpense`).
 //! - [`vehicle`]: the ATO cents-per-km rate table and trip arithmetic.
+//! - [`ledger`]: payments, credits and the derived `paid_date`.
+//! - [`report`]: the GST/BAS summary, aged receivables, project figures.
+//! - [`csv`]: the accountant's CSV exports.
+//! - [`send`]: emailing an invoice or credit note with its PDF attached.
+//! - [`today_utc`]/[`add_days`]: the date arithmetic due dates and overdue
+//!   checks need.
 
+pub mod csv;
 pub mod expense;
+pub mod ledger;
 pub mod money;
 pub mod pdf;
+pub mod report;
+pub mod send;
 pub mod snapshot;
 pub mod vehicle;
 
@@ -87,9 +97,101 @@ pub fn validate_total_within_safe_integer(total_cents: i64) -> Result<(), String
     Ok(())
 }
 
+/// Today's date, `YYYY-MM-DD`, by the UTC clock (`crate::clock`) — what
+/// "overdue" and the aged-receivables report measure against. UTC, not the
+/// business's local time: an invoice becomes overdue at UTC midnight after
+/// its due date, up to a day later than local midnight in Australia.
+pub fn today_utc() -> String {
+    chrono::DateTime::from_timestamp(crate::clock::now_sec() as i64, 0)
+        .map(|t| t.date_naive().format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "1970-01-01".to_string())
+}
+
+/// `date` (`YYYY-MM-DD`, already validated) plus `days`.
+pub fn add_days(date: &str, days: u32) -> Result<String, String> {
+    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| format!("{date:?} is not a valid date"))?;
+    parsed
+        .checked_add_days(chrono::Days::new(u64::from(days)))
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .ok_or_else(|| "Date is out of range".to_string())
+}
+
+/// Validate payment terms in days: `0..=`[`crate::db::MAX_PAYMENT_TERMS_DAYS`].
+pub fn validate_payment_terms_days(days: i32) -> Result<u32, String> {
+    u32::try_from(days)
+        .ok()
+        .filter(|d| *d <= crate::db::MAX_PAYMENT_TERMS_DAYS)
+        .ok_or_else(|| {
+            format!(
+                "Payment terms must be between 0 and {} days",
+                crate::db::MAX_PAYMENT_TERMS_DAYS
+            )
+        })
+}
+
+/// Parse a markup percentage (`"10"`, `"12.5"`, `"0"`) into basis points
+/// (hundredths of a percent): at most 2 dp, `0 ≤ markup ≤ 1000%`. Reuses the
+/// quantity parser's decimal rules.
+pub fn parse_markup_basis_points(raw: &str) -> Result<i64, String> {
+    let s = raw.trim();
+    // `parse_quantity` rejects zero; "0", "0.0" and "" all mean no markup.
+    let is_zero = s.bytes().any(|b| b == b'0')
+        && s.bytes().all(|b| b == b'0' || b == b'.')
+        && s.bytes().filter(|b| *b == b'.').count() <= 1;
+    if s.is_empty() || is_zero {
+        return Ok(0);
+    }
+    let bp = money::parse_quantity(s)
+        .map_err(|_| format!("{s:?} is not a valid markup (use a percentage like 10 or 12.5)"))?;
+    if bp > 100_000 {
+        return Err("Markup cannot be more than 1000%".to_string());
+    }
+    Ok(bp)
+}
+
+/// What re-billing an expense charges, GST-exclusive: its own ex-GST cost
+/// plus `markup_basis_points`, rounded half-up to the cent.
+pub fn rebill_unit_price_cents(expense_ex_gst_cents: i64, markup_basis_points: i64) -> i64 {
+    report::apportion(expense_ex_gst_cents, 10_000 + markup_basis_points, 10_000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn add_days_crosses_months_and_years() {
+        assert_eq!(add_days("2026-08-19", 14).unwrap(), "2026-09-02");
+        assert_eq!(add_days("2026-12-25", 30).unwrap(), "2027-01-24");
+        assert_eq!(add_days("2026-08-19", 0).unwrap(), "2026-08-19");
+    }
+
+    #[test]
+    fn payment_terms_are_bounded() {
+        assert_eq!(validate_payment_terms_days(0), Ok(0));
+        assert_eq!(validate_payment_terms_days(365), Ok(365));
+        assert!(validate_payment_terms_days(-1).is_err());
+        assert!(validate_payment_terms_days(366).is_err());
+    }
+
+    #[test]
+    fn markup_parses_to_basis_points() {
+        assert_eq!(parse_markup_basis_points("0"), Ok(0));
+        assert_eq!(parse_markup_basis_points(""), Ok(0));
+        assert_eq!(parse_markup_basis_points("10"), Ok(1_000));
+        assert_eq!(parse_markup_basis_points("12.5"), Ok(1_250));
+        assert!(parse_markup_basis_points("-5").is_err());
+        assert!(parse_markup_basis_points("1001").is_err());
+        assert!(parse_markup_basis_points("abc").is_err());
+    }
+
+    #[test]
+    fn rebill_price_applies_the_markup() {
+        assert_eq!(rebill_unit_price_cents(10_000, 0), 10_000);
+        assert_eq!(rebill_unit_price_cents(10_000, 1_000), 11_000);
+        assert_eq!(rebill_unit_price_cents(333, 1_250), 375); // 374.625 -> 375
+    }
 
     #[test]
     fn validate_item_date_accepts_a_real_padded_date() {

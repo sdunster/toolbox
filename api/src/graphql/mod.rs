@@ -25,6 +25,7 @@ use crate::telemetry::{self, OperationKind};
 pub mod auth;
 pub mod dataloader;
 pub mod error;
+pub mod finance;
 pub mod mutations;
 pub mod pagination;
 pub mod query;

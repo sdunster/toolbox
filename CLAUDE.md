@@ -241,13 +241,13 @@ local setup, and `SCHEMA.md` for the data model.
     transactions in this codebase (`dynamodb.rs`'s `transact_write` helper). `finalizeInvoice`
     freezes everything the invoice prints (seller/bill-to/reference, sorted lines, totals, GST
     flag, currency, payment text, number, issue date) into a JSON `snapshot`
-    (`invoicing::snapshot::build_snapshot`, `schema_version: 1`) via one `TransactWriteItems` of
+    (`invoicing::snapshot::build_snapshot`, `schema_version: 2`) via one `TransactWriteItems` of
     two updates — the invoice itself, and the number's reservation row in `{prefix}_counter`
     (`{instance_id}#invoice#{number}`, `attribute_not_exists`, see below; the items need no write,
     every item's `invoice_id` already points here); later edits to the project
-    or instance settings never alter it. **Strictly one-way**: no void, no un-finalize — the only
-    mutation a finalized invoice still accepts is `setInvoicePaid` (any member; not printed on the
-    invoice). The number comes from `{prefix}_counter`'s `next_invoice_number`, the same atomic-`ADD`
+    or instance settings never alter it. **Strictly one-way**: no void, no un-finalize — a finalized
+    invoice only takes payments, credit notes and sends (see "Due dates, payments and credit notes"
+    below), none of which change what it prints. The number comes from `{prefix}_counter`'s `next_invoice_number`, the same atomic-`ADD`
     counter pattern as tickets' `next_ticket_number` — allocated *before* the conditional finalize
     write, so a version mismatch there leaves a **gap**, never a duplicate (see `SCHEMA.md`'s
     "Known issues"). Owner-or-superuser `setNextInvoiceNumber` can move it **forward only**
@@ -302,8 +302,20 @@ local setup, and `SCHEMA.md` for the data model.
   linked to one of the instance's projects (`project_id` omitted when unset, so the sparse
   `project_id-date-index` drops it). Same guards and kind check as billable items (`Member`,
   `db::require_instance_kind`, superusers get nothing, `NOT_FOUND` for missing and not-yours alike),
-  and an archived project takes no *new* expenses. Every expense can be edited or deleted — none is
-  ever on an invoice, and v1 deliberately has no rebilling and no receipt uploads.
+  and an archived project takes no *new* expenses. Every expense can be edited; one can be deleted
+  unless it has been re-billed (below).
+  - **Re-billing (`rebillExpense`) passes an expense on to its project's client** as a new UNBILLED
+    billable item: its GST-exclusive cost (`Expense::amount_ex_gst_cents`) plus an optional markup
+    (basis points, `invoicing::parse_markup_basis_points`), dated like the expense. The item's
+    `source_expense_id` and the expense's `billable_item_id` are written together in one
+    transaction (`db::Handler::rebill_expense`), conditioned on the expense not already being
+    re-billed, and cleared together when the item is deleted (`delete_billable_item` with its
+    `source_expense_id`) — so an expense is billed at most once, and a re-billed expense can't be
+    deleted (`CONFLICT`) while its item exists.
+  - **Receipts** upload straight to `receipts/{instance_id}/{expense_id}/{nanoid}/{filename}` by
+    presigned PUT (`createExpenseReceiptUpload`), then `attachExpenseReceipt` records them —
+    refusing any key outside that expense's own prefix (`FORBIDDEN`), a file that isn't there yet,
+    or one over 20 MB. Kept forever, like invoice PDFs: they back a tax claim.
   - **Categories are a fixed list in code** (`db::ExpenseCategory`/`ExpenseCategoryType`, labels in
     `web/src/lib/expenses.ts`), not per-instance configuration, so totals stay comparable. Adding
     one is adding an enum value in all three places.
@@ -322,6 +334,57 @@ local setup, and `SCHEMA.md` for the data model.
     which Toolbox can't fully know — and the web turns amber past 4,500 km and red past 5,000.
   - `invoicing::expense::validate_expense_input` is the one place an `ExpenseFields` is built from
     input, so the category ↔ shape rule can't drift between create and update.
+
+- **Due dates, payments and credit notes: what happens after an invoice is issued.**
+  - **Payment terms** are `instance.payment_terms_days` (absent = 14,
+    `db::DEFAULT_PAYMENT_TERMS_DAYS`) overridden per project (`project.payment_terms_days`).
+    `finalizeInvoice` sets `due_date` = issue date + those terms unless given an explicit `dueDate`
+    (never before the issue date), and freezes it into the snapshot (`schema_version: 2`) and onto
+    the row. A project's `default_unit_price_cents` fills an omitted `unitPriceCents` on
+    `createBillableItem`; `updateBillableItem` keeps the item's own price when it's omitted.
+  - **GST-free lines** (`billable_item.gst_free`, only ever written `true`): GST is 10% of the
+    *taxable* subtotal only (`invoicing::snapshot::totals`); the line prints "(GST-free)" on a tax
+    invoice.
+  - **Balance = total − credited − paid.** Payments are a JSON list on the invoice row
+    (`payments`, absent when empty — `db::InvoicePayment`); credit totals are denormalised
+    `credited_cents`/`credited_gst_cents`. **`paid_date` means "settled"**: set exactly when the
+    balance reaches zero (by payments, credit notes or both), to the date of whatever settled it
+    (`invoicing::ledger::settled_date`), and removed when a deleted payment un-settles it. Every
+    UNPAID/PAID/OVERDUE filter reads it, so it must only ever be written by a path that recomputes
+    it — `set_invoice_payments` (conditioned on `version`, which every payment write bumps) or
+    `create_credit_note`. `setInvoicePaid(date)` is now "record one payment of the whole balance";
+    `setInvoicePaid(null)` removes every payment. A payment can't exceed the balance.
+  - **OVERDUE** = finalized, no `paid_date`, `due_date` before **today's UTC date**
+    (`invoicing::today_utc`) — up to a day later than local midnight in Australia. Deliberate:
+    there's no per-instance timezone, and a day's slack on "overdue" is harmless.
+  - **Credit notes (`{prefix}_credit_note`) are how a finalized invoice is corrected — finality is
+    unchanged.** `issueCreditNote` is strictly one-way like `finalizeInvoice`: no draft, no edit,
+    no delete, its own `CN-001` sequence (`counter.next_credit_note_number`, gap-not-duplicate like
+    invoice numbers), and a frozen snapshot built from the **invoice's** snapshot
+    (`build_credit_note_snapshot`) — seller, bill-to and GST registration as they were on the
+    invoice, titled "Adjustment Note" for a tax invoice (the ATO's term), else "Credit Note". Lines
+    are GST-exclusive amounts (or omitted, for a full credit — only while nothing is credited); the
+    total with GST can't exceed what's left uncredited. The note's `Put` and the invoice's `ADD
+    credited_cents` (plus `paid_date` when it settles it) are one transaction conditioned on the
+    invoice's `version`. Any member may issue one; superusers can't (no `Member`).
+- **Sending invoices and credit notes (`sendInvoice`/`sendCreditNote`) — customer mail from an
+  invoicing instance.** Explicit only (never a side effect of finalizing or crediting), to the
+  given `to`/`cc` or else the project's `client_email`, at most 10 recipients, PDF attached
+  (rendered and cached exactly as `downloadInvoicePdf` does). An invoicing instance has no
+  inbound address, so this is the one kind of instance mail **not** sent from one: `From` is
+  `mail::system_from()` under the seller's business name, `Reply-To` the seller's business email
+  (else the system reply-to), and the subject carries no `[#slug-n]` tag — a client's reply goes
+  to the business, never into the inbound pipeline (`invoicing::send`). Sending *is* the
+  mutation's whole effect, so a send failure fails it (like `replyToTicket`); success records
+  `sent_at`/`sent_to`. The MCP tools say they send email.
+- **Reports (`gstReport`, `receivables`, `invoicingExport`, `Project.financials`) are pure functions
+  over rows read whole** (`invoicing::report`, `invoicing::csv`): every finalized invoice and credit
+  note of the instance (`list_all_finalized_invoices`/`list_all_credit_notes`) and expenses by date
+  range — fine at one small business's scale; a range is capped at two years. **Accrual** counts
+  invoices and credit notes by issue date; **cash** counts payments by date, each carrying the
+  invoice's GST (net of credits) pro rata. Expenses count by their own date on both bases (Toolbox
+  doesn't record when an expense was paid). The figures are a guide, and the UI says so. CSV cells
+  starting `=`/`+`/`-`/`@` are prefixed with `'` (CSV injection); amounts are plain decimals.
 
 - **OAuth tokens (`mtoa_`/`mtor_`) are for the MCP interface only and never reach GraphQL.**
   `api/src/oauth.rs` holds one `oauth_grant` row per client a user authorizes (access + refresh
@@ -370,9 +433,10 @@ local setup, and `SCHEMA.md` for the data model.
   The ticket tools (`mcp/tickets.rs`) send customer mail exactly as the same GraphQL mutation does —
   see the "Outbound mail" rule above — and say so in their descriptions (`reply_to_ticket` always,
   `set_ticket_status` on a close or reopen). Attachments are deliberately not exposed.
-  The invoicing tools (`mcp/invoicing.rs`) send no email and are refused for a support instance by
-  the resolvers' own kind check. `finalize_invoice` is strictly irreversible, so its description
-  says so, it is annotated destructive, and it requires an explicit `issueDate` (no default); the
+  The invoicing tools (`mcp/invoicing.rs`) are refused for a support instance by the resolvers'
+  own kind check; only `send_invoice`/`send_credit_note` send email, and say so in capitals.
+  `finalize_invoice` and `issue_credit_note` are strictly irreversible, so their descriptions say
+  so, they are annotated destructive, and they require an explicit date (no default); the
   owner-level `updateInvoicingSettings`/`setNextInvoiceNumber` are deliberately not tools —
   `finalize_invoice`'s optional owner-only `number` (plus a past `issueDate`) is what importing an
   existing invoice under its original number and date needs, in the one irreversible call.

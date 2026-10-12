@@ -8,6 +8,7 @@ const invoicePreviewFragment = graphql`
     title
     displayNumber
     issueDate
+    dueDate
     billTo {
       name
       abn
@@ -26,6 +27,7 @@ const invoicePreviewFragment = graphql`
       quantity
       unitPriceCents
       amountCents
+      gstFree
     }
     subtotalCents
     gstCents
@@ -106,6 +108,9 @@ export function InvoicePreview({
               Invoice date:{" "}
               {data.issueDate ? formatDate(data.issueDate) : "Draft"}
             </p>
+            {data.dueDate && (
+              <p className="font-bold">Due date: {formatDate(data.dueDate)}</p>
+            )}
             <p>Invoice number: {data.displayNumber ?? "Draft"}</p>
           </div>
           <div>
@@ -168,6 +173,9 @@ export function InvoicePreview({
               <tr key={i} className="border-b border-neutral-200 align-top">
                 <td className="py-2 pr-3">
                   <DescriptionLines text={line.description} />
+                  {data.gstRegistered && line.gstFree && (
+                    <p className="text-xs text-neutral-600">(GST-free)</p>
+                  )}
                 </td>
                 <td className="py-2 pr-3 text-right tabular-nums">
                   {line.quantity}

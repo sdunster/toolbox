@@ -1136,6 +1136,7 @@ mod tests {
             payment_details: None,
             gst_registered: false,
             currency: None,
+            payment_terms_days: None,
         }
     }
 

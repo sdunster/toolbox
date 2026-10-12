@@ -17,6 +17,7 @@ export interface BillableItemFormValues {
   /** Sent as typed (trimmed) — the API is the one quantity parser. */
   quantity: string;
   unitPriceCents: number;
+  gstFree: boolean;
 }
 
 export interface BillableItemFormInitial {
@@ -25,6 +26,7 @@ export interface BillableItemFormInitial {
   quantity: string;
   /** The price as the user would type it, e.g. `"150"` or `"125.50"`. */
   price: string;
+  gstFree?: boolean;
 }
 
 /**
@@ -64,6 +66,7 @@ export function BillableItemForm({
   const [description, setDescription] = useState(initial.description);
   const [quantity, setQuantity] = useState(initial.quantity);
   const [price, setPrice] = useState(initial.price);
+  const [gstFree, setGstFree] = useState(initial.gstFree ?? false);
   const [priceError, setPriceError] = useState<string | null>(null);
 
   const quantityHundredths = parseQuantityToHundredths(quantity);
@@ -88,6 +91,7 @@ export function BillableItemForm({
       description: description.trim(),
       quantity: quantity.trim(),
       unitPriceCents: priceCents,
+      gstFree,
     });
   }
 
@@ -163,6 +167,17 @@ export function BillableItemForm({
           </span>
         </p>
       </div>
+
+      <label className="flex items-center gap-2 text-sm text-ink">
+        <input
+          id={id("gst-free")}
+          type="checkbox"
+          checked={gstFree}
+          onChange={(e) => setGstFree(e.target.checked)}
+          className="size-4 rounded-sm border-line text-accent focus:ring-2 focus:ring-accent/25"
+        />
+        GST-free (no GST is charged on this line)
+      </label>
 
       {error && (
         <p role="alert" className="text-sm text-red-600 dark:text-red-400">

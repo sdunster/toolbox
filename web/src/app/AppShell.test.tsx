@@ -120,6 +120,7 @@ describe("AppShell — kind-aware nav", () => {
       "Projects",
       "Billable items",
       "Expenses",
+      "Reports",
       "Settings",
       "Business settings",
       "Admin",
@@ -134,6 +135,7 @@ describe("AppShell — kind-aware nav", () => {
       "Projects",
       "Billable items",
       "Expenses",
+      "Reports",
       "Settings",
     ]);
   });

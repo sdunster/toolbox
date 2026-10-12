@@ -17,6 +17,7 @@ const invoiceListRowFragment = graphql`
     displayNumber
     issueDate
     paidDate
+    overdue
     totalCents
     currency
     project {
@@ -78,9 +79,9 @@ export function InvoiceListRow({
           {data.displayNumber ?? "Draft"}
         </span>
         <span
-          className={`${invoiceStatusBadgeBase} ${invoiceStatusBadgeClass(data.status, data.paidDate)} lg:order-5 lg:justify-self-start`}
+          className={`${invoiceStatusBadgeBase} ${invoiceStatusBadgeClass(data.status, data.paidDate, data.overdue)} lg:order-5 lg:justify-self-start`}
         >
-          {invoiceStatusLabel(data.status, data.paidDate)}
+          {invoiceStatusLabel(data.status, data.paidDate, data.overdue)}
         </span>
       </div>
       <span className="text-sm text-ink-muted tabular-nums lg:order-2">

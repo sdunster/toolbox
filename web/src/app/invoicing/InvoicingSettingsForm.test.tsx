@@ -59,6 +59,7 @@ const settings = {
   paymentDetails: null,
   gstRegistered: false,
   currency: "AUD",
+  paymentTermsDays: 14,
 };
 
 function instanceResponse(invoicingSettings: typeof settings | null) {
@@ -95,6 +96,7 @@ describe("InvoicingSettingsForm", () => {
                   paymentDetails: "BSB 000-000 Account 00000000",
                   gstRegistered: true,
                   currency: "NZD",
+                  paymentTermsDays: 14,
                 },
               },
             },
@@ -136,6 +138,7 @@ describe("InvoicingSettingsForm", () => {
         paymentDetails: "BSB 000-000 Account 00000000",
         gstRegistered: true,
         currency: "NZD",
+        paymentTermsDays: 14,
       },
     });
   });

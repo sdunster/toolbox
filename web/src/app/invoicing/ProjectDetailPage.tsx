@@ -11,6 +11,8 @@ import { ProjectEditForm } from "./ProjectEditForm";
 import { ProjectBillableItems } from "./ProjectBillableItems";
 import { ProjectInvoices } from "./ProjectInvoices";
 import { ProjectExpenses } from "./ProjectExpenses";
+import { ProjectFinancials } from "./ProjectFinancials";
+import { centsToInput } from "../../lib/money";
 
 const projectDetailPageQuery = graphql`
   query ProjectDetailPageQuery($id: ID!) @throwOnFieldError {
@@ -19,6 +21,7 @@ const projectDetailPageQuery = graphql`
       name
       clientName
       archived
+      defaultUnitPriceCents
       instance {
         id
         invoicingSettings {
@@ -73,6 +76,10 @@ function Content({ id }: { id: string }) {
         </div>
         <p className="mt-1 text-sm text-ink-muted">{project.clientName}</p>
       </div>
+      <ProjectFinancials
+        projectId={project.id}
+        currency={project.instance.invoicingSettings?.currency ?? "AUD"}
+      />
       <div className="max-w-3xl">
         <ProjectEditForm project={project} />
       </div>
@@ -81,6 +88,11 @@ function Content({ id }: { id: string }) {
         projectId={project.id}
         currency={project.instance.invoicingSettings?.currency ?? "AUD"}
         archived={project.archived}
+        defaultPrice={
+          project.defaultUnitPriceCents == null
+            ? ""
+            : centsToInput(project.defaultUnitPriceCents)
+        }
       />
       <ProjectInvoices
         instanceId={project.instance.id}
