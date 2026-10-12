@@ -2705,12 +2705,19 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
     /// Deleting one does not: see that function's doc comment. The same
     /// "not into `DELETED`" carve-out applies to the best-effort staff
     /// notice below.
+    ///
+    /// `quiet: true` ("close quietly" in the web app) suppresses that
+    /// customer notice — for a ticket the customer doesn't need to hear about
+    /// (spam that isn't worth deleting, a thread that already ended with a
+    /// "thanks"). It affects customer mail only: the staff notice is sent
+    /// exactly as it would be otherwise.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Authenticated)")]
     async fn set_ticket_status(
         &self,
         ctx: &Context<'_>,
         ticket_id: ID,
         status: TicketStatusType,
+        #[graphql(default)] quiet: bool,
     ) -> Result<Ticket<A>> {
         let ticket = require_ticket_member(ctx, &*self.app, ticket_id.as_str()).await?;
         let user_id = require_user_id(ctx)?;
@@ -2738,8 +2745,10 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         // `outbound::status_notice_body`'s doc comment, and the "Outbound
         // mail" entry in `CLAUDE.md`, for the reasoning). Failure here is
         // logged, never surfaced — the status change is this mutation's
-        // primary effect and has already succeeded.
-        if let Some(notice) = outbound::status_notice_body(old_status, new_status) {
+        // primary effect and has already succeeded. `quiet` skips it.
+        if let Some(notice) =
+            outbound::status_notice_body(old_status, new_status).filter(|_| !quiet)
+        {
             send_system_notification(
                 &*self.app,
                 &ticket,

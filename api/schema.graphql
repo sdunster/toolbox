@@ -1222,8 +1222,14 @@ type MutationRoot {
 	Deleting one does not: see that function's doc comment. The same
 	"not into `DELETED`" carve-out applies to the best-effort staff
 	notice below.
+	
+	`quiet: true` ("close quietly" in the web app) suppresses that
+	customer notice — for a ticket the customer doesn't need to hear about
+	(spam that isn't worth deleting, a thread that already ended with a
+	"thanks"). It affects customer mail only: the staff notice is sent
+	exactly as it would be otherwise.
 	"""
-	setTicketStatus(ticketId: ID!, status: TicketStatusType!): Ticket!
+	setTicketStatus(ticketId: ID!, status: TicketStatusType!, quiet: Boolean! = false): Ticket!
 	"""
 	Assign (or, with `userId: null`, unassign) a ticket. The target user,
 	when assigning, must themselves be a member of this ticket's

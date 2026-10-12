@@ -9,7 +9,7 @@
 //! say so, because an AI client should know before it acts:
 //!   - `reply_to_ticket` emails the requesters and CCs, always;
 //!   - `set_ticket_status` emails them a brief notice on a close or a reopen
-//!     (not on a delete);
+//!     (not on a delete, nor when `quiet` is set);
 //!   - notes, assignment and recipient edits send no customer mail.
 //!
 //! Staff notifications (`staff_notify`) fire exactly as they do for the same
@@ -193,12 +193,17 @@ pub fn catalogue() -> Vec<Value> {
             "description": "Close, reopen or delete a ticket. **Closing or reopening emails the \
                 requesters and CCs a brief notice**; deleting (a soft delete, spam cleanup) \
                 sends nothing, and restoring a deleted ticket to OPEN counts as a reopen. \
+                Pass `quiet: true` to close (or reopen) without emailing the customer. \
                 Setting the status a ticket already has changes nothing.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "ticketId": { "type": "string" },
                     "status": { "type": "string", "enum": ["OPEN", "CLOSED", "DELETED"] },
+                    "quiet": {
+                        "type": "boolean",
+                        "description": "Don't email the requesters/CCs about this change. Default false.",
+                    },
                 },
                 "required": ["ticketId", "status"],
             },
@@ -339,13 +344,20 @@ where
             ) else {
                 return Some(missing_argument("ticketId/status"));
             };
+            let quiet = arguments
+                .get("quiet")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let doc = format!(
-                "mutation McpStatus($ticketId: ID!, $status: TicketStatusType!) {{ \
-                 setTicketStatus(ticketId: $ticketId, status: $status) {{ {TICKET_FIELDS} }} }}"
+                "mutation McpStatus($ticketId: ID!, $status: TicketStatusType!, $quiet: Boolean!) {{ \
+                 setTicketStatus(ticketId: $ticketId, status: $status, quiet: $quiet) {{ {TICKET_FIELDS} }} }}"
             );
             rename(
-                ctx.run(&doc, json!({"ticketId": id, "status": status}))
-                    .await,
+                ctx.run(
+                    &doc,
+                    json!({"ticketId": id, "status": status, "quiet": quiet}),
+                )
+                .await,
                 "setTicketStatus",
                 "ticket",
             )

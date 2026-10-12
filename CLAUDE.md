@@ -46,7 +46,8 @@ local setup, and `SCHEMA.md` for the data model.
     reopen** (including restoring a deleted ticket back to open) — see `outbound::status_notice_body`.
     Transitioning *into* `DELETED`, in either direction, sends nothing: deleting a ticket is admin
     housekeeping (spam cleanup, a mistaken submission), not a resolution the customer is owed a
-    notification about.
+    notification about. An agent can also opt out per call with `quiet: true` ("Close quietly" in
+    the web app, `quiet` on the MCP tool), which skips the customer notice but not staff notices.
   - `assignTicket`, `addTicketRequester`/`removeTicketRequester`, `addTicketCc`/`removeTicketCc`
     send no **customer** mail at all — which agent owns a ticket, and who else is copied on it, is
     internal bookkeeping. `addInternalNote` never sends customer mail, as the build plan says

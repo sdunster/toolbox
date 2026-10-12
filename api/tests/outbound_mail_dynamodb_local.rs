@@ -323,6 +323,44 @@ async fn closing_a_ticket_sends_exactly_one_notice() {
 }
 
 #[tokio::test]
+async fn closing_a_ticket_quietly_sends_no_customer_notice() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner_id, _address) = setup_instance(&db, "closeq").await;
+    let requester_email = unique_email("requester");
+    let cc_email = unique_email("cc");
+    let ticket = make_ticket(&db, &instance.id, &requester_email, &cc_email).await;
+
+    let (my_app, schema) = build_app_and_schema(db);
+
+    let response = schema
+        .execute(
+            Request::new(
+                r#"
+                mutation($ticketId: ID!, $status: TicketStatusType!) {
+                    setTicketStatus(ticketId: $ticketId, status: $status, quiet: true) { id status }
+                }
+                "#,
+            )
+            .variables(Variables::from_json(json!({
+                "ticketId": ticket.id,
+                "status": "CLOSED",
+            })))
+            .data(user_auth(&owner_id, &instance.id, true)),
+        )
+        .await;
+    assert_eq!(
+        expect_data(&response, "setTicketStatus.status"),
+        json!("CLOSED")
+    );
+
+    // `setup_instance` has only the one member (the actor), so no staff
+    // notice either — any mail at all here would be the customer notice.
+    let sent = my_app.mail.sent_raw();
+    assert!(sent.is_empty(), "a quiet close must send nothing: {sent:?}");
+}
+
+#[tokio::test]
 async fn self_assigning_a_ticket_sends_no_mail_at_all() {
     let prefix = require_local_db!();
     let db = dynamodb::Handler::new(&prefix, false).await;
