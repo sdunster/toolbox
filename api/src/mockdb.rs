@@ -616,7 +616,7 @@ impl db::Handler for Handler {
         &self,
         _id: &str,
         _index: usize,
-        _update: &db::BroadcastDeliveryUpdate,
+        _update: &db::DeliveryUpdate,
     ) -> db::Result<bool> {
         Self::unsupported()
     }
@@ -630,6 +630,25 @@ impl db::Handler for Handler {
         _instance_id: &str,
         _limit: i32,
     ) -> db::Result<Vec<db::Broadcast>> {
+        Self::unsupported()
+    }
+
+    // ── message_delivery ──────────────────────────────────────────────────
+
+    async fn record_message_delivery(
+        &self,
+        _ticket_id: &str,
+        _ses_message_id: &str,
+        _email: &str,
+        _update: &db::DeliveryUpdate,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn list_message_deliveries(
+        &self,
+        _ticket_id: &str,
+    ) -> db::Result<Vec<db::MessageDelivery>> {
         Self::unsupported()
     }
 

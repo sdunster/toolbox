@@ -746,6 +746,34 @@ Written by `create_credit_note` in one `TransactWriteItems` with the invoice's `
 
 ---
 
+### `{prefix}_message_delivery`
+
+What SES reported for one recipient of one customer-facing ticket message — see CLAUDE.md's "Ticket
+mail delivery tracking". Written only by the inbound-mail Lambda (`ticket_delivery::apply`), as an
+upsert conditioned on `delivery_rank`, so status only moves forward. Never deleted.
+
+| Attribute   | Type | Role                                             |
+| ----------- | ---- | ------------------------------------------------ |
+| `id`        | S    | Hash key (PK) — `{ses_message_id}#{email}`       |
+| `ticket_id` | S    | GSI hash key                                     |
+
+**GSIs:**
+
+| GSI               | Hash key    | Sort key | Projection | Purpose                                  |
+| ----------------- | ----------- | -------- | ---------- | ---------------------------------------- |
+| `ticket_id-index` | `ticket_id` | —        | ALL        | Every delivery row for a ticket's thread |
+
+**Non-obvious attributes:**
+
+- `ses_message_id` (S) — SES's bare message id; the matching `ticket_message.rfc_message_id` is
+  `<{ses_message_id}@{region}.amazonses.com>`.
+- `email` (S) — lowercased recipient.
+- `delivery_status` (S) — `delayed`/`delivered`/`bounced`/`rejected`/`complained`; `delivery_rank`
+  (N) — its forward-only rank; `delivery_detail` (S) — optional reason; `updated_at` (N) — the
+  event's time.
+
+---
+
 ### `{prefix}_broadcast`
 
 One announcement email sent from a support instance to a list of addresses, one copy per recipient —
@@ -784,7 +812,7 @@ recipient as its send returns) and by the inbound-mail Lambda as SES delivery ev
 
 An SES event finds its row and list index from the `broadcast_id`/`broadcast_recipient` message
 tags every broadcast send carries — a `GetItem`-shaped update by primary key, no GSI. The events
-arrive on the same `toolbox-mail-feedback` topic as suppression feedback.
+arrive on the shared `toolbox-mail-feedback` stream (`ses_events`).
 
 ---
 

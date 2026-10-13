@@ -33,6 +33,7 @@ use toolbox::graphql;
 use toolbox::inbound::pipeline;
 use toolbox::mockmail;
 use toolbox::mockstorage;
+use toolbox::ses_events::SesEvent;
 
 type TestApp = app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage>;
 type TestSchema = graphql::ToolboxSchema<TestApp>;
@@ -420,6 +421,7 @@ fn ses_event(
         "mail": {
             "timestamp": "2026-10-13T01:00:00.000Z",
             "messageId": "0100018f-test",
+            "destination": ["recipient@example.com"],
             "tags": {
                 "ses:configuration-set": ["toolbox"],
                 "broadcast_id": [broadcast_id],
@@ -459,10 +461,17 @@ async fn delivery_events_update_the_right_recipient_and_only_move_forward() {
     let bounce = json!({
         "bounceType": "Permanent",
         "bounceSubType": "General",
-        "bouncedRecipients": [{ "diagnosticCode": "smtp; 550 5.1.1 user unknown" }],
+        "bouncedRecipients": [{
+            "emailAddress": "recipient@example.com",
+            "diagnosticCode": "smtp; 550 5.1.1 user unknown"
+        }],
         "timestamp": "2026-10-13T01:00:02.000Z",
     });
-    let delay = json!({ "delayType": "MailboxFull", "timestamp": "2026-10-13T01:00:03.000Z" });
+    let delay = json!({
+        "delayType": "MailboxFull",
+        "delayedRecipients": [{ "emailAddress": "recipient@example.com" }],
+        "timestamp": "2026-10-13T01:00:03.000Z",
+    });
     for msg in [
         ses_event("Delivery", &id, 0, "delivery", delivery.clone()),
         ses_event("Bounce", &id, 1, "bounce", bounce),
@@ -482,33 +491,28 @@ async fn delivery_events_update_the_right_recipient_and_only_move_forward() {
         ses_event("Delivery", "nonexistent0", 0, "delivery", delivery.clone()),
         ses_event("Delivery", &id, 99, "delivery", delivery.clone()),
     ] {
-        broadcast_events::apply(&db, &msg).await.expect("apply");
+        broadcast_events::apply(&db, &SesEvent::parse(&msg).unwrap())
+            .await
+            .expect("apply");
     }
     // Ticket mail carries no tags: ignored.
     let untagged =
         json!({ "eventType": "Bounce", "mail": { "tags": {} }, "bounce": {} }).to_string();
-    broadcast_events::apply(&db, &untagged).await.unwrap();
+    broadcast_events::apply(&db, &SesEvent::parse(&untagged).unwrap())
+        .await
+        .unwrap();
 
     let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
     assert_eq!(stored.recipients.len(), 3);
     let r = &stored.recipients;
-    assert_eq!(
-        r[0].delivery_status,
-        Some(db::BroadcastDeliveryStatus::Delivered)
-    );
+    assert_eq!(r[0].delivery_status, Some(db::DeliveryStatus::Delivered));
     assert_eq!(r[0].delivery_detail.as_deref(), Some("250 OK"));
-    assert_eq!(
-        r[1].delivery_status,
-        Some(db::BroadcastDeliveryStatus::Bounced)
-    );
+    assert_eq!(r[1].delivery_status, Some(db::DeliveryStatus::Bounced));
     assert_eq!(
         r[1].delivery_detail.as_deref(),
         Some("Permanent/General: smtp; 550 5.1.1 user unknown")
     );
-    assert_eq!(
-        r[2].delivery_status,
-        Some(db::BroadcastDeliveryStatus::Complained)
-    );
+    assert_eq!(r[2].delivery_status, Some(db::DeliveryStatus::Complained));
     // The send-time fields are untouched by events.
     assert!(
         r.iter()

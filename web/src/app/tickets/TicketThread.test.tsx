@@ -89,6 +89,7 @@ function baseTicket() {
         bodyText: "It's actually on fire, please help.",
         createdAt: Math.floor(Date.now() / 1000) - 7200,
         attachments: [],
+        deliveries: [],
       },
       {
         __typename: "TicketMessage",
@@ -106,6 +107,7 @@ function baseTicket() {
         bodyText: "Definitely do not reply-all with the fire department joke.",
         createdAt: Math.floor(Date.now() / 1000) - 3600,
         attachments: [],
+        deliveries: [],
       },
     ],
   };
@@ -160,6 +162,61 @@ describe("TicketThread — message kinds", () => {
     ).toBeInTheDocument();
     expect(
       screen.queryAllByText("Internal note — not sent to the customer"),
+    ).toHaveLength(1);
+  });
+});
+
+describe("TicketThread — delivery status", () => {
+  it("shows what the mail provider reported for each recipient of a reply", async () => {
+    const ticket = baseTicket();
+    ticket.messages.push({
+      __typename: "TicketMessage",
+      id: "msg-sent",
+      kind: "REPLY",
+      fromEmail: null,
+      author: {
+        __typename: "User",
+        id: "user-agent",
+        name: "Adrian Agent",
+        email: "agent@example.com",
+      },
+      toEmails: ["customer@example.com"],
+      ccEmails: ["gone@example.com"],
+      bodyText: "We're on it.",
+      createdAt: Math.floor(Date.now() / 1000),
+      attachments: [],
+      deliveries: [
+        {
+          email: "customer@example.com",
+          status: "DELIVERED",
+          detail: "250 OK",
+        },
+        {
+          email: "gone@example.com",
+          status: "BOUNCED",
+          detail: "Permanent/General: 550 5.1.1 user unknown",
+        },
+      ],
+    } as (typeof ticket.messages)[number]);
+    server.use(
+      relayEndpoint.query("TicketThreadHarnessQuery", () =>
+        HttpResponse.json({ data: { ticket } }),
+      ),
+    );
+
+    renderHarness();
+
+    expect(
+      await screen.findByText("customer@example.com: Delivered"),
+    ).toBeInTheDocument();
+    const bounced = screen.getByText("gone@example.com: Bounced");
+    expect(bounced).toHaveAttribute(
+      "title",
+      "Permanent/General: 550 5.1.1 user unknown",
+    );
+    // Messages with no events (the inbound one, the note) show nothing.
+    expect(
+      screen.getAllByRole("list", { name: "Delivery status" }),
     ).toHaveLength(1);
   });
 });
@@ -225,6 +282,7 @@ describe("TicketThread — reply mutation", () => {
               bodyText: variables.body,
               createdAt: Math.floor(Date.now() / 1000),
               attachments: [],
+              deliveries: [],
             },
           },
         }),

@@ -25,11 +25,13 @@ pub mod outbound;
 pub mod request_metrics;
 pub mod s3storage;
 pub mod server;
+pub mod ses_events;
 pub mod sesmail;
 pub mod staff_notify;
 pub mod storage;
 pub mod suppression;
 pub mod telemetry;
+pub mod ticket_delivery;
 pub mod turnstile;
 
 /// Load local `.env`/`.env.secret` for CLI / dev binaries. The Lambda binaries

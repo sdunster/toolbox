@@ -292,6 +292,13 @@ const TABLES: &[Table] = &[
         ttl: None,
     },
     Table {
+        name: "message_delivery",
+        hash: "id",
+        attrs: &[Attr("id", S), Attr("ticket_id", S)],
+        gsis: &[all("ticket_id-index", "ticket_id", None)],
+        ttl: None,
+    },
+    Table {
         name: "broadcast",
         hash: "id",
         attrs: &[Attr("id", S), Attr("instance_id", S), Attr("created_at", N)],

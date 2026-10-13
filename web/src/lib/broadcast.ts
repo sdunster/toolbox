@@ -1,3 +1,5 @@
+import { deliveryStatusLabel, type StatusTone } from "./deliveryStatus";
+
 /** Mirrors `broadcast::MAX_BROADCAST_RECIPIENTS` in the API. */
 export const MAX_BROADCAST_RECIPIENTS = 100;
 
@@ -26,10 +28,6 @@ export function invalidRecipients(recipients: string[]): string[] {
 }
 
 export type BroadcastSendStatus = "PENDING" | "SENT" | "FAILED" | "SUPPRESSED";
-export type BroadcastDeliveryStatus =
-  "DELAYED" | "DELIVERED" | "BOUNCED" | "REJECTED" | "COMPLAINED";
-
-export type RecipientTone = "neutral" | "good" | "warn" | "bad";
 
 /**
  * One label for a recipient: the provider-reported delivery outcome when
@@ -38,19 +36,9 @@ export type RecipientTone = "neutral" | "good" | "warn" | "bad";
 export function recipientStatus(
   sendStatus: string,
   deliveryStatus: string | null | undefined,
-): { label: string; tone: RecipientTone } {
-  switch (deliveryStatus) {
-    case "DELIVERED":
-      return { label: "Delivered", tone: "good" };
-    case "DELAYED":
-      return { label: "Delayed", tone: "warn" };
-    case "BOUNCED":
-      return { label: "Bounced", tone: "bad" };
-    case "REJECTED":
-      return { label: "Rejected", tone: "bad" };
-    case "COMPLAINED":
-      return { label: "Marked as spam", tone: "bad" };
-  }
+): { label: string; tone: StatusTone } {
+  const delivery = deliveryStatusLabel(deliveryStatus);
+  if (delivery) return delivery;
   switch (sendStatus) {
     case "SENT":
       return { label: "Sent", tone: "neutral" };

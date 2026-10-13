@@ -1237,11 +1237,14 @@ impl BroadcastSendStatus {
     }
 }
 
-/// What the provider reported *after* accepting a broadcast recipient's
-/// copy — written by `broadcast_events` from SES event publishing, never by
-/// the sender, so the two writers can't overwrite each other.
+/// What the mail provider reported *after* accepting a message, for one
+/// recipient — from SES event publishing (`ses_events`). Recorded for
+/// broadcast recipients (`broadcast_events`) and for the recipients of
+/// customer-facing ticket mail (`ticket_delivery`), never by the sender
+/// itself, so a send-time write and an event write can't overwrite each
+/// other.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BroadcastDeliveryStatus {
+pub enum DeliveryStatus {
     Delayed,
     Delivered,
     Bounced,
@@ -1249,7 +1252,7 @@ pub enum BroadcastDeliveryStatus {
     Complained,
 }
 
-impl BroadcastDeliveryStatus {
+impl DeliveryStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Delayed => "delayed",
@@ -1297,7 +1300,7 @@ pub struct BroadcastRecipient {
     pub provider_message_id: Option<String>,
     /// Why the send failed (`Failed`), or why it was skipped (`Suppressed`).
     pub error: Option<String>,
-    pub delivery_status: Option<BroadcastDeliveryStatus>,
+    pub delivery_status: Option<DeliveryStatus>,
     /// Human-readable detail from the provider: the bounce type and
     /// diagnostic code, the complaint feedback type, the reject reason.
     pub delivery_detail: Option<String>,
@@ -1350,12 +1353,41 @@ pub struct BroadcastSendResult {
 }
 
 /// The provider-reported half of a recipient's status — see
-/// [`Handler::set_broadcast_delivery`].
+/// [`Handler::set_broadcast_delivery`] and
+/// [`Handler::record_message_delivery`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BroadcastDeliveryUpdate {
-    pub status: BroadcastDeliveryStatus,
+pub struct DeliveryUpdate {
+    pub status: DeliveryStatus,
     pub detail: Option<String>,
     pub at: u64,
+}
+
+/// One `message_delivery` row: what SES reported for one recipient of one
+/// customer-facing ticket message. Keyed `{ses_message_id}#{email}` — SES's
+/// own message id, not the `ticket_message` row id, because an event names
+/// the SES id and the ticket (by tag) and nothing else, so the write is a
+/// plain upsert by primary key — see `ticket_delivery`. Listed per ticket via
+/// `ticket_id-index`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageDelivery {
+    pub ticket_id: String,
+    /// SES's bare message id — the part of `ticket_message.rfc_message_id`
+    /// between `<` and `@` ([`ses_message_id_from_rfc`]).
+    pub ses_message_id: String,
+    /// Lowercased.
+    pub email: String,
+    pub status: DeliveryStatus,
+    pub detail: Option<String>,
+    pub updated_at: u64,
+}
+
+/// The bare SES message id inside a stored `rfc_message_id`
+/// (`<{id}@{region}.amazonses.com>`), or `None` for anything else — an
+/// inbound message's own id, say.
+pub fn ses_message_id_from_rfc(rfc_message_id: &str) -> Option<&str> {
+    let inner = rfc_message_id.trim().strip_prefix('<')?.strip_suffix('>')?;
+    let (id, domain) = inner.split_once('@')?;
+    (domain.ends_with(".amazonses.com") && !id.is_empty()).then_some(id)
 }
 
 /// Which partition a credit-note listing reads.
@@ -2711,7 +2743,7 @@ pub trait Handler: Sync {
         result: &BroadcastSendResult,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Record a provider delivery event for recipient `index`, only moving
-    /// forward ([`BroadcastDeliveryStatus::rank`]): conditioned on the
+    /// forward ([`DeliveryStatus::rank`]): conditioned on the
     /// recipient existing and its stored `delivery_rank` being absent or
     /// `<=` this one. `Ok(false)` — not an error — when the condition fails
     /// (an unknown broadcast/index, or a stale event), so a redelivered or
@@ -2720,7 +2752,7 @@ pub trait Handler: Sync {
         &self,
         id: &str,
         index: usize,
-        update: &BroadcastDeliveryUpdate,
+        update: &DeliveryUpdate,
     ) -> impl Future<Output = Result<bool>> + Send;
     fn get_broadcast_consistent(
         &self,
@@ -2732,6 +2764,26 @@ pub trait Handler: Sync {
         instance_id: &str,
         limit: i32,
     ) -> impl Future<Output = Result<Vec<Broadcast>>> + Send;
+
+    // ── message_delivery ──────────────────────────────────────────────────
+    /// Upsert one recipient's delivery status for one ticket message,
+    /// moving only forward ([`DeliveryStatus::rank`]) — conditioned on no
+    /// row yet, or a stored `delivery_rank` `<=` this one. `Ok(false)` when
+    /// a later status is already stored (a stale or replayed event).
+    fn record_message_delivery(
+        &self,
+        ticket_id: &str,
+        ses_message_id: &str,
+        email: &str,
+        update: &DeliveryUpdate,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Every delivery row for a ticket — one `ticket_id-index` query, for the
+    /// whole thread. Eventually consistent, which only means a status that
+    /// arrived a moment ago may show on the next load.
+    fn list_message_deliveries(
+        &self,
+        ticket_id: &str,
+    ) -> impl Future<Output = Result<Vec<MessageDelivery>>> + Send;
 
     // ── ticket ────────────────────────────────────────────────────────────
     fn get_tickets<T: AsRef<str> + Sync>(

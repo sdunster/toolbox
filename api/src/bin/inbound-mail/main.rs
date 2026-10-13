@@ -30,12 +30,11 @@
 //! third Lambda: it already has the table access and the deploy pipeline,
 //! and the work is a handful of idempotent upserts.
 //!
-//! The same topic also carries `DELIVERY`/`DELIVERY_DELAY`/`REJECT`, for
-//! broadcast delivery tracking: every feedback message is also handed to
-//! `toolbox::broadcast_events::apply`, which records it against the
-//! broadcast recipient its message tags name and ignores anything else
-//! (ticket mail carries no tags). `record_feedback` ignores those extra
-//! event types.
+//! The same topic also carries `DELIVERY`/`DELIVERY_DELAY`/`REJECT`. Each
+//! message is parsed once (`toolbox::ses_events`) and handed to every
+//! consumer: suppression, broadcast delivery tracking
+//! (`toolbox::broadcast_events`) and ticket-mail delivery tracking
+//! (`toolbox::ticket_delivery`); each acts only on what concerns it.
 
 use anyhow::{Context, Result, anyhow};
 use aws_lambda_events::event::ses::SimpleEmailService;
@@ -51,8 +50,10 @@ use toolbox::broadcast_events;
 use toolbox::dynamodb;
 use toolbox::inbound::pipeline;
 use toolbox::s3storage;
+use toolbox::ses_events::SesEvent;
 use toolbox::sesmail;
 use toolbox::suppression;
+use toolbox::ticket_delivery;
 
 /// The outer envelope every SQS message body carries: an SNS notification.
 /// Only `Message` (the inner, JSON-encoded SES event) is needed here.
@@ -139,33 +140,44 @@ async fn handle_sqs(app: &App, event: SqsEvent) -> Result<(), Error> {
     }
 }
 
-/// SES feedback: bounce/complaint suppression, and broadcast delivery
-/// tracking. Failing the invocation makes Lambda retry the asynchronous SNS
-/// delivery (twice, by default); every write on both paths is idempotent
-/// (an upsert, or a forward-only conditional update), so a retry of a
-/// half-applied event is harmless.
+/// SES events: each SNS message is parsed once (`ses_events`) and handed to
+/// every consumer — bounce/complaint suppression, broadcast delivery
+/// tracking, and ticket-mail delivery tracking. Each consumer runs even if
+/// an earlier one failed; any failure fails the invocation, so Lambda
+/// retries the asynchronous SNS delivery (twice, by default). Every write
+/// on every path is idempotent (an upsert, or a forward-only conditional
+/// update), so a retry of a half-applied event is harmless. A message that
+/// isn't valid JSON can never succeed, so it is logged and dropped rather
+/// than retried.
 async fn handle_sns(app: &App, event: SnsEvent) -> Result<(), Error> {
     let mut last_err: Option<anyhow::Error> = None;
     for record in event.records {
-        match suppression::record_feedback(app, &record.sns.message).await {
-            Ok(n) => tracing::info!(
-                sns_message_id = record.sns.message_id,
-                suppressed = n,
-                "processed SES feedback event"
-            ),
+        let sns_message_id = record.sns.message_id;
+        let ses_event = match SesEvent::parse(&record.sns.message) {
+            Ok(e) => e,
             Err(e) => {
-                tracing::error!(error = %e, "failed to process an SES feedback event");
+                tracing::error!(sns_message_id, error = %e, "unparseable SES event; dropping");
+                continue;
+            }
+        };
+        match suppression::record_event(app, &ses_event).await {
+            Ok(n) => tracing::info!(sns_message_id, suppressed = n, "suppression"),
+            Err(e) => {
+                tracing::error!(sns_message_id, error = %e, "failed to record suppression");
                 last_err = Some(e);
             }
         }
-        match broadcast_events::apply(app.db(), &record.sns.message).await {
-            Ok(outcome) => tracing::info!(
-                sns_message_id = record.sns.message_id,
-                outcome,
-                "processed SES event for broadcasts"
-            ),
+        match broadcast_events::apply(app.db(), &ses_event).await {
+            Ok(outcome) => tracing::info!(sns_message_id, outcome, "broadcast tracking"),
             Err(e) => {
-                tracing::error!(error = %e, "failed to record an SES event against a broadcast");
+                tracing::error!(sns_message_id, error = %e, "failed to record broadcast delivery");
+                last_err = Some(e);
+            }
+        }
+        match ticket_delivery::apply(app.db(), &ses_event).await {
+            Ok(outcome) => tracing::info!(sns_message_id, outcome, "ticket mail tracking"),
+            Err(e) => {
+                tracing::error!(sns_message_id, error = %e, "failed to record ticket mail delivery");
                 last_err = Some(e);
             }
         }
@@ -264,9 +276,11 @@ mod tests {
     /// recipient its tags name.
     #[test]
     fn a_broadcast_delivery_event_is_tracked_not_suppressed() {
-        let ses = r#"{"eventType":"Delivery","delivery":{"smtpResponse":"250 OK"},"mail":{"tags":{"broadcast_id":["b1"],"broadcast_recipient":["3"]}}}"#;
+        let ses = r#"{"eventType":"Delivery","delivery":{"smtpResponse":"250 OK","recipients":["a@example.com"]},"mail":{"tags":{"broadcast_id":["b1"],"broadcast_recipient":["3"]}}}"#;
         assert!(suppression::parse_feedback(ses).unwrap().is_empty());
-        match broadcast_events::parse_event(ses, 0).unwrap() {
+        let parsed = SesEvent::parse(ses).unwrap();
+        assert!(ticket_delivery::updates_from(&parsed).is_none());
+        match broadcast_events::update_from(&parsed, 0) {
             broadcast_events::ParsedEvent::Update {
                 broadcast_id,
                 index,

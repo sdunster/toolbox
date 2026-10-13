@@ -161,18 +161,46 @@ local setup, and `SCHEMA.md` for the data model.
     against `email_suppression` (`suppression::find_suppressed`, failing open like every other
     instance-mail send) and records a suppressed one as `send_status = suppressed` with the reason,
     never sending it. A broadcast's own hard bounce or complaint lands in that list the usual way.
-  - **Delivery tracking rides on the suppression feedback topic.** The `toolbox-mail-feedback`
-    event destination (`infra/ses_feedback.tf`) also carries `DELIVERY`, `DELIVERY_DELAY` and
-    `REJECT`, and `bin/inbound-mail`'s SNS handler passes every message to both
-    `suppression::record_feedback` (which ignores the extra types) and `broadcast_events::apply`.
+  - **Delivery tracking is one consumer of the shared SES event stream** (see "SES events" below).
     Each broadcast send carries SES message tags `broadcast_id` and `broadcast_recipient` (its
-    index), echoed on every event, so an event updates `recipients[i]` by primary key — no GSI,
-    same reasoning as the reply tag. Ticket mail carries no tags and `broadcast_events` ignores its
-    events. Send-time status (`send_status`, by the API) and delivery status (`delivery_status`, by
+    index), echoed on every event, so `broadcast_events` updates `recipients[i]` by primary key —
+    no GSI, same reasoning as the reply tag. Send-time status (`send_status`, by the API) and delivery status (`delivery_status`, by
     the Lambda) are separate keys; delivery status only moves forward
     (`BroadcastDeliveryStatus::rank`). A row is written `pending` before anything is sent and each
     recipient's result as soon as its send returns, so a timeout mid-send leaves an accurate record.
   - Not an MCP tool. If one is ever added, its description must say it sends customer email.
+
+- **SES events: parsed once, many consumers (`api/src/ses_events.rs`).** The `toolbox-mail-feedback`
+  event destination (`infra/ses_feedback.tf`) publishes `BOUNCE`, `COMPLAINT`, `DELIVERY`,
+  `DELIVERY_DELAY` and `REJECT` for every send. `bin/inbound-mail`'s SNS handler parses each
+  message once into a `SesEvent` (typed per-type blocks, the message's tags, and
+  `recipient_outcomes()` — one `DeliveryStatus` plus reason per affected recipient) and hands the
+  same value to every consumer, each of which acts only on what concerns it:
+  - `suppression::record_event` — permanent bounces and complaints, keyed on addresses, every send;
+  - `broadcast_events::apply` — the `broadcast_id`/`broadcast_recipient` tags;
+  - `ticket_delivery::apply` — the `ticket_id` tag (below).
+
+  **A consumer joins on tags, never on a lookup**: SES echoes a message's `EmailTags` on every
+  event, and only this system sets them, so the write is by primary key with no GSI and no race
+  against the write that recorded the send. Each consumer runs even if an earlier one failed; any
+  failure fails the invocation (Lambda retries the async SNS delivery), and every write is
+  idempotent. Delivery status only moves forward (`db::DeliveryStatus::rank`, conditioned on a
+  stored rank), because events arrive out of order. A new consumer is a new tag plus one call in
+  `handle_sns` — don't add a second parser.
+
+- **Ticket mail delivery tracking (`api/src/ticket_delivery.rs`, `{prefix}_message_delivery`).**
+  Every customer-facing ticket send — `replyToTicket`, the `submitTicket` acknowledgement, a
+  close/reopen notice (`send_system_notification`), and the inbound relay
+  (`inbound::pipeline::notify_others`) — goes out via `send_raw_tagged` with the `ticket_id` tag.
+  Staff notifications are not tagged (they go to members, not to a ticket's people). Each event is
+  stored per recipient under `id = {ses_message_id}#{email}`: SES's message id, not the
+  `ticket_message` row id, because that's all an event names — so the write needs no lookup, even
+  though some paths only create the message row *after* sending. `TicketMessage.deliveries` joins
+  back on the SES id inside `rfc_message_id` (`db::ses_message_id_from_rfc`), reading the whole
+  ticket's rows once per request (`TicketDeliveriesKey` DataLoader, `ticket_id-index`); it is
+  members-only by construction (reached through `Ticket.messages`). The thread view shows a chip per
+  recipient (Delivered / Delayed / Bounced / Rejected / Marked as spam, reason in the tooltip).
+  Mail sent before this shipped simply has no rows.
 
 - **Rows reference an instance by `id`, never by `slug`.** Slugs are editable and exist for
   humans; `id` is the foreign key every other table stores. Anything taking an instance from user
