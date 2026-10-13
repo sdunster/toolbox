@@ -485,6 +485,42 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
         tokens.sort_by_key(|t| t.created_at);
         Ok(tokens.into_iter().map(ApiTokenInfo::new).collect())
     }
+
+    /// This instance's broadcasts, newest first (at most `first`, default
+    /// 25, max 100). Owner-only — **not** superuser: a broadcast is
+    /// customer communication, the ticket side of the superuser boundary in
+    /// CLAUDE.md. `null`-free empty list for an invoicing instance, which
+    /// can't send one.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(self.rec.id.clone()))")]
+    async fn broadcasts(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 25)] first: i32,
+    ) -> Result<Vec<Broadcast<A>>> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let rows = app
+            .db()
+            .list_broadcasts(&self.rec.id, first.clamp(0, 100))
+            .await?;
+        Ok(rows.into_iter().map(Broadcast::new).collect())
+    }
+
+    /// The domains a broadcast from this instance may be sent from — the
+    /// domains of its inbound addresses (`broadcast::instance_mail_domains`).
+    /// Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+    /// instance.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(self.rec.id.clone()))")]
+    async fn broadcast_from_domains(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
+        if self.rec.kind != db::InstanceKind::Support {
+            return Ok(Vec::new());
+        }
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let addresses = app
+            .db()
+            .list_inbound_addresses_by_instance(&self.rec.id)
+            .await?;
+        Ok(crate::broadcast::instance_mail_domains(&addresses))
+    }
 }
 
 /// One member of an instance: the user, and their role in this instance
@@ -560,6 +596,190 @@ impl<A: App + HasDb + Send + Sync + 'static> ApiTokenInfo<A> {
     }
     async fn last_used_at(&self) -> Option<i64> {
         self.rec.last_used_at.map(|t| t as i64)
+    }
+    /// Dataloaded — see [`TicketMessage::author`]'s doc comment.
+    async fn created_by(&self, ctx: &Context<'_>) -> Result<Option<User<A>>> {
+        let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+        let rec = loader
+            .load_one(UserId(ID(self.rec.created_by_user_id.clone())))
+            .await
+            .map_err(|e| anyhow!("Failed to load createdBy via DataLoader: {}", e))?;
+        Ok(rec.map(User::new))
+    }
+}
+
+/// `sendBroadcast`'s argument. `fromName` defaults to the instance's own
+/// from-name. See `broadcast::validate` for every rule.
+#[derive(InputObject, Clone, Debug)]
+pub struct SendBroadcastInput {
+    pub from_address: String,
+    pub from_name: Option<String>,
+    pub subject: String,
+    pub body: String,
+    pub recipients: Vec<String>,
+}
+
+/// `BroadcastRecipient.sendStatus` — see `db::BroadcastSendStatus`.
+#[derive(Enum, Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BroadcastSendStatusType {
+    Pending,
+    Sent,
+    Failed,
+    Suppressed,
+}
+
+impl From<db::BroadcastSendStatus> for BroadcastSendStatusType {
+    fn from(s: db::BroadcastSendStatus) -> Self {
+        match s {
+            db::BroadcastSendStatus::Pending => Self::Pending,
+            db::BroadcastSendStatus::Sent => Self::Sent,
+            db::BroadcastSendStatus::Failed => Self::Failed,
+            db::BroadcastSendStatus::Suppressed => Self::Suppressed,
+        }
+    }
+}
+
+/// `BroadcastRecipient.deliveryStatus` — see `db::BroadcastDeliveryStatus`.
+#[derive(Enum, Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BroadcastDeliveryStatusType {
+    Delayed,
+    Delivered,
+    Bounced,
+    Rejected,
+    Complained,
+}
+
+impl From<db::BroadcastDeliveryStatus> for BroadcastDeliveryStatusType {
+    fn from(s: db::BroadcastDeliveryStatus) -> Self {
+        match s {
+            db::BroadcastDeliveryStatus::Delayed => Self::Delayed,
+            db::BroadcastDeliveryStatus::Delivered => Self::Delivered,
+            db::BroadcastDeliveryStatus::Bounced => Self::Bounced,
+            db::BroadcastDeliveryStatus::Rejected => Self::Rejected,
+            db::BroadcastDeliveryStatus::Complained => Self::Complained,
+        }
+    }
+}
+
+/// One recipient of a broadcast: what happened when it was sent
+/// (`sendStatus`/`error`), and what SES reported afterwards
+/// (`deliveryStatus`/`deliveryDetail`, `null` until an event arrives — see
+/// `broadcast_events`).
+#[derive(SimpleObject, Clone, Debug, PartialEq)]
+#[graphql(name = "BroadcastRecipient")]
+pub struct BroadcastRecipientInfo {
+    pub email: String,
+    pub send_status: BroadcastSendStatusType,
+    pub error: Option<String>,
+    pub delivery_status: Option<BroadcastDeliveryStatusType>,
+    pub delivery_detail: Option<String>,
+    pub delivery_updated_at: Option<i64>,
+}
+
+impl From<db::BroadcastRecipient> for BroadcastRecipientInfo {
+    fn from(r: db::BroadcastRecipient) -> Self {
+        Self {
+            email: r.email,
+            send_status: r.send_status.into(),
+            error: r.error,
+            delivery_status: r.delivery_status.map(Into::into),
+            delivery_detail: r.delivery_detail,
+            delivery_updated_at: r.delivery_updated_at.map(|t| t as i64),
+        }
+    }
+}
+
+/// A `broadcast` row — see CLAUDE.md's "Broadcasts" entry. Reached only
+/// through owner-guarded fields (`Instance.broadcasts`, `sendBroadcast`).
+#[derive(Debug, PartialEq)]
+pub struct Broadcast<A: App + HasDb + Send + Sync> {
+    _marker: PhantomData<A>,
+    rec: db::Broadcast,
+}
+
+impl<A: App + HasDb + Send + Sync> Broadcast<A> {
+    pub fn new(rec: db::Broadcast) -> Self {
+        Self {
+            _marker: PhantomData,
+            rec,
+        }
+    }
+
+    fn count(&self, f: impl Fn(&db::BroadcastRecipient) -> bool) -> i32 {
+        self.rec.recipients.iter().filter(|r| f(r)).count() as i32
+    }
+}
+
+impl<A: App + HasDb + Send + Sync> Clone for Broadcast<A> {
+    fn clone(&self) -> Self {
+        Self {
+            _marker: PhantomData,
+            rec: self.rec.clone(),
+        }
+    }
+}
+
+#[Object]
+impl<A: App + HasDb + Send + Sync + 'static> Broadcast<A> {
+    async fn id(&self) -> ID {
+        ID(self.rec.id.clone())
+    }
+    async fn from_address(&self) -> &str {
+        &self.rec.from_address
+    }
+    /// Named `sender_name`, not `from_name` — see `Instance.fromName`'s
+    /// comment for the async-graphql quirk.
+    #[graphql(name = "fromName")]
+    async fn sender_name(&self) -> &str {
+        &self.rec.from_name
+    }
+    async fn reply_to(&self) -> &str {
+        &self.rec.reply_to
+    }
+    async fn subject(&self) -> &str {
+        &self.rec.subject
+    }
+    async fn body(&self) -> &str {
+        &self.rec.body_text
+    }
+    async fn created_at(&self) -> i64 {
+        self.rec.created_at as i64
+    }
+    async fn recipients(&self) -> Vec<BroadcastRecipientInfo> {
+        self.rec
+            .recipients
+            .iter()
+            .cloned()
+            .map(BroadcastRecipientInfo::from)
+            .collect()
+    }
+    async fn recipient_count(&self) -> i32 {
+        self.rec.recipients.len() as i32
+    }
+    async fn sent_count(&self) -> i32 {
+        self.count(|r| r.send_status == db::BroadcastSendStatus::Sent)
+    }
+    async fn failed_count(&self) -> i32 {
+        self.count(|r| r.send_status == db::BroadcastSendStatus::Failed)
+    }
+    /// Skipped because the address is on the suppression list.
+    async fn suppressed_count(&self) -> i32 {
+        self.count(|r| r.send_status == db::BroadcastSendStatus::Suppressed)
+    }
+    async fn delivered_count(&self) -> i32 {
+        self.count(|r| r.delivery_status == Some(db::BroadcastDeliveryStatus::Delivered))
+    }
+    /// Bounced or rejected — either way, it never arrived.
+    async fn bounced_count(&self) -> i32 {
+        self.count(|r| {
+            matches!(
+                r.delivery_status,
+                Some(db::BroadcastDeliveryStatus::Bounced | db::BroadcastDeliveryStatus::Rejected)
+            )
+        })
+    }
+    async fn complained_count(&self) -> i32 {
+        self.count(|r| r.delivery_status == Some(db::BroadcastDeliveryStatus::Complained))
     }
     /// Dataloaded — see [`TicketMessage::author`]'s doc comment.
     async fn created_by(&self, ctx: &Context<'_>) -> Result<Option<User<A>>> {

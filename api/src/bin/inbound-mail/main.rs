@@ -29,6 +29,13 @@
 //! to `toolbox::suppression::record_feedback`. Same function rather than a
 //! third Lambda: it already has the table access and the deploy pipeline,
 //! and the work is a handful of idempotent upserts.
+//!
+//! The same topic also carries `DELIVERY`/`DELIVERY_DELAY`/`REJECT`, for
+//! broadcast delivery tracking: every feedback message is also handed to
+//! `toolbox::broadcast_events::apply`, which records it against the
+//! broadcast recipient its message tags name and ignores anything else
+//! (ticket mail carries no tags). `record_feedback` ignores those extra
+//! event types.
 
 use anyhow::{Context, Result, anyhow};
 use aws_lambda_events::event::ses::SimpleEmailService;
@@ -39,7 +46,8 @@ use serde::Deserialize;
 use std::sync::Arc;
 
 use toolbox::app;
-use toolbox::app::HasStorage as _;
+use toolbox::app::{HasDb as _, HasStorage as _};
+use toolbox::broadcast_events;
 use toolbox::dynamodb;
 use toolbox::inbound::pipeline;
 use toolbox::s3storage;
@@ -131,9 +139,11 @@ async fn handle_sqs(app: &App, event: SqsEvent) -> Result<(), Error> {
     }
 }
 
-/// Bounce/complaint feedback. Failing the invocation makes Lambda retry the
-/// asynchronous SNS delivery (twice, by default); every write is an
-/// idempotent upsert, so a retry of a half-applied event is harmless.
+/// SES feedback: bounce/complaint suppression, and broadcast delivery
+/// tracking. Failing the invocation makes Lambda retry the asynchronous SNS
+/// delivery (twice, by default); every write on both paths is idempotent
+/// (an upsert, or a forward-only conditional update), so a retry of a
+/// half-applied event is harmless.
 async fn handle_sns(app: &App, event: SnsEvent) -> Result<(), Error> {
     let mut last_err: Option<anyhow::Error> = None;
     for record in event.records {
@@ -145,6 +155,17 @@ async fn handle_sns(app: &App, event: SnsEvent) -> Result<(), Error> {
             ),
             Err(e) => {
                 tracing::error!(error = %e, "failed to process an SES feedback event");
+                last_err = Some(e);
+            }
+        }
+        match broadcast_events::apply(app.db(), &record.sns.message).await {
+            Ok(outcome) => tracing::info!(
+                sns_message_id = record.sns.message_id,
+                outcome,
+                "processed SES event for broadcasts"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to record an SES event against a broadcast");
                 last_err = Some(e);
             }
         }
@@ -236,5 +257,25 @@ mod tests {
         let feedback = suppression::parse_feedback(&event.records[0].sns.message).unwrap();
         assert_eq!(feedback.len(), 1);
         assert_eq!(feedback[0].email, "gone@example.com");
+    }
+
+    /// A broadcast's Delivery event on the same topic suppresses nothing,
+    /// but is recognised by `broadcast_events` as an update for the
+    /// recipient its tags name.
+    #[test]
+    fn a_broadcast_delivery_event_is_tracked_not_suppressed() {
+        let ses = r#"{"eventType":"Delivery","delivery":{"smtpResponse":"250 OK"},"mail":{"tags":{"broadcast_id":["b1"],"broadcast_recipient":["3"]}}}"#;
+        assert!(suppression::parse_feedback(ses).unwrap().is_empty());
+        match broadcast_events::parse_event(ses, 0).unwrap() {
+            broadcast_events::ParsedEvent::Update {
+                broadcast_id,
+                index,
+                ..
+            } => {
+                assert_eq!(broadcast_id, "b1");
+                assert_eq!(index, 3);
+            }
+            other => panic!("expected an update, got {other:?}"),
+        }
     }
 }

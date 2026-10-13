@@ -818,6 +818,52 @@ resource "aws_dynamodb_table" "credit_note" {
   }
 }
 
+# ── broadcast ────────────────────────────────────────────────────────────────
+# One announcement email sent from a support instance to a list of addresses —
+# see CLAUDE.md's "Broadcasts" entry. `recipients` is a list of maps updated in
+# place by index: each send's result by the API, each SES delivery event by
+# the inbound-mail lambda (api/src/broadcast_events.rs). Never deleted.
+
+resource "aws_dynamodb_table" "broadcast" {
+  name                        = "${var.db_prefix}_broadcast"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "id"
+  deletion_protection_enabled = true
+
+  point_in_time_recovery {
+    enabled                 = true
+    recovery_period_in_days = 35
+  }
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+  attribute {
+    name = "instance_id"
+    type = "S"
+  }
+  attribute {
+    name = "created_at"
+    type = "N"
+  }
+
+  # An instance's broadcast history, newest first. ALL: the page renders
+  # every field, including each recipient's status.
+  global_secondary_index {
+    name = "instance_id-created_at-index"
+    key_schema {
+      attribute_name = "instance_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "created_at"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+}
+
 # ── webauthn_credential ──────────────────────────────────────────────────────
 
 resource "aws_dynamodb_table" "webauthn_credential" {

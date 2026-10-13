@@ -597,6 +597,42 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    // ── broadcast ─────────────────────────────────────────────────────────
+
+    async fn create_broadcast(&self, _broadcast: &db::Broadcast) -> db::Result<()> {
+        Self::unsupported()
+    }
+
+    async fn set_broadcast_send_result(
+        &self,
+        _id: &str,
+        _index: usize,
+        _result: &db::BroadcastSendResult,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn set_broadcast_delivery(
+        &self,
+        _id: &str,
+        _index: usize,
+        _update: &db::BroadcastDeliveryUpdate,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn get_broadcast_consistent(&self, _id: &str) -> db::Result<Option<db::Broadcast>> {
+        Self::unsupported()
+    }
+
+    async fn list_broadcasts(
+        &self,
+        _instance_id: &str,
+        _limit: i32,
+    ) -> db::Result<Vec<db::Broadcast>> {
+        Self::unsupported()
+    }
+
     // ── ticket ────────────────────────────────────────────────────────────
 
     async fn get_tickets<T: AsRef<str> + Sync>(

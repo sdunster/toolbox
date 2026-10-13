@@ -41,6 +41,9 @@ pub struct RawEmail {
     pub cc: Vec<String>,
     pub raw: Vec<u8>,
     pub message_id: String,
+    /// Provider message tags, from [`mail::Handler::send_raw_tagged`]
+    /// (empty for a plain `send_raw`).
+    pub tags: Vec<(String, String)>,
 }
 
 #[derive(Default)]
@@ -128,7 +131,13 @@ impl Handler {
     /// (see `mail::Handler::send_raw`'s doc comment for why that's the right
     /// layer), so a `.eml` written under `MOCK_MAIL_DIR` still shows the
     /// original intended recipients for debugging.
-    fn record_raw(&self, raw: &[u8], to: &[String], cc: &[String]) -> Result<String> {
+    fn record_raw(
+        &self,
+        raw: &[u8],
+        to: &[String],
+        cc: &[String],
+        tags: &[(String, String)],
+    ) -> Result<String> {
         let to: Vec<String> = to.iter().map(|t| mail::resolve_recipient(t)).collect();
         let cc: Vec<String> = cc.iter().map(|t| mail::resolve_recipient(t)).collect();
         tracing::info!(
@@ -158,6 +167,7 @@ impl Handler {
             cc,
             raw: raw.to_vec(),
             message_id: message_id.clone(),
+            tags: tags.to_vec(),
         });
         Ok(message_id)
     }
@@ -183,7 +193,17 @@ impl mail::Handler for Handler {
     }
 
     async fn send_raw(&self, raw: &[u8], to: &[String], cc: &[String]) -> Result<String> {
-        self.record_raw(raw, to, cc)
+        self.record_raw(raw, to, cc, &[])
+    }
+
+    async fn send_raw_tagged(
+        &self,
+        raw: &[u8],
+        to: &[String],
+        cc: &[String],
+        tags: &[(String, String)],
+    ) -> Result<String> {
+        self.record_raw(raw, to, cc, tags)
     }
 }
 

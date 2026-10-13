@@ -9,6 +9,7 @@ import OAuthAuthorize from "./OAuthAuthorize";
 import Settings from "./Settings";
 import { TicketListPage } from "./tickets/TicketListPage";
 import { TicketThreadPage } from "./tickets/TicketThreadPage";
+import { BroadcastPage } from "./broadcast/BroadcastPage";
 import { ProjectListPage } from "./invoicing/ProjectListPage";
 import { ProjectDetailPage } from "./invoicing/ProjectDetailPage";
 import { BillableItemListPage } from "./invoicing/BillableItemListPage";
@@ -120,6 +121,7 @@ export default function AppRoute() {
             }
           />
           <Route path="tickets/:id" element={<TicketThreadPage />} />
+          <Route path="broadcast" element={<BroadcastPage />} />
           <Route path="invoices" element={<InvoiceListPage />} />
           <Route path="invoices/:id" element={<InvoiceDetailPage />} />
           <Route path="projects" element={<ProjectListPage />} />

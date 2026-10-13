@@ -1199,6 +1199,165 @@ pub struct FinalizeInvoice<'a> {
     pub finalized_by_user_id: &'a str,
 }
 
+// ── broadcast ─────────────────────────────────────────────────────────────
+
+/// What happened when a broadcast recipient's copy was handed to the mail
+/// provider — written by `sendBroadcast` itself, one recipient at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BroadcastSendStatus {
+    /// Not attempted yet (or the send was cut short, e.g. a Lambda timeout).
+    Pending,
+    /// Accepted by the provider.
+    Sent,
+    /// Refused by the provider at send time; see `BroadcastRecipient::error`.
+    Failed,
+    /// Never sent: the address is on the `email_suppression` list (a past
+    /// hard bounce or complaint); `BroadcastRecipient::error` says which.
+    Suppressed,
+}
+
+impl BroadcastSendStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Sent => "sent",
+            Self::Failed => "failed",
+            Self::Suppressed => "suppressed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "sent" => Some(Self::Sent),
+            "failed" => Some(Self::Failed),
+            "suppressed" => Some(Self::Suppressed),
+            _ => None,
+        }
+    }
+}
+
+/// What the provider reported *after* accepting a broadcast recipient's
+/// copy — written by `broadcast_events` from SES event publishing, never by
+/// the sender, so the two writers can't overwrite each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BroadcastDeliveryStatus {
+    Delayed,
+    Delivered,
+    Bounced,
+    Rejected,
+    Complained,
+}
+
+impl BroadcastDeliveryStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Delayed => "delayed",
+            Self::Delivered => "delivered",
+            Self::Bounced => "bounced",
+            Self::Rejected => "rejected",
+            Self::Complained => "complained",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "delayed" => Some(Self::Delayed),
+            "delivered" => Some(Self::Delivered),
+            "bounced" => Some(Self::Bounced),
+            "rejected" => Some(Self::Rejected),
+            "complained" => Some(Self::Complained),
+            _ => None,
+        }
+    }
+
+    /// Delivery status only ever moves forward: an update is applied only
+    /// when its rank is `>=` the stored one (`delivery_rank`). Events arrive
+    /// out of order — a `DeliveryDelay` can land after the final `Bounce` —
+    /// and a late, less-final event must not hide the outcome. A complaint
+    /// comes after a delivery, so it outranks one.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Delayed => 1,
+            Self::Delivered => 2,
+            Self::Bounced | Self::Rejected => 3,
+            Self::Complained => 4,
+        }
+    }
+}
+
+/// One entry in `broadcast.recipients` — a DynamoDB list of maps, updated in
+/// place by index (`recipients[i].…`). Every `Option` is omitted from the
+/// map when `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BroadcastRecipient {
+    pub email: String,
+    pub send_status: BroadcastSendStatus,
+    /// The provider's message id (`<…@region.amazonses.com>`), once sent.
+    pub provider_message_id: Option<String>,
+    /// Why the send failed (`Failed`), or why it was skipped (`Suppressed`).
+    pub error: Option<String>,
+    pub delivery_status: Option<BroadcastDeliveryStatus>,
+    /// Human-readable detail from the provider: the bounce type and
+    /// diagnostic code, the complaint feedback type, the reject reason.
+    pub delivery_detail: Option<String>,
+    pub delivery_updated_at: Option<u64>,
+}
+
+impl BroadcastRecipient {
+    pub fn pending(email: impl Into<String>) -> Self {
+        Self {
+            email: email.into(),
+            send_status: BroadcastSendStatus::Pending,
+            provider_message_id: None,
+            error: None,
+            delivery_status: None,
+            delivery_detail: None,
+            delivery_updated_at: None,
+        }
+    }
+}
+
+/// A `broadcast` row: one announcement email sent from a support instance to
+/// a list of addresses, one copy each. See CLAUDE.md's "Broadcasts" entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Broadcast {
+    pub id: String,
+    pub instance_id: String,
+    pub created_by_user_id: String,
+    pub created_at: u64,
+    pub from_address: String,
+    pub from_name: String,
+    pub reply_to: String,
+    pub subject: String,
+    pub body_text: String,
+    pub recipients: Vec<BroadcastRecipient>,
+}
+
+impl HasID for Broadcast {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// The send-time half of a recipient's status — see
+/// [`Handler::set_broadcast_send_result`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BroadcastSendResult {
+    pub status: BroadcastSendStatus,
+    pub provider_message_id: Option<String>,
+    pub error: Option<String>,
+}
+
+/// The provider-reported half of a recipient's status — see
+/// [`Handler::set_broadcast_delivery`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BroadcastDeliveryUpdate {
+    pub status: BroadcastDeliveryStatus,
+    pub detail: Option<String>,
+    pub at: u64,
+}
+
 /// Which partition a credit-note listing reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreditNoteScope<'a> {
@@ -2537,6 +2696,42 @@ pub trait Handler: Sync {
         filter: InvoiceListFilter,
         page: ListInvoicesPage,
     ) -> impl Future<Output = Result<Vec<Invoice>>> + Send;
+
+    // ── broadcast ─────────────────────────────────────────────────────────
+    /// `Put` a new broadcast (`attribute_not_exists(id)`), every recipient
+    /// `pending`.
+    fn create_broadcast(&self, broadcast: &Broadcast) -> impl Future<Output = Result<()>> + Send;
+    /// Record what happened when recipient `index` was handed to the mail
+    /// provider (`SET recipients[index].send_status`, plus the message id or
+    /// error). Conditioned on that recipient existing; `Ok(false)` if not.
+    fn set_broadcast_send_result(
+        &self,
+        id: &str,
+        index: usize,
+        result: &BroadcastSendResult,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Record a provider delivery event for recipient `index`, only moving
+    /// forward ([`BroadcastDeliveryStatus::rank`]): conditioned on the
+    /// recipient existing and its stored `delivery_rank` being absent or
+    /// `<=` this one. `Ok(false)` — not an error — when the condition fails
+    /// (an unknown broadcast/index, or a stale event), so a redelivered or
+    /// out-of-order SQS message is a harmless no-op.
+    fn set_broadcast_delivery(
+        &self,
+        id: &str,
+        index: usize,
+        update: &BroadcastDeliveryUpdate,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    fn get_broadcast_consistent(
+        &self,
+        id: &str,
+    ) -> impl Future<Output = Result<Option<Broadcast>>> + Send;
+    /// An instance's broadcasts, newest `created_at` first, at most `limit`.
+    fn list_broadcasts(
+        &self,
+        instance_id: &str,
+        limit: i32,
+    ) -> impl Future<Output = Result<Vec<Broadcast>>> + Send;
 
     // ── ticket ────────────────────────────────────────────────────────────
     fn get_tickets<T: AsRef<str> + Sync>(

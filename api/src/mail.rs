@@ -135,6 +135,21 @@ pub trait Handler: Sync {
         to: &[String],
         cc: &[String],
     ) -> impl Future<Output = Result<String>> + Send;
+
+    /// [`Self::send_raw`], plus provider message tags (`name`, `value`) that
+    /// the provider echoes back on every delivery event for this message —
+    /// SES's `EmailTags`, published by the `toolbox` configuration set's
+    /// event destination (`infra/ses.tf`). Broadcasts use them to tie a
+    /// bounce/complaint/delivery event back to one recipient row with no
+    /// lookup index; see [`crate::broadcast_events`]. Tag names and values
+    /// must be SES-safe (`[A-Za-z0-9_-]`, ≤ 256 chars).
+    fn send_raw_tagged(
+        &self,
+        raw: &[u8],
+        to: &[String],
+        cc: &[String],
+        tags: &[(String, String)],
+    ) -> impl Future<Output = Result<String>> + Send;
 }
 
 #[cfg(test)]

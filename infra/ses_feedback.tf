@@ -1,8 +1,13 @@
-# Bounce and complaint feedback for outbound mail (issue #6):
+# Bounce and complaint feedback for outbound mail (issue #6), plus broadcast
+# delivery tracking:
 #
-#   SES configuration set (ses.tf) -> event destination (BOUNCE, COMPLAINT)
+#   SES configuration set (ses.tf) -> event destination
+#     (BOUNCE, COMPLAINT, DELIVERY, DELIVERY_DELAY, REJECT)
 #     -> this SNS topic -> inbound-mail Lambda, invoked directly
 #        -> api/src/suppression.rs records the address in email_suppression
+#           (bounces and complaints only)
+#        -> api/src/broadcast_events.rs records the outcome on the broadcast
+#           recipient its message tags name (broadcast mail only)
 #
 # Every identity uses aws_sesv2_configuration_set.main as its default, so this
 # covers every send — instance mail and system mail alike. The Lambda is the
@@ -48,7 +53,7 @@ resource "aws_sesv2_configuration_set_event_destination" "feedback" {
 
   event_destination {
     enabled              = true
-    matching_event_types = ["BOUNCE", "COMPLAINT"]
+    matching_event_types = ["BOUNCE", "COMPLAINT", "DELIVERY", "DELIVERY_DELAY", "REJECT"]
 
     sns_destination {
       topic_arn = aws_sns_topic.mail_feedback.arn

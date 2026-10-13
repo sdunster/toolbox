@@ -22,6 +22,9 @@ const SETTINGS_NAV_ITEM = { to: "/app/settings", label: "Settings" };
 // non-owner who navigates to the URL directly still gets FORBIDDEN from the
 // server, surfaced by the page's own error boundary.
 const DELETED_NAV_ITEM = { to: "/app/tickets/deleted", label: "Deleted" };
+// `sendBroadcast` is owner-only in the API — hidden from an agent as a
+// convenience, like `DELETED_NAV_ITEM`; the page also explains it.
+const BROADCAST_NAV_ITEM = { to: "/app/broadcast", label: "Broadcast" };
 // Every `admin*` query/mutation is superuser-only in the API — hiding this
 // item for anyone else is convenience, the same as `DELETED_NAV_ITEM` above;
 // a non-superuser who navigates to `/app/admin/*` directly still gets
@@ -74,7 +77,7 @@ export default function AppShell() {
         ]
       : [
           ...BASE_NAV_ITEMS,
-          ...(isOwner ? [DELETED_NAV_ITEM] : []),
+          ...(isOwner ? [DELETED_NAV_ITEM, BROADCAST_NAV_ITEM] : []),
           SETTINGS_NAV_ITEM,
           ...(user.isSuperuser ? [ADMIN_NAV_ITEM] : []),
         ];

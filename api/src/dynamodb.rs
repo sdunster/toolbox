@@ -777,6 +777,113 @@ impl TryInto<db::CreditNote> for Item {
     }
 }
 
+/// One `broadcast.recipients` entry as a DynamoDB map — every `None`
+/// omitted, per the omit-optional-attributes house rule.
+fn broadcast_recipient_to_av(r: &db::BroadcastRecipient) -> AttributeValue {
+    let mut m = HashMap::from([
+        ("email".to_string(), AttributeValue::S(r.email.clone())),
+        (
+            "send_status".to_string(),
+            AttributeValue::S(r.send_status.as_str().to_string()),
+        ),
+    ]);
+    if let Some(v) = &r.provider_message_id {
+        m.insert("provider_message_id".into(), AttributeValue::S(v.clone()));
+    }
+    if let Some(v) = &r.error {
+        m.insert("error".into(), AttributeValue::S(v.clone()));
+    }
+    if let Some(v) = r.delivery_status {
+        m.insert(
+            "delivery_status".into(),
+            AttributeValue::S(v.as_str().to_string()),
+        );
+        m.insert(
+            "delivery_rank".into(),
+            AttributeValue::N(v.rank().to_string()),
+        );
+    }
+    if let Some(v) = &r.delivery_detail {
+        m.insert("delivery_detail".into(), AttributeValue::S(v.clone()));
+    }
+    if let Some(v) = r.delivery_updated_at {
+        m.insert(
+            "delivery_updated_at".into(),
+            AttributeValue::N(v.to_string()),
+        );
+    }
+    AttributeValue::M(m)
+}
+
+impl TryInto<db::Broadcast> for Item {
+    type Error = HydrationError;
+    fn try_into(self) -> Result<db::Broadcast, Self::Error> {
+        let req_s = |field: &str| -> Result<String, HydrationError> {
+            Ok(self
+                .string_field(field)?
+                .ok_or_else(|| anyhow!("Broadcast missing {field}"))?)
+        };
+        let recipients = match self.0.get("recipients") {
+            None => Vec::new(),
+            Some(v) => v
+                .as_l()
+                .map_err(|_| anyhow!("Broadcast recipients is not a list"))?
+                .iter()
+                .map(|entry| -> anyhow::Result<db::BroadcastRecipient> {
+                    let m = entry
+                        .as_m()
+                        .map_err(|_| anyhow!("Broadcast recipient is not a map"))?;
+                    let item = Item(m.clone());
+                    let send_status = item
+                        .string_field("send_status")?
+                        .ok_or_else(|| anyhow!("Broadcast recipient missing send_status"))?;
+                    Ok(db::BroadcastRecipient {
+                        email: item
+                            .string_field("email")?
+                            .ok_or_else(|| anyhow!("Broadcast recipient missing email"))?,
+                        send_status: db::BroadcastSendStatus::parse(&send_status).ok_or_else(
+                            || {
+                                anyhow!(
+                                    "Broadcast recipient has unknown send_status {send_status:?}"
+                                )
+                            },
+                        )?,
+                        provider_message_id: item.string_field("provider_message_id")?,
+                        error: item.string_field("error")?,
+                        delivery_status: match item.string_field("delivery_status")? {
+                            None => None,
+                            Some(s) => {
+                                Some(db::BroadcastDeliveryStatus::parse(&s).ok_or_else(|| {
+                                    anyhow!("Broadcast recipient has unknown delivery_status {s:?}")
+                                })?)
+                            }
+                        },
+                        delivery_detail: item.string_field("delivery_detail")?,
+                        delivery_updated_at: item
+                            .i64_field("delivery_updated_at")?
+                            .map(|t| t as u64),
+                    })
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?,
+        };
+        Ok(db::Broadcast {
+            id: self.id()?,
+            instance_id: req_s("instance_id")?,
+            created_by_user_id: req_s("created_by_user_id")?,
+            created_at: self
+                .i64_field("created_at")?
+                .ok_or_else(|| anyhow!("Broadcast missing created_at"))?
+                as u64,
+            from_address: req_s("from_address")?,
+            from_name: self.string_field("from_name")?.unwrap_or_default(),
+            reply_to: req_s("reply_to")?,
+            subject: req_s("subject")?,
+            body_text: req_s("body_text")?,
+            recipients,
+        })
+    }
+}
+
 /// Build a `SET a = :a, … REMOVE b, …` expression from `(name, placeholder,
 /// value)` triples: `Some` values are `SET`, `None` ones `REMOVE`d — the
 /// omit-optional-attributes house rule for a full-replace update. `name` may
@@ -4621,6 +4728,163 @@ impl db::Handler for Handler {
             .send()
             .await;
         conditional_write_result("set_credit_note_sent", resp)
+    }
+
+    // ── broadcast ─────────────────────────────────────────────────────────
+
+    async fn create_broadcast(&self, b: &db::Broadcast) -> db::Result<()> {
+        self.ensure_writable()?;
+        let s = |v: &str| AttributeValue::S(v.to_string());
+        let mut item: HashMap<String, AttributeValue> = HashMap::from([
+            ("id".to_string(), s(&b.id)),
+            ("instance_id".to_string(), s(&b.instance_id)),
+            ("created_by_user_id".to_string(), s(&b.created_by_user_id)),
+            (
+                "created_at".to_string(),
+                AttributeValue::N(b.created_at.to_string()),
+            ),
+            ("from_address".to_string(), s(&b.from_address)),
+            ("reply_to".to_string(), s(&b.reply_to)),
+            ("subject".to_string(), s(&b.subject)),
+            ("body_text".to_string(), s(&b.body_text)),
+            (
+                "recipients".to_string(),
+                AttributeValue::L(b.recipients.iter().map(broadcast_recipient_to_av).collect()),
+            ),
+        ]);
+        if !b.from_name.is_empty() {
+            item.insert("from_name".to_string(), s(&b.from_name));
+        }
+        let resp = self
+            .client
+            .put_item()
+            .table_name(self.table_name("broadcast"))
+            .set_item(Some(item))
+            .condition_expression("attribute_not_exists(id)")
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        record_capacity("create_broadcast", resp.consumed_capacity(), CapKind::Write);
+        Ok(())
+    }
+
+    async fn set_broadcast_send_result(
+        &self,
+        id: &str,
+        index: usize,
+        result: &db::BroadcastSendResult,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let path = format!("recipients[{index}]");
+        let mut sets = vec![format!("{path}.send_status = :status")];
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .condition_expression(format!("attribute_exists({path})"))
+            .expression_attribute_values(
+                ":status",
+                AttributeValue::S(result.status.as_str().to_string()),
+            );
+        if let Some(mid) = &result.provider_message_id {
+            sets.push(format!("{path}.provider_message_id = :mid"));
+            req = req.expression_attribute_values(":mid", AttributeValue::S(mid.clone()));
+        }
+        if let Some(err) = &result.error {
+            sets.push(format!("{path}.#err = :err"));
+            req = req
+                .expression_attribute_names("#err", "error")
+                .expression_attribute_values(":err", AttributeValue::S(err.clone()));
+        }
+        let resp = req
+            .update_expression(format!("SET {}", sets.join(", ")))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_broadcast_send_result", resp)
+    }
+
+    async fn set_broadcast_delivery(
+        &self,
+        id: &str,
+        index: usize,
+        update: &db::BroadcastDeliveryUpdate,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let path = format!("recipients[{index}]");
+        let mut sets = vec![
+            format!("{path}.delivery_status = :status"),
+            format!("{path}.delivery_rank = :rank"),
+            format!("{path}.delivery_updated_at = :at"),
+        ];
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .condition_expression(format!(
+                "attribute_exists({path}) AND \
+                 (attribute_not_exists({path}.delivery_rank) OR {path}.delivery_rank <= :rank)"
+            ))
+            .expression_attribute_values(
+                ":status",
+                AttributeValue::S(update.status.as_str().to_string()),
+            )
+            .expression_attribute_values(
+                ":rank",
+                AttributeValue::N(update.status.rank().to_string()),
+            )
+            .expression_attribute_values(":at", AttributeValue::N(update.at.to_string()));
+        let mut removes = Vec::new();
+        match &update.detail {
+            Some(detail) => {
+                sets.push(format!("{path}.delivery_detail = :detail"));
+                req = req.expression_attribute_values(":detail", AttributeValue::S(detail.clone()));
+            }
+            None => removes.push(format!("{path}.delivery_detail")),
+        }
+        let mut expr = format!("SET {}", sets.join(", "));
+        if !removes.is_empty() {
+            expr.push_str(&format!(" REMOVE {}", removes.join(", ")));
+        }
+        let resp = req
+            .update_expression(expr)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_broadcast_delivery", resp)
+    }
+
+    async fn get_broadcast_consistent(&self, id: &str) -> db::Result<Option<db::Broadcast>> {
+        self.get_record_consistent("get_broadcast_consistent", "broadcast", id)
+            .await
+    }
+
+    async fn list_broadcasts(
+        &self,
+        instance_id: &str,
+        limit: i32,
+    ) -> db::Result<Vec<db::Broadcast>> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+        let resp = self
+            .client
+            .query()
+            .table_name(self.table_name("broadcast"))
+            .index_name("instance_id-created_at-index")
+            .key_condition_expression("instance_id = :instance_id")
+            .expression_attribute_values(":instance_id", AttributeValue::S(instance_id.to_string()))
+            .scan_index_forward(false)
+            .limit(limit)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        record_capacity("list_broadcasts", resp.consumed_capacity(), CapKind::Read);
+        Ok(hydrate_items(resp.items)?)
     }
 
     // ── ticket ────────────────────────────────────────────────────────────

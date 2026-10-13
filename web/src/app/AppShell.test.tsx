@@ -108,6 +108,7 @@ describe("AppShell — kind-aware nav", () => {
       "All",
       "Mine",
       "Deleted",
+      "Broadcast",
       "Settings",
     ]);
   });
