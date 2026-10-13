@@ -252,7 +252,7 @@ fn escape_html(s: &str) -> String {
 /// newlines converted to `<br>`; the instance's signature, if set, is
 /// escaped the same way and appended in a visually distinct block below a
 /// divider.
-fn render_html(body: &str, signature: &str) -> String {
+pub(crate) fn render_html(body: &str, signature: &str) -> String {
     let mut html = String::from(
         "<!DOCTYPE html>\n<html><body style=\"font-family:Arial,Helvetica,sans-serif;color:#222\">\n",
     );
@@ -273,7 +273,7 @@ fn render_html(body: &str, signature: &str) -> String {
 /// Plain-text counterpart to [`render_html`]: the body, with the instance's
 /// signature (if set) appended after a blank line — no escaping needed for
 /// plain text.
-fn render_text(body: &str, signature: &str) -> String {
+pub(crate) fn render_text(body: &str, signature: &str) -> String {
     if signature.trim().is_empty() {
         body.to_string()
     } else {

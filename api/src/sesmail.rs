@@ -24,7 +24,9 @@
 use anyhow::{Context, Result, anyhow};
 use aws_sdk_sesv2::Client;
 use aws_sdk_sesv2::primitives::Blob;
-use aws_sdk_sesv2::types::{Body, Content, Destination, EmailContent, Message, RawMessage};
+use aws_sdk_sesv2::types::{
+    Body, Content, Destination, EmailContent, Message, MessageTag, RawMessage,
+};
 
 use crate::mail;
 
@@ -94,6 +96,16 @@ impl mail::Handler for Mailer {
     }
 
     async fn send_raw(&self, raw: &[u8], to: &[String], cc: &[String]) -> Result<String> {
+        self.send_raw_tagged(raw, to, cc, &[]).await
+    }
+
+    async fn send_raw_tagged(
+        &self,
+        raw: &[u8],
+        to: &[String],
+        cc: &[String],
+        tags: &[(String, String)],
+    ) -> Result<String> {
         let to: Vec<String> = to.iter().map(|t| mail::resolve_recipient(t)).collect();
         let cc: Vec<String> = cc.iter().map(|t| mail::resolve_recipient(t)).collect();
 
@@ -112,11 +124,21 @@ impl mail::Handler for Mailer {
             .context("building SES RawMessage")?;
         let content = EmailContent::builder().raw(raw_message).build();
 
-        let resp = self
+        let mut request = self
             .client
             .send_email()
             .destination(destination)
-            .content(content)
+            .content(content);
+        for (name, value) in tags {
+            request = request.email_tags(
+                MessageTag::builder()
+                    .name(name)
+                    .value(value)
+                    .build()
+                    .context("building SES MessageTag")?,
+            );
+        }
+        let resp = request
             .send()
             .await
             .with_context(|| format!("failed to send raw email to {to:?} cc {cc:?}"))?;

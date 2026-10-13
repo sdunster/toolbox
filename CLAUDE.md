@@ -53,6 +53,8 @@ local setup, and `SCHEMA.md` for the data model.
     internal bookkeeping. `addInternalNote` never sends customer mail, as the build plan says
     explicitly. (`assignTicket` *does* send a best-effort **staff** notice — see the next entry;
     the requester/CC mutations never send anything, staff included.)
+  - `sendBroadcast` is a separate, owner-only kind of customer mail with its own rules — see the
+    "Broadcasts" entry below.
   - A send failure is handled differently depending on whether the mail *is* the mutation's
     primary effect or a secondary side effect of one: `replyToTicket` fails the mutation (the
     message row survives, but the caller is told delivery didn't happen); `submitTicket`'s
@@ -135,6 +137,42 @@ local setup, and `SCHEMA.md` for the data model.
   which of a ticket's addresses are suppressed (never which tenant's mail caused it); only an
   operator can clear one, with `cli suppression remove` (which also prints the `aws sesv2
   delete-suppressed-destination` command for SES's own list).
+
+- **Broadcasts (`sendBroadcast`, `api/src/broadcast.rs`): one announcement to a list, every reply
+  a new ticket.** An owner of a support instance emails up to 100 addresses
+  (`broadcast::MAX_BROADCAST_RECIPIENTS`, sent inline in the API Lambda, 5 at a time) from any local
+  part on one of the instance's inbound-address domains. Guard `InstanceOwner` — **not**
+  superuser: it is customer mail whose replies become tickets, the ticket side of the superuser
+  boundary. An invoicing/deleted/missing instance is `NOT_FOUND` (kind isolation).
+  - **Each recipient gets their own copy** (`To:` that address only, no `Cc`), so a reply-all can't
+    pull the rest of the list into a ticket.
+  - **A reply must open a new ticket, one per reply — so a broadcast carries none of the three
+    things `inbound::pipeline::resolve_ticket` threads on:** no `+t{ticket_id}.{reply_token}` tag
+    (`Reply-To` is a plain inbound address — the From address itself when it routes back, else an
+    exact address on the same domain; a `+` in the From address is refused), no `ticket_message`
+    row (so its Message-ID never enters `rfc_message_id-index`), and no `[#slug-n]` subject (a
+    subject containing one is refused). Don't "helpfully" persist a broadcast as a ticket message —
+    every reply would then thread onto it. The same person replying twice opens two tickets; that's
+    accepted.
+  - **Auto-responders are asked not to answer** (`Auto-Submitted: auto-generated`,
+    `X-Auto-Response-Suppress: OOF, AutoReply`, `Precedence: bulk`); an auto-reply that answers
+    anyway is dropped by `mailloop` when it's marked as one.
+  - **Suppressed addresses are skipped, not mailed.** `sendBroadcast` checks every recipient
+    against `email_suppression` (`suppression::find_suppressed`, failing open like every other
+    instance-mail send) and records a suppressed one as `send_status = suppressed` with the reason,
+    never sending it. A broadcast's own hard bounce or complaint lands in that list the usual way.
+  - **Delivery tracking rides on the suppression feedback topic.** The `toolbox-mail-feedback`
+    event destination (`infra/ses_feedback.tf`) also carries `DELIVERY`, `DELIVERY_DELAY` and
+    `REJECT`, and `bin/inbound-mail`'s SNS handler passes every message to both
+    `suppression::record_feedback` (which ignores the extra types) and `broadcast_events::apply`.
+    Each broadcast send carries SES message tags `broadcast_id` and `broadcast_recipient` (its
+    index), echoed on every event, so an event updates `recipients[i]` by primary key — no GSI,
+    same reasoning as the reply tag. Ticket mail carries no tags and `broadcast_events` ignores its
+    events. Send-time status (`send_status`, by the API) and delivery status (`delivery_status`, by
+    the Lambda) are separate keys; delivery status only moves forward
+    (`BroadcastDeliveryStatus::rank`). A row is written `pending` before anything is sent and each
+    recipient's result as soon as its send returns, so a timeout mid-send leaves an accurate record.
+  - Not an MCP tool. If one is ever added, its description must say it sends customer email.
 
 - **Rows reference an instance by `id`, never by `slug`.** Slugs are editable and exist for
   humans; `id` is the foreign key every other table stores. Anything taking an instance from user

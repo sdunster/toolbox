@@ -746,6 +746,48 @@ Written by `create_credit_note` in one `TransactWriteItems` with the invoice's `
 
 ---
 
+### `{prefix}_broadcast`
+
+One announcement email sent from a support instance to a list of addresses, one copy per recipient —
+see CLAUDE.md's "Broadcasts" entry. Written by `sendBroadcast` (`Put`, then one `UpdateItem` per
+recipient as its send returns) and by the inbound-mail Lambda as SES delivery events arrive
+(`broadcast_events`). Never deleted.
+
+| Attribute     | Type | Role                   |
+| ------------- | ---- | ---------------------- |
+| `id`          | S    | Hash key (PK) — nanoid |
+| `instance_id` | S    | GSI hash key           |
+| `created_at`  | N    | GSI sort key           |
+
+**GSIs:**
+
+| GSI                            | Hash key      | Sort key     | Projection | Purpose                                     |
+| ------------------------------ | ------------- | ------------ | ---------- | ------------------------------------------- |
+| `instance_id-created_at-index` | `instance_id` | `created_at` | ALL        | The Broadcast page's history, newest first  |
+
+**Non-obvious attributes:**
+
+- `from_address`, `reply_to` (S) — the sending address (any local part on one of the instance's
+  inbound-address domains) and where replies go (an address that routes back to the instance, never
+  carrying a `+t…` reply tag).
+- `from_name` (S) — optional; omitted when blank.
+- `subject`, `body_text`, `created_by_user_id` (S), `created_at` (N).
+- `recipients` (L of M) — one map per recipient, in the order given, **updated in place by index**
+  (`recipients[i].…`). Each has `email` and `send_status` (`pending`/`sent`/`failed`/`suppressed` — the last for an address on
+  `email_suppression`, never sent — written by the
+  API) plus, when set, `provider_message_id`, `error` (a reserved word — `#err`), and the
+  provider-reported `delivery_status` (`delayed`/`delivered`/`bounced`/`rejected`/`complained`),
+  `delivery_rank`, `delivery_detail` and `delivery_updated_at` (written only by
+  `set_broadcast_delivery`). The two halves are written by different processes and never touch each
+  other's keys. `delivery_rank` (`db::BroadcastDeliveryStatus::rank`) is the condition that keeps a
+  late, less-final event (a `DeliveryDelay` after the `Bounce`) from overwriting a final one.
+
+An SES event finds its row and list index from the `broadcast_id`/`broadcast_recipient` message
+tags every broadcast send carries — a `GetItem`-shaped update by primary key, no GSI. The events
+arrive on the same `toolbox-mail-feedback` topic as suppression feedback.
+
+---
+
 ### `{prefix}_expense`
 
 Money an invoicing instance spent — a purchase, or a cents-per-km vehicle trip — optionally against

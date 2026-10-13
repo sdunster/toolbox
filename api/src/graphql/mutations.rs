@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::app::{App, HasDb, HasMail, HasStorage};
 use crate::auth::{self, AuthInfo};
+use crate::broadcast;
 use crate::db;
 use crate::db::Handler as _;
 use crate::inbound::{attachments, routing};
@@ -31,10 +32,11 @@ use super::auth::{AuthGuard, AuthRequirement, is_member, is_owner};
 use super::error::ApiError;
 use super::finance::{CreditNote, CreditNoteInput, RecordPaymentInput, SendDocumentInput};
 use super::query::{
-    ApiTokenInfo, BillableItem, BillableItemInput, CreateProjectInput, CreatedApiToken, Expense,
-    ExpenseInput, InboundAddressInfo, Instance, InstanceKindType, Invoice, InvoicingSettingsInput,
-    MembershipInfo, MembershipRoleType, NotificationSettingsInput, PasskeyInfo, Project, Ticket,
-    TicketMessage, TicketStatusType, UpdateProjectInput, User,
+    ApiTokenInfo, BillableItem, BillableItemInput, Broadcast, CreateProjectInput, CreatedApiToken,
+    Expense, ExpenseInput, InboundAddressInfo, Instance, InstanceKindType, Invoice,
+    InvoicingSettingsInput, MembershipInfo, MembershipRoleType, NotificationSettingsInput,
+    PasskeyInfo, Project, SendBroadcastInput, Ticket, TicketMessage, TicketStatusType,
+    UpdateProjectInput, User,
 };
 
 /// One code per address per this many seconds — cheap anti-spam for
@@ -963,7 +965,7 @@ async fn send_system_notification<A: App + HasDb + HasMail + Send + Sync>(
 /// little validation `inbound::routing::classify_for_storage` does for the
 /// same reason: perfect email validation is famously not worth attempting,
 /// and DynamoDB/SES will reject anything that matters more than this does.
-fn normalize_ticket_email(raw: &str) -> Result<String> {
+pub(crate) fn normalize_ticket_email(raw: &str) -> Result<String> {
     let lower = raw.trim().to_lowercase();
     let Some((local, domain)) = lower.split_once('@') else {
         return Err(anyhow!(
@@ -1641,6 +1643,169 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                 None
             }
         }
+    }
+
+    /// Send a broadcast email from a support instance: one copy per
+    /// recipient, each addressed to that recipient alone, from an address on
+    /// one of the instance's own domains. **Sends customer email that cannot
+    /// be unsent.** See CLAUDE.md's "Broadcasts" entry and `crate::broadcast`
+    /// for the rules, chiefly: a reply opens a *new* ticket for its sender —
+    /// one per reply, never a shared one — because a broadcast carries no
+    /// reply tag, no stored Message-ID and no `[#slug-n]` subject.
+    ///
+    /// **Owner-only — not superuser.** Mass mail from an instance's domain is
+    /// both a reputation risk (owner, like `addInboundAddress`) and customer
+    /// communication whose replies become tickets (the ticket side of the
+    /// superuser boundary). An invoicing, deleted or missing instance is
+    /// `NOT_FOUND`, per the kind-isolation rule.
+    ///
+    /// Everything is validated before anything is sent. Suppressed addresses
+    /// (`crate::suppression`) are recorded `SUPPRESSED` and skipped. The row
+    /// is then written with every other recipient `PENDING`, and each one's outcome
+    /// recorded as soon as its send returns — so a Lambda timeout mid-send
+    /// still leaves an accurate record. A single recipient's send failure is
+    /// recorded as `FAILED` and does not fail the mutation; later bounces and
+    /// complaints arrive through `broadcast_events`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn send_broadcast(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        input: SendBroadcastInput,
+    ) -> Result<Broadcast<A>> {
+        use futures_util::StreamExt as _;
+
+        let user_id = require_user_id(ctx)?;
+        let instance = self
+            .app
+            .db()
+            .get_instances(&[instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .filter(|i| !i.deleted && i.kind == db::InstanceKind::Support)
+            .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+        let addresses = self
+            .app
+            .db()
+            .list_inbound_addresses_by_instance(&instance.id)
+            .await?;
+        let valid = broadcast::validate(
+            broadcast::BroadcastInput {
+                from_address: &input.from_address,
+                from_name: input.from_name.as_deref(),
+                subject: &input.subject,
+                body: &input.body,
+                recipients: &input.recipients,
+            },
+            &instance,
+            &addresses,
+        )?;
+        // Build every copy up front: a MIME error fails the whole broadcast
+        // before anything has gone out.
+        let built = valid
+            .recipients
+            .iter()
+            .map(|r| broadcast::build_broadcast_message(&valid, &instance.signature, r))
+            .collect::<Result<Vec<_>>>()?;
+
+        // Addresses on the suppression list (a past hard bounce or
+        // complaint) are recorded as SUPPRESSED and never sent, like every
+        // other instance-mail send skips them. Fails open — see
+        // `crate::suppression`.
+        let suppressed: std::collections::HashMap<String, String> =
+            suppression::find_suppressed(&*self.app, &valid.recipients, "sendBroadcast")
+                .await
+                .into_iter()
+                .map(|s| (s.email.clone(), suppression::describe(&s)))
+                .collect();
+
+        let mut rec = db::Broadcast {
+            id: crate::dynamodb::new_id(),
+            instance_id: instance.id.clone(),
+            created_by_user_id: user_id,
+            created_at: crate::clock::now_sec(),
+            from_address: valid.from_address.clone(),
+            from_name: valid.from_name.clone(),
+            reply_to: valid.reply_to.clone(),
+            subject: valid.subject.clone(),
+            body_text: valid.body.clone(),
+            recipients: valid
+                .recipients
+                .iter()
+                .map(|email| match suppressed.get(email) {
+                    Some(why) => db::BroadcastRecipient {
+                        send_status: db::BroadcastSendStatus::Suppressed,
+                        error: Some(why.clone()),
+                        ..db::BroadcastRecipient::pending(email)
+                    },
+                    None => db::BroadcastRecipient::pending(email),
+                })
+                .collect(),
+        };
+        self.app.db().create_broadcast(&rec).await?;
+
+        let app = &self.app;
+        let broadcast_id = rec.id.as_str();
+        let results: Vec<(usize, db::BroadcastSendResult)> = futures_util::stream::iter(
+            built
+                .into_iter()
+                .enumerate()
+                .filter(|(index, _)| !suppressed.contains_key(&valid.recipients[*index])),
+        )
+        .map(|(index, msg)| async move {
+            let tags = broadcast::send_tags(broadcast_id, index);
+            let result = match app
+                .mail()
+                .send_raw_tagged(&msg.raw, &msg.to, &msg.cc, &tags)
+                .await
+            {
+                Ok(message_id) => db::BroadcastSendResult {
+                    status: db::BroadcastSendStatus::Sent,
+                    provider_message_id: Some(message_id),
+                    error: None,
+                },
+                Err(e) => {
+                    warn!(broadcast_id, index, "broadcast send failed: {e:#}");
+                    db::BroadcastSendResult {
+                        status: db::BroadcastSendStatus::Failed,
+                        provider_message_id: None,
+                        error: Some(format!("{e:#}")),
+                    }
+                }
+            };
+            if let Err(e) = app
+                .db()
+                .set_broadcast_send_result(broadcast_id, index, &result)
+                .await
+            {
+                // The mail is already out (or not); a lost status
+                // write only leaves this recipient showing PENDING.
+                warn!(
+                    broadcast_id,
+                    index, "could not record broadcast send result: {e:#}"
+                );
+            }
+            (index, result)
+        })
+        .buffer_unordered(broadcast::SEND_CONCURRENCY)
+        .collect()
+        .await;
+
+        for (index, result) in results {
+            let r = &mut rec.recipients[index];
+            r.send_status = result.status;
+            r.provider_message_id = result.provider_message_id;
+            r.error = result.error;
+        }
+        info!(
+            broadcast_id = rec.id,
+            instance_id = rec.instance_id,
+            recipients = rec.recipients.len(),
+            "broadcast sent"
+        );
+        Ok(Broadcast::new(rec))
     }
 
     /// Add an inbound address to an instance. Owner-or-superuser — see

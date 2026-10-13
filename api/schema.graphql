@@ -173,6 +173,74 @@ enum BillableItemStatusType {
 	INVOICED
 }
 
+type Broadcast {
+	id: ID!
+	fromAddress: String!
+	"""
+	Named `sender_name`, not `from_name` — see `Instance.fromName`'s
+	comment for the async-graphql quirk.
+	"""
+	fromName: String!
+	replyTo: String!
+	subject: String!
+	body: String!
+	createdAt: Int!
+	recipients: [BroadcastRecipient!]!
+	recipientCount: Int!
+	sentCount: Int!
+	failedCount: Int!
+	"""
+	Skipped because the address is on the suppression list.
+	"""
+	suppressedCount: Int!
+	deliveredCount: Int!
+	"""
+	Bounced or rejected — either way, it never arrived.
+	"""
+	bouncedCount: Int!
+	complainedCount: Int!
+	"""
+	Dataloaded — see [`TicketMessage::author`]'s doc comment.
+	"""
+	createdBy: User
+}
+
+"""
+`BroadcastRecipient.deliveryStatus` — see `db::BroadcastDeliveryStatus`.
+"""
+enum BroadcastDeliveryStatusType {
+	DELAYED
+	DELIVERED
+	BOUNCED
+	REJECTED
+	COMPLAINED
+}
+
+"""
+One recipient of a broadcast: what happened when it was sent
+(`sendStatus`/`error`), and what SES reported afterwards
+(`deliveryStatus`/`deliveryDetail`, `null` until an event arrives — see
+`broadcast_events`).
+"""
+type BroadcastRecipient {
+	email: String!
+	sendStatus: BroadcastSendStatusType!
+	error: String
+	deliveryStatus: BroadcastDeliveryStatusType
+	deliveryDetail: String
+	deliveryUpdatedAt: Int
+}
+
+"""
+`BroadcastRecipient.sendStatus` — see `db::BroadcastSendStatus`.
+"""
+enum BroadcastSendStatusType {
+	PENDING
+	SENT
+	FAILED
+	SUPPRESSED
+}
+
 """
 `createProject`'s argument.
 
@@ -574,6 +642,21 @@ type Instance {
 	here — see `createApiToken`'s doc comment for the only time it does.
 	"""
 	apiTokens: [ApiTokenInfo!]!
+	"""
+	This instance's broadcasts, newest first (at most `first`, default
+	25, max 100). Owner-only — **not** superuser: a broadcast is
+	customer communication, the ticket side of the superuser boundary in
+	CLAUDE.md. `null`-free empty list for an invoicing instance, which
+	can't send one.
+	"""
+	broadcasts(first: Int! = 25): [Broadcast!]!
+	"""
+	The domains a broadcast from this instance may be sent from — the
+	domains of its inbound addresses (`broadcast::instance_mail_domains`).
+	Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+	instance.
+	"""
+	broadcastFromDomains: [String!]!
 }
 
 """
@@ -928,6 +1011,30 @@ type MutationRoot {
 	`tests/submit_code_dynamodb_local.rs` for the regression tests.
 	"""
 	verifySubmitCode(slug: String!, email: String!, code: String!): String
+	"""
+	Send a broadcast email from a support instance: one copy per
+	recipient, each addressed to that recipient alone, from an address on
+	one of the instance's own domains. **Sends customer email that cannot
+	be unsent.** See CLAUDE.md's "Broadcasts" entry and `crate::broadcast`
+	for the rules, chiefly: a reply opens a *new* ticket for its sender —
+	one per reply, never a shared one — because a broadcast carries no
+	reply tag, no stored Message-ID and no `[#slug-n]` subject.
+	
+	**Owner-only — not superuser.** Mass mail from an instance's domain is
+	both a reputation risk (owner, like `addInboundAddress`) and customer
+	communication whose replies become tickets (the ticket side of the
+	superuser boundary). An invoicing, deleted or missing instance is
+	`NOT_FOUND`, per the kind-isolation rule.
+	
+	Everything is validated before anything is sent. Suppressed addresses
+	(`crate::suppression`) are recorded `SUPPRESSED` and skipped. The row
+	is then written with every other recipient `PENDING`, and each one's outcome
+	recorded as soon as its send returns — so a Lambda timeout mid-send
+	still leaves an accurate record. A single recipient's send failure is
+	recorded as `FAILED` and does not fail the mutation; later bounces and
+	complaints arrive through `broadcast_events`.
+	"""
+	sendBroadcast(instanceId: ID!, input: SendBroadcastInput!): Broadcast!
 	"""
 	Add an inbound address to an instance. Owner-or-superuser — see
 	`Instance::inbound_addresses`'s doc comment. `address` is normalized
@@ -2016,6 +2123,18 @@ enum ReportBasisType {
 	By issue date.
 	"""
 	ACCRUAL
+}
+
+"""
+`sendBroadcast`'s argument. `fromName` defaults to the instance's own
+from-name. See `broadcast::validate` for every rule.
+"""
+input SendBroadcastInput {
+	fromAddress: String!
+	fromName: String
+	subject: String!
+	body: String!
+	recipients: [String!]!
 }
 
 """

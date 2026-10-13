@@ -37,6 +37,7 @@ aws-sdk-sesv2 = { version = "1.89.0", default-features = false, features = ["def
 aws-sdk-sqs = { version = "1.89.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 aws_lambda_events = { version = "1.2.0", default-features = false, features = ["sqs", "ses", "sns"] }
 lambda_http = "1.2"
+futures-util = "0.3.34"
 lambda_runtime = "1.2"
 base64 = "0.22.1"
 chrono = "0.4.42"

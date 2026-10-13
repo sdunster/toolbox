@@ -4332,6 +4332,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "form_urlencoded",
+ "futures-util",
  "hex",
  "hmac 0.12.1",
  "http 1.5.0",
