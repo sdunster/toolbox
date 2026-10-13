@@ -55,6 +55,26 @@ fn ticket_schema() -> Value {
     })
 }
 
+/// `get_ticket`'s ticket: [`ticket_schema`] plus `undeliverableEmails`, which
+/// list tools leave out (it's a lookup per ticket).
+fn ticket_detail_schema() -> Value {
+    let mut schema = ticket_schema();
+    schema["properties"]["undeliverableEmails"] = json!({
+        "type": "array",
+        "description": "Requesters/CCs Toolbox will not email because a past message to them \
+            bounced permanently (HARD_BOUNCE) or they marked it as spam (COMPLAINT). Replies \
+            and notices skip them; ask the customer for another address instead.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "email": { "type": "string" },
+                "reason": { "type": "string", "enum": ["HARD_BOUNCE", "COMPLAINT"] },
+            },
+        },
+    });
+    schema
+}
+
 fn message_schema() -> Value {
     json!({
         "type": "object",
@@ -146,7 +166,7 @@ pub fn catalogue() -> Vec<Value> {
             "outputSchema": {
                 "type": "object",
                 "properties": {
-                    "ticket": ticket_schema(),
+                    "ticket": ticket_detail_schema(),
                     "messages": { "type": "array", "items": message_schema() },
                 },
                 "required": ["ticket", "messages"],
@@ -159,7 +179,9 @@ pub fn catalogue() -> Vec<Value> {
             "description": "Send a reply on a ticket. **This emails the ticket's requesters and \
                 CCs** with your message as written, so it is customer-facing and cannot be \
                 unsent — use `add_internal_note` for anything internal. Plain text. Fails, \
-                without recording anything as delivered, if the email can't be sent.",
+                without recording anything as delivered, if the email can't be sent. \
+                Addresses in `get_ticket`'s `undeliverableEmails` are skipped; if that \
+                leaves nobody, it fails without sending.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -456,7 +478,7 @@ where
     };
     let doc = format!(
         "query McpTicket($id: ID!) {{ ticket(id: $id) {{ {TICKET_FIELDS} \
-         messages {{ {MESSAGE_FIELDS} }} }} }}"
+         undeliverableEmails {{ email reason }} messages {{ {MESSAGE_FIELDS} }} }} }}"
     );
     match ctx.run(&doc, json!({"id": id})).await {
         Err(e) => ToolOutcome::Error(e),

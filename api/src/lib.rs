@@ -26,6 +26,7 @@ pub mod server;
 pub mod sesmail;
 pub mod staff_notify;
 pub mod storage;
+pub mod suppression;
 pub mod telemetry;
 pub mod turnstile;
 

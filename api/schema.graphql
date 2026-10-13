@@ -2046,6 +2046,21 @@ type SubmittedTicket {
 	subjectTag: String!
 }
 
+"""
+Why an address is on the suppression list — `db::SuppressionReason`
+over GraphQL.
+"""
+enum SuppressionReasonType {
+	"""
+	A permanent bounce: the mailbox doesn't exist or refuses mail.
+	"""
+	HARD_BOUNCE
+	"""
+	The recipient marked our mail as spam.
+	"""
+	COMPLAINT
+}
+
 type Ticket {
 	id: ID!
 	instanceId: ID!
@@ -2060,6 +2075,13 @@ type Ticket {
 	status: TicketStatusType!
 	requesterEmails: [String!]!
 	ccEmails: [String!]!
+	"""
+	Which of `requesterEmails`/`ccEmails` Toolbox will not mail, because
+	SES reported a hard bounce or a spam complaint for them — replies and
+	notices skip these. Members only (`FORBIDDEN` otherwise): it's for
+	the agent deciding who to contact, not for a requester's view.
+	"""
+	undeliverableEmails: [UndeliverableEmail!]!
 	assigneeUserId: ID
 	"""
 	Dataloaded — see [`TicketMessage::author`]'s doc comment.
@@ -2175,6 +2197,17 @@ enum TicketStatusType {
 	OPEN
 	CLOSED
 	DELETED
+}
+
+"""
+An address Toolbox no longer mails — see `crate::suppression`. Only
+ever exposed for an address already on a ticket the caller can see,
+and without saying which instance's mail triggered it.
+"""
+type UndeliverableEmail {
+	email: String!
+	reason: SuppressionReasonType!
+	suppressedAt: Int!
 }
 
 """

@@ -874,6 +874,31 @@ resource "aws_dynamodb_table" "ephemeral_state" {
   }
 }
 
+# ── email_suppression ────────────────────────────────────────────────────────
+# Addresses Toolbox stops mailing after SES reports a hard bounce or a spam
+# complaint (api/src/suppression.rs, written by the inbound-mail Lambda from
+# the configuration set's feedback events — ses_feedback.tf). Hash key `id` is
+# the lowercased address itself, so a send checks its recipients with one
+# BatchGetItem. Durable: an address stays suppressed until an operator removes
+# it (`cli suppression remove`).
+
+resource "aws_dynamodb_table" "email_suppression" {
+  name                        = "${var.db_prefix}_email_suppression"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "id"
+  deletion_protection_enabled = true
+
+  point_in_time_recovery {
+    enabled                 = true
+    recovery_period_in_days = 35
+  }
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+}
+
 # ── processed_message ────────────────────────────────────────────────────────
 # Inbound-mail idempotency: one row per SES message id, written with a
 # conditional PutItem (attribute_not_exists(ses_message_id)) before any other

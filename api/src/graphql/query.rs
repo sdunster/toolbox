@@ -886,6 +886,45 @@ pub enum TicketStatusFilterType {
     Deleted,
 }
 
+/// Why an address is on the suppression list — `db::SuppressionReason`
+/// over GraphQL.
+#[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
+pub enum SuppressionReasonType {
+    /// A permanent bounce: the mailbox doesn't exist or refuses mail.
+    HardBounce,
+    /// The recipient marked our mail as spam.
+    Complaint,
+}
+
+impl From<db::SuppressionReason> for SuppressionReasonType {
+    fn from(r: db::SuppressionReason) -> Self {
+        match r {
+            db::SuppressionReason::HardBounce => Self::HardBounce,
+            db::SuppressionReason::Complaint => Self::Complaint,
+        }
+    }
+}
+
+/// An address Toolbox no longer mails — see `crate::suppression`. Only
+/// ever exposed for an address already on a ticket the caller can see,
+/// and without saying which instance's mail triggered it.
+#[derive(SimpleObject, Clone, Debug)]
+pub struct UndeliverableEmail {
+    pub email: String,
+    pub reason: SuppressionReasonType,
+    pub suppressed_at: i64,
+}
+
+impl From<db::EmailSuppression> for UndeliverableEmail {
+    fn from(s: db::EmailSuppression) -> Self {
+        Self {
+            email: s.email,
+            reason: s.reason.into(),
+            suppressed_at: s.suppressed_at as i64,
+        }
+    }
+}
+
 /// `ticket_message.kind`, exposed over GraphQL.
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum TicketMessageKindType {
@@ -1110,6 +1149,34 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> Ticket<A> {
     }
     async fn cc_emails(&self) -> &[String] {
         &self.rec.cc_emails
+    }
+    /// Which of `requesterEmails`/`ccEmails` Toolbox will not mail, because
+    /// SES reported a hard bounce or a spam complaint for them — replies and
+    /// notices skip these. Members only (`FORBIDDEN` otherwise): it's for
+    /// the agent deciding who to contact, not for a requester's view.
+    async fn undeliverable_emails(&self, ctx: &Context<'_>) -> Result<Vec<UndeliverableEmail>> {
+        match ctx.data_opt::<AuthInfo>() {
+            Some(AuthInfo::User { memberships, .. })
+                if is_member(memberships, &self.rec.instance_id) => {}
+            _ => {
+                return Err(ApiError::forbidden("Not a member of this ticket's instance").into());
+            }
+        }
+        let app = ctx.data_unchecked::<Arc<A>>();
+        let emails: Vec<String> = self
+            .rec
+            .requester_emails
+            .iter()
+            .chain(&self.rec.cc_emails)
+            .cloned()
+            .collect();
+        Ok(
+            crate::suppression::find_suppressed(&**app, &emails, "Ticket.undeliverableEmails")
+                .await
+                .into_iter()
+                .map(UndeliverableEmail::from)
+                .collect(),
+        )
     }
     async fn assignee_user_id(&self) -> Option<ID> {
         self.rec.assignee_user_id.clone().map(ID)

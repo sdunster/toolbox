@@ -37,6 +37,9 @@ resource "aws_lambda_function" "inbound_mail" {
   }
 }
 
+# A second trigger, not configured here: ses_feedback.tf's SNS topic invokes
+# this function directly with bounce/complaint events (aws_lambda_permission
+# + an SNS subscription). The binary tells the two event shapes apart itself.
 resource "aws_lambda_event_source_mapping" "inbound_mail" {
   event_source_arn = aws_sqs_queue.inbound_mail.arn
   function_name    = aws_lambda_function.inbound_mail.arn

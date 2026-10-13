@@ -711,6 +711,38 @@ async fn send_invoice_mails_the_client_with_the_pdf() {
     assert!(error_message(&r).contains("no client email"));
 }
 
+/// A recipient Toolbox has suppressed (a hard bounce or complaint —
+/// `toolbox::suppression`) makes `sendInvoice` refuse, naming it, rather
+/// than quietly mailing only the others.
+#[tokio::test]
+async fn send_invoice_refuses_a_suppressed_recipient() {
+    let _ = require_local_db!();
+    let Some(w) = setup("sendsupp").await else {
+        return;
+    };
+    let inv = invoice(
+        &w,
+        &[item(&w, &w.project_id, "1", None, false).await],
+        "2026-08-01",
+        None,
+    )
+    .await;
+    let dead = format!("dead-{}@example.com", nanoid::nanoid!(8)).to_lowercase();
+    w.db()
+        .record_email_suppression(&dead, db::SuppressionReason::HardBounce, None, 1)
+        .await
+        .unwrap();
+    let r = w
+        .run(
+            "mutation($id: ID!, $input: SendDocumentInput) { sendInvoice(invoiceId: $id, input: $input) { sentAt } }",
+            json!({ "id": str_of(&inv, "id"), "input": { "cc": [dead] } }),
+        )
+        .await;
+    assert_eq!(error_code(&r), "CONFLICT");
+    assert!(error_message(&r).contains(&dead), "{r:?}");
+    assert!(w.s.app.mail.sent_raw().is_empty());
+}
+
 async fn expense(w: &World, project_id: Option<&str>) -> String {
     let r = w
         .run(

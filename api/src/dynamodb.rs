@@ -342,6 +342,34 @@ impl TryInto<db::ApiToken> for Item {
     }
 }
 
+impl TryInto<db::EmailSuppression> for Item {
+    type Error = HydrationError;
+    fn try_into(self) -> Result<db::EmailSuppression, Self::Error> {
+        let reason_str = self
+            .string_field("reason")?
+            .ok_or_else(|| anyhow!("EmailSuppression missing reason"))?;
+        let suppressed_at = self
+            .i64_field("suppressed_at")?
+            .ok_or_else(|| anyhow!("EmailSuppression missing suppressed_at"))?
+            as u64;
+        Ok(db::EmailSuppression {
+            email: self.id()?,
+            reason: db::SuppressionReason::parse(&reason_str)
+                .ok_or_else(|| anyhow!("EmailSuppression has unknown reason {reason_str:?}"))?,
+            detail: self.string_field("detail")?,
+            suppressed_at,
+            last_event_at: self
+                .i64_field("last_event_at")?
+                .map(|i| i as u64)
+                .unwrap_or(suppressed_at),
+            event_count: self
+                .i64_field("event_count")?
+                .map(|i| i as u64)
+                .unwrap_or(1),
+        })
+    }
+}
+
 impl TryInto<db::WebauthnCredential> for Item {
     type Error = HydrationError;
     fn try_into(self) -> Result<db::WebauthnCredential, Self::Error> {
@@ -5377,6 +5405,82 @@ impl db::Handler for Handler {
             }
             Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
         }
+    }
+
+    // ── email_suppression ─────────────────────────────────────────────────
+
+    async fn get_email_suppressions<T: AsRef<str> + Sync>(
+        &self,
+        emails: &[T],
+    ) -> db::Result<Vec<Option<db::EmailSuppression>>> {
+        if emails.is_empty() {
+            return Ok(vec![]);
+        }
+        self.get_records("email_suppression", emails).await
+    }
+
+    async fn record_email_suppression(
+        &self,
+        email: &str,
+        reason: db::SuppressionReason,
+        detail: Option<&str>,
+        now: u64,
+    ) -> db::Result<()> {
+        self.ensure_writable()?;
+        // `detail` is optional, so it only appears in the expression when
+        // there is one — never written as Null (CLAUDE.md house rule).
+        let mut set = vec![
+            "reason = if_not_exists(reason, :reason)",
+            "suppressed_at = if_not_exists(suppressed_at, :now)",
+            "last_event_at = :now",
+        ];
+        let mut builder = self
+            .client
+            .update_item()
+            .table_name(self.table_name("email_suppression"))
+            .key("id", AttributeValue::S(email.to_string()))
+            .expression_attribute_values(":reason", AttributeValue::S(reason.as_str().to_string()))
+            .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+            .expression_attribute_values(":one", AttributeValue::N("1".to_string()));
+        if let Some(detail) = detail {
+            set.push("detail = if_not_exists(detail, :detail)");
+            builder = builder
+                .expression_attribute_values(":detail", AttributeValue::S(detail.to_string()));
+        }
+        let resp = builder
+            .update_expression(format!("SET {} ADD event_count :one", set.join(", ")))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        record_capacity(
+            "record_email_suppression",
+            resp.consumed_capacity(),
+            CapKind::Write,
+        );
+        Ok(())
+    }
+
+    async fn delete_email_suppression(&self, email: &str) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .delete_item()
+            .table_name(self.table_name("email_suppression"))
+            .key("id", AttributeValue::S(email.to_string()))
+            .return_values(ReturnValue::AllOld)
+            .send()
+            .await
+            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+        Ok(resp.attributes().is_some_and(|a| !a.is_empty()))
+    }
+
+    async fn scan_email_suppressions(
+        &self,
+        cursor: Option<db::ScanCursor>,
+    ) -> db::Result<db::ScanPage<db::EmailSuppression>> {
+        self.scan_page("scan_email_suppressions", "email_suppression", cursor, 100)
+            .await
     }
 
     // ── webauthn_credential ───────────────────────────────────────────────

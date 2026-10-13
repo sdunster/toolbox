@@ -50,6 +50,11 @@ function baseTicket() {
     assignee: null,
     requesterEmails: ["customer@example.com"],
     ccEmails: [],
+    undeliverableEmails: [] as {
+      email: string;
+      reason: string;
+      suppressedAt: number;
+    }[],
     instance: {
       __typename: "Instance",
       id: "inst-1",
@@ -159,6 +164,40 @@ describe("TicketThread — message kinds", () => {
   });
 });
 
+describe("TicketThread — undeliverable addresses", () => {
+  it("flags a requester or CC that Toolbox won't mail", async () => {
+    server.use(
+      relayEndpoint.query("TicketThreadHarnessQuery", () =>
+        HttpResponse.json({
+          data: {
+            ticket: {
+              ...baseTicket(),
+              ccEmails: ["gone@example.com"],
+              undeliverableEmails: [
+                {
+                  email: "gone@example.com",
+                  reason: "HARD_BOUNCE",
+                  suppressedAt: 1_760_000_000,
+                },
+              ],
+            },
+          },
+        }),
+      ),
+    );
+
+    renderHarness();
+
+    const chip = (await screen.findByText("(undeliverable)")).closest("li");
+    expect(chip).toHaveTextContent("gone@example.com");
+    expect(chip?.getAttribute("title")).toMatch(/bounced permanently/);
+    // The working requester carries no such flag.
+    expect(
+      screen.getAllByText("(undeliverable)", { exact: false }),
+    ).toHaveLength(1);
+  });
+});
+
 describe("TicketThread — reply mutation", () => {
   it("appends a reply to the thread without a full query refetch", async () => {
     let harnessCalls = 0;
@@ -211,6 +250,37 @@ describe("TicketThread — reply mutation", () => {
     // mutation's own updater (appending onto `ticket.messages`), not a
     // second round trip through the ticket query.
     expect(harnessCalls).toBe(1);
+  });
+
+  it("shows why a reply was refused when nobody can receive it", async () => {
+    const refusal =
+      "Every recipient of this ticket is undeliverable: customer@example.com (hard bounce). Add a working address before replying.";
+    server.use(
+      relayEndpoint.query("TicketThreadHarnessQuery", () =>
+        HttpResponse.json({ data: { ticket: baseTicket() } }),
+      ),
+      relayEndpoint.mutation("ReplyFormMutation", () =>
+        HttpResponse.json({
+          data: null,
+          errors: [
+            {
+              message: refusal,
+              path: ["replyToTicket"],
+              extensions: { code: "CONFLICT" },
+            },
+          ],
+        }),
+      ),
+    );
+
+    const user = UserEvent.setup();
+    renderHarness();
+
+    await screen.findByText("It's actually on fire, please help.");
+    await user.type(screen.getByLabelText("Reply to customer"), "Hello?");
+    await user.click(screen.getByRole("button", { name: "Send reply" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(refusal);
   });
 });
 

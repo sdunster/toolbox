@@ -153,6 +153,7 @@ async fn list_and_get_follow_membership() {
     .await
     .unwrap();
     assert_eq!(got["ticket"]["subject"], "first");
+    assert_eq!(got["ticket"]["undeliverableEmails"], json!([]));
     assert_eq!(got["messages"][0]["kind"], "INBOUND");
     assert_eq!(got["messages"][0]["bodyText"], "Something is broken");
 

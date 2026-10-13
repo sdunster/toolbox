@@ -46,6 +46,7 @@ use crate::mailloop::{self, DropReason};
 use crate::outbound;
 use crate::staff_notify::{self, Actor, StaffEvent};
 use crate::storage;
+use crate::suppression;
 
 /// How long a `processed_message` idempotency row is retained. Long enough
 /// to outlast SQS's redelivery window (the queue's visibility timeout plus
@@ -615,11 +616,24 @@ async fn notify_others<A: App + HasDb + HasMail + Send + Sync>(
     };
     let threading = outbound::threading_for(&prior);
 
+    // Suppressed addresses (`crate::suppression`) are skipped here like
+    // every other instance mail.
+    let recipients = suppression::filter_recipients(app, recipients, &[], "notify")
+        .await
+        .to;
+    if recipients.is_empty() {
+        tracing::info!(
+            ses_message_id,
+            "notify: every other recipient is suppressed; nothing sent"
+        );
+        return None;
+    }
+
     let built = match outbound::build_outbound(
         &instance,
         &addresses,
         ticket,
-        recipients,
+        &recipients,
         &[],
         body,
         &threading,

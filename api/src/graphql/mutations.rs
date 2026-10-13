@@ -25,6 +25,7 @@ use crate::mail::Handler as _;
 use crate::outbound;
 use crate::staff_notify::{self, Actor, StaffEvent};
 use crate::storage::Handler as _;
+use crate::suppression;
 
 use super::auth::{AuthGuard, AuthRequirement, is_member, is_owner};
 use super::error::ApiError;
@@ -643,6 +644,29 @@ async fn write_payments<A: App + HasDb + Send + Sync>(
     }))
 }
 
+/// Refuse `sendInvoice`/`sendCreditNote` outright when any recipient is on
+/// the suppression list (`crate::suppression`), naming them. Unlike ticket
+/// mail, these recipients are chosen per send, so the caller can simply pick
+/// another address — quietly sending to only some of them would leave
+/// `sentTo` claiming a delivery the user didn't intend.
+async fn refuse_suppressed_recipients<A: HasDb + Sync>(
+    app: &A,
+    to: &[String],
+    cc: &[String],
+    context: &str,
+) -> Result<()> {
+    let all: Vec<String> = to.iter().chain(cc).cloned().collect();
+    let suppressed = suppression::find_suppressed(app, &all, context).await;
+    if suppressed.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "Undeliverable address: {}. Send to a different address.",
+        suppression::describe_all(&suppressed)
+    ))
+    .into())
+}
+
 /// Resolve `sendInvoice`/`sendCreditNote`'s recipients (an empty `to`
 /// means the project's client email) and covering message.
 fn resolve_send_input(
@@ -854,12 +878,21 @@ async fn send_system_notification<A: App + HasDb + HasMail + Send + Sync>(
     else {
         return;
     };
+    let recipients =
+        suppression::filter_recipients(app, requester_emails, cc_emails, context).await;
+    if recipients.to.is_empty() && recipients.cc.is_empty() {
+        info!(
+            "{context}: every recipient of ticket {} is suppressed; no notification sent",
+            ticket.id
+        );
+        return;
+    }
     let built = match outbound::build_outbound(
         &instance,
         &addresses,
         ticket,
-        requester_emails,
-        cc_emails,
+        &recipients.to,
+        &recipients.cc,
         body,
         &outbound::Threading::default(),
     ) {
@@ -2516,6 +2549,28 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             .list_inbound_addresses_by_instance(&instance.id)
             .await?;
 
+        // Suppressed addresses (a past hard bounce or spam complaint —
+        // `crate::suppression`) are left off this reply, and off the stored
+        // row's `to`/`cc`. If that leaves nobody, refuse before persisting
+        // anything, naming them: the agent needs to fix the recipients, and
+        // a row for a reply nobody could receive would only mislead.
+        let recipients = suppression::filter_recipients(
+            &*self.app,
+            &ticket.requester_emails,
+            &ticket.cc_emails,
+            "replyToTicket",
+        )
+        .await;
+        if recipients.to.is_empty() && recipients.cc.is_empty() && !recipients.suppressed.is_empty()
+        {
+            return Err(ApiError::conflict(format!(
+                "Every recipient of this ticket is undeliverable: {}. Add a working address \
+                 before replying.",
+                suppression::describe_all(&recipients.suppressed)
+            ))
+            .into());
+        }
+
         // Built (and can fail on a configuration problem — no inbound
         // address, no recipients left once our own are excluded) *before*
         // anything is persisted, so a reply that can't possibly be sent
@@ -2526,8 +2581,8 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             &instance,
             &addresses,
             &ticket,
-            &ticket.requester_emails,
-            &ticket.cc_emails,
+            &recipients.to,
+            &recipients.cc,
             body,
             &threading,
         )?;
@@ -4424,6 +4479,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             .flatten()
             .ok_or_else(|| ApiError::not_found("Project", invoice.project_id.as_str()))?;
         let (to, cc, message) = resolve_send_input(&input, project.client_email.as_deref())?;
+        refuse_suppressed_recipients(&*self.app, &to, &cc, "sendInvoice").await?;
         let snapshot = invoice_snapshot(&invoice)?;
         let filename = invoice_pdf_filename(&invoice);
         let (key, bytes) = document_pdf(
@@ -4712,6 +4768,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             .flatten()
             .ok_or_else(|| ApiError::not_found("Project", note.project_id.as_str()))?;
         let (to, cc, message) = resolve_send_input(&input, project.client_email.as_deref())?;
+        refuse_suppressed_recipients(&*self.app, &to, &cc, "sendCreditNote").await?;
         let snapshot = credit_note_snapshot(&note)?;
         let filename = credit_note_pdf_filename(&note);
         let (key, bytes) = document_pdf(

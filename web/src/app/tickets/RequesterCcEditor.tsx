@@ -13,13 +13,35 @@ const requesterCcEditorFragment = graphql`
     id
     requesterEmails
     ccEmails
+    undeliverableEmails {
+      email
+      reason
+      suppressedAt
+    }
   }
 `;
+
+type Undeliverable = {
+  readonly email: string;
+  readonly reason: string;
+  readonly suppressedAt: number;
+};
+
+/** Hover text for an address Toolbox won't mail (`Ticket.undeliverableEmails`). */
+function undeliverableTitle(u: Undeliverable): string {
+  const why =
+    u.reason === "COMPLAINT"
+      ? "marked our mail as spam"
+      : "bounced permanently (the mailbox doesn't exist or refuses mail)";
+  const since = new Date(u.suppressedAt * 1000).toLocaleDateString();
+  return `Undeliverable: this address ${why} on ${since}. Replies and notices skip it.`;
+}
 
 /** One editable email chip list: requesters (`To`) or CCs. */
 function EmailList({
   label,
   emails,
+  undeliverable,
   disabled,
   canRemove,
   onAdd,
@@ -27,6 +49,7 @@ function EmailList({
 }: {
   label: string;
   emails: readonly string[];
+  undeliverable: ReadonlyMap<string, Undeliverable>;
   disabled: boolean;
   canRemove: (email: string) => boolean;
   onAdd: (email: string) => void;
@@ -38,25 +61,35 @@ function EmailList({
     <div>
       <h3 className="text-sm font-semibold text-ink-muted">{label}</h3>
       <ul className="mt-1.5 flex flex-wrap gap-1.5">
-        {emails.map((email) => (
-          <li
-            key={email}
-            className="flex items-center gap-1 rounded-full bg-surface-sunken px-2.5 py-1 text-xs text-ink"
-          >
-            {email}
-            {canRemove(email) && (
-              <button
-                type="button"
-                aria-label={`Remove ${email} from ${label}`}
-                className="cursor-pointer text-ink-muted hover:text-ink"
-                disabled={disabled}
-                onClick={() => onRemove(email)}
-              >
-                ×
-              </button>
-            )}
-          </li>
-        ))}
+        {emails.map((email) => {
+          const bad = undeliverable.get(email.toLowerCase());
+          return (
+            <li
+              key={email}
+              title={bad ? undeliverableTitle(bad) : undefined}
+              className={
+                bad
+                  ? "flex items-center gap-1 rounded-full bg-amber-100 px-2.5 py-1 text-xs text-amber-900 dark:bg-amber-900/40 dark:text-amber-200"
+                  : "flex items-center gap-1 rounded-full bg-surface-sunken px-2.5 py-1 text-xs text-ink"
+              }
+            >
+              {bad && <span aria-hidden="true">⚠</span>}
+              {email}
+              {bad && <span className="sr-only"> (undeliverable)</span>}
+              {canRemove(email) && (
+                <button
+                  type="button"
+                  aria-label={`Remove ${email} from ${label}`}
+                  className="cursor-pointer text-ink-muted hover:text-ink"
+                  disabled={disabled}
+                  onClick={() => onRemove(email)}
+                >
+                  ×
+                </button>
+              )}
+            </li>
+          );
+        })}
       </ul>
       <form
         className="mt-2 flex gap-2"
@@ -108,6 +141,11 @@ export function RequesterCcEditor({
         addTicketRequester(ticketId: $ticketId, email: $email) {
           id
           requesterEmails
+          undeliverableEmails {
+            email
+            reason
+            suppressedAt
+          }
         }
       }
     `);
@@ -120,6 +158,11 @@ export function RequesterCcEditor({
         removeTicketRequester(ticketId: $ticketId, email: $email) {
           id
           requesterEmails
+          undeliverableEmails {
+            email
+            reason
+            suppressedAt
+          }
         }
       }
     `);
@@ -128,6 +171,11 @@ export function RequesterCcEditor({
       addTicketCc(ticketId: $ticketId, email: $email) {
         id
         ccEmails
+        undeliverableEmails {
+          email
+          reason
+          suppressedAt
+        }
       }
     }
   `);
@@ -140,18 +188,27 @@ export function RequesterCcEditor({
         removeTicketCc(ticketId: $ticketId, email: $email) {
           id
           ccEmails
+          undeliverableEmails {
+            email
+            reason
+            suppressedAt
+          }
         }
       }
     `,
   );
 
   const busy = addingRequester || removingRequester || addingCc || removingCc;
+  const undeliverable = new Map(
+    data.undeliverableEmails.map((u) => [u.email.toLowerCase(), u]),
+  );
 
   return (
     <div className="flex flex-col gap-4">
       <EmailList
         label="Requesters"
         emails={data.requesterEmails}
+        undeliverable={undeliverable}
         disabled={busy}
         canRemove={() => data.requesterEmails.length > 1}
         onAdd={(email) => {
@@ -161,6 +218,7 @@ export function RequesterCcEditor({
             optimisticResponse: {
               addTicketRequester: {
                 id: data.id,
+                undeliverableEmails: data.undeliverableEmails,
                 requesterEmails: data.requesterEmails.includes(email)
                   ? data.requesterEmails
                   : [...data.requesterEmails, email],
@@ -176,6 +234,7 @@ export function RequesterCcEditor({
             optimisticResponse: {
               removeTicketRequester: {
                 id: data.id,
+                undeliverableEmails: data.undeliverableEmails,
                 requesterEmails: data.requesterEmails.filter(
                   (e) => e !== email,
                 ),
@@ -189,6 +248,7 @@ export function RequesterCcEditor({
       <EmailList
         label="CC"
         emails={data.ccEmails}
+        undeliverable={undeliverable}
         disabled={busy}
         canRemove={() => true}
         onAdd={(email) => {
@@ -198,6 +258,7 @@ export function RequesterCcEditor({
             optimisticResponse: {
               addTicketCc: {
                 id: data.id,
+                undeliverableEmails: data.undeliverableEmails,
                 ccEmails: data.ccEmails.includes(email)
                   ? data.ccEmails
                   : [...data.ccEmails, email],
@@ -213,6 +274,7 @@ export function RequesterCcEditor({
             optimisticResponse: {
               removeTicketCc: {
                 id: data.id,
+                undeliverableEmails: data.undeliverableEmails,
                 ccEmails: data.ccEmails.filter((e) => e !== email),
               },
             },

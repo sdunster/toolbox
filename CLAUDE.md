@@ -113,6 +113,29 @@ local setup, and `SCHEMA.md` for the data model.
   staff notification sent from that Lambda falls back to `mail::FROM_FALLBACK`'s reserved `.test`
   domain and is refused by the provider.
 
+- **Bounces and complaints suppress an address (`api/src/suppression.rs`, issue #6).** The SES
+  configuration set publishes `BOUNCE`/`COMPLAINT` events to the `toolbox-mail-feedback` SNS topic
+  (`infra/ses_feedback.tf`), which invokes the **inbound-mail Lambda directly** — the same function
+  that consumes the inbound SQS queue; `bin/inbound-mail` tells an SNS event from an SQS one by the
+  records' event source. A permanent bounce or a complaint (not a transient bounce, not a `not-spam`
+  complaint) upserts the lowercased address into `{prefix}_email_suppression` — first reason wins,
+  replays are harmless. Every **instance-mail** send then checks its recipients first and leaves a
+  suppressed address off the envelope *and* off the stored message's `to`/`cc`:
+  - ticket notices (`submitTicket`/`setTicketStatus`, the inbound relay) and staff notifications
+    quietly skip it, sending nothing if nobody is left;
+  - `replyToTicket` skips it too, but refuses with `CONFLICT` (naming the addresses, before
+    persisting anything) if that leaves nobody;
+  - `sendInvoice`/`sendCreditNote` refuse with `CONFLICT` if *any* recipient is suppressed — those
+    recipients are picked per send, so the caller picks another rather than getting a partial send.
+
+  **System mail (login codes, the submit form's verification code) is deliberately not filtered** —
+  an old bounce must not lock someone out, and SES's own account-level list still applies. **A
+  lookup failure fails open** (send to everyone, `warn!`): a suppression check must never be why a
+  reply fails. Suppression is global, not per instance. `Ticket.undeliverableEmails` shows members
+  which of a ticket's addresses are suppressed (never which tenant's mail caused it); only an
+  operator can clear one, with `cli suppression remove` (which also prints the `aws sesv2
+  delete-suppressed-destination` command for SES's own list).
+
 - **Rows reference an instance by `id`, never by `slug`.** Slugs are editable and exist for
   humans; `id` is the foreign key every other table stores. Anything taking an instance from user
   input (the CLI's `--instance`, an argument, a path segment) must resolve it through

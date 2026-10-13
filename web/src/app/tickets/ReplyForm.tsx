@@ -4,6 +4,10 @@ import type { RecordSourceSelectorProxy } from "relay-runtime";
 import type { ReplyFormMutation } from "./__generated__/ReplyFormMutation.graphql";
 import type { ReplyFormCreateUploadMutation } from "./__generated__/ReplyFormCreateUploadMutation.graphql";
 import { Button } from "../../components/ui/Button";
+import {
+  relayMutationErrorCode,
+  relayMutationErrorMessage,
+} from "../../lib/relayMutationError";
 
 interface PendingAttachment {
   id: string;
@@ -143,8 +147,15 @@ export function ReplyForm({ ticketId }: { ticketId: string }) {
         setBody("");
         setAttachments([]);
       },
-      onError: () =>
-        setError("Failed to send reply. Your draft is unchanged — try again."),
+      // CONFLICT is the API refusing a reply nobody could receive (every
+      // recipient is undeliverable — see `replyToTicket`): its message names
+      // them, which is what the agent needs. Anything else stays generic.
+      onError: (err) =>
+        setError(
+          relayMutationErrorCode(err) === "CONFLICT"
+            ? `${relayMutationErrorMessage(err, "Reply refused.")} Your draft is unchanged.`
+            : "Failed to send reply. Your draft is unchanged — try again.",
+        ),
     });
   }
 
