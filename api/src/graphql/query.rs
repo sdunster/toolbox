@@ -25,7 +25,7 @@ use super::finance::{
     ProjectFinancialsInfo, ReceivablesReport, ReportBasisType,
 };
 use super::pagination::{build_connection, pagination_args};
-use super::{InstanceId, InvoiceId, ProjectId, UserId};
+use super::{InstanceId, InvoiceId, ProjectId, TicketDeliveriesKey, UserId};
 use crate::invoicing::{self, money, report, vehicle};
 
 /// Metadata for a stored passkey credential — never the credential itself (no
@@ -639,9 +639,9 @@ impl From<db::BroadcastSendStatus> for BroadcastSendStatusType {
     }
 }
 
-/// `BroadcastRecipient.deliveryStatus` — see `db::BroadcastDeliveryStatus`.
+/// `BroadcastRecipient.deliveryStatus` — see `db::DeliveryStatus`.
 #[derive(Enum, Copy, Clone, Debug, PartialEq, Eq)]
-pub enum BroadcastDeliveryStatusType {
+pub enum DeliveryStatusType {
     Delayed,
     Delivered,
     Bounced,
@@ -649,14 +649,14 @@ pub enum BroadcastDeliveryStatusType {
     Complained,
 }
 
-impl From<db::BroadcastDeliveryStatus> for BroadcastDeliveryStatusType {
-    fn from(s: db::BroadcastDeliveryStatus) -> Self {
+impl From<db::DeliveryStatus> for DeliveryStatusType {
+    fn from(s: db::DeliveryStatus) -> Self {
         match s {
-            db::BroadcastDeliveryStatus::Delayed => Self::Delayed,
-            db::BroadcastDeliveryStatus::Delivered => Self::Delivered,
-            db::BroadcastDeliveryStatus::Bounced => Self::Bounced,
-            db::BroadcastDeliveryStatus::Rejected => Self::Rejected,
-            db::BroadcastDeliveryStatus::Complained => Self::Complained,
+            db::DeliveryStatus::Delayed => Self::Delayed,
+            db::DeliveryStatus::Delivered => Self::Delivered,
+            db::DeliveryStatus::Bounced => Self::Bounced,
+            db::DeliveryStatus::Rejected => Self::Rejected,
+            db::DeliveryStatus::Complained => Self::Complained,
         }
     }
 }
@@ -671,7 +671,7 @@ pub struct BroadcastRecipientInfo {
     pub email: String,
     pub send_status: BroadcastSendStatusType,
     pub error: Option<String>,
-    pub delivery_status: Option<BroadcastDeliveryStatusType>,
+    pub delivery_status: Option<DeliveryStatusType>,
     pub delivery_detail: Option<String>,
     pub delivery_updated_at: Option<i64>,
 }
@@ -685,6 +685,28 @@ impl From<db::BroadcastRecipient> for BroadcastRecipientInfo {
             delivery_status: r.delivery_status.map(Into::into),
             delivery_detail: r.delivery_detail,
             delivery_updated_at: r.delivery_updated_at.map(|t| t as i64),
+        }
+    }
+}
+
+/// One recipient's delivery status for a ticket message — see
+/// `TicketMessage.deliveries`.
+#[derive(SimpleObject, Clone, Debug, PartialEq)]
+#[graphql(name = "MessageDelivery")]
+pub struct MessageDeliveryInfo {
+    pub email: String,
+    pub status: DeliveryStatusType,
+    pub detail: Option<String>,
+    pub updated_at: i64,
+}
+
+impl From<db::MessageDelivery> for MessageDeliveryInfo {
+    fn from(d: db::MessageDelivery) -> Self {
+        Self {
+            email: d.email,
+            status: d.status.into(),
+            detail: d.detail,
+            updated_at: d.updated_at as i64,
         }
     }
 }
@@ -767,19 +789,19 @@ impl<A: App + HasDb + Send + Sync + 'static> Broadcast<A> {
         self.count(|r| r.send_status == db::BroadcastSendStatus::Suppressed)
     }
     async fn delivered_count(&self) -> i32 {
-        self.count(|r| r.delivery_status == Some(db::BroadcastDeliveryStatus::Delivered))
+        self.count(|r| r.delivery_status == Some(db::DeliveryStatus::Delivered))
     }
     /// Bounced or rejected — either way, it never arrived.
     async fn bounced_count(&self) -> i32 {
         self.count(|r| {
             matches!(
                 r.delivery_status,
-                Some(db::BroadcastDeliveryStatus::Bounced | db::BroadcastDeliveryStatus::Rejected)
+                Some(db::DeliveryStatus::Bounced | db::DeliveryStatus::Rejected)
             )
         })
     }
     async fn complained_count(&self) -> i32 {
-        self.count(|r| r.delivery_status == Some(db::BroadcastDeliveryStatus::Complained))
+        self.count(|r| r.delivery_status == Some(db::DeliveryStatus::Complained))
     }
     /// Dataloaded — see [`TicketMessage::author`]'s doc comment.
     async fn created_by(&self, ctx: &Context<'_>) -> Result<Option<User<A>>> {
@@ -1286,6 +1308,39 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> TicketMessage<A> {
     }
     async fn rfc_message_id(&self) -> Option<&str> {
         self.rec.rfc_message_id.as_deref()
+    }
+    /// What the mail provider reported for each recipient of this message —
+    /// delivered, delayed, bounced (with the remote server's reason),
+    /// rejected or marked as spam — from SES events (`ticket_delivery`).
+    /// Empty for a message we didn't send (`inbound`, `note`), for one sent
+    /// before tracking existed, and until the first event arrives. Loaded
+    /// once per ticket, not per message.
+    async fn deliveries(&self, ctx: &Context<'_>) -> Result<Vec<MessageDeliveryInfo>> {
+        let Some(ses_id) = self
+            .rec
+            .rfc_message_id
+            .as_deref()
+            .and_then(db::ses_message_id_from_rfc)
+        else {
+            return Ok(vec![]);
+        };
+        if !matches!(
+            self.rec.kind,
+            db::TicketMessageKind::Reply | db::TicketMessageKind::System
+        ) {
+            return Ok(vec![]);
+        }
+        let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+        let rows = loader
+            .load_one(TicketDeliveriesKey(ID(self.rec.ticket_id.clone())))
+            .await
+            .map_err(|e| anyhow!("Failed to load deliveries via DataLoader: {}", e))?
+            .unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .filter(|d| d.ses_message_id == ses_id)
+            .map(MessageDeliveryInfo::from)
+            .collect())
     }
     async fn in_reply_to(&self) -> Option<&str> {
         self.rec.in_reply_to.as_deref()

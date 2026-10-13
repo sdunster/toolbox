@@ -31,6 +31,7 @@ locals {
     aws_dynamodb_table.expense,
     aws_dynamodb_table.credit_note,
     aws_dynamodb_table.broadcast,
+    aws_dynamodb_table.message_delivery,
   ]
 }
 

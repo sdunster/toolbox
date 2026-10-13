@@ -1,7 +1,8 @@
 import { graphql, useFragment } from "react-relay";
 import type { BroadcastHistory_broadcasts$key } from "./__generated__/BroadcastHistory_broadcasts.graphql";
 import { formatTimestamp } from "../../lib/dates";
-import { recipientStatus, type RecipientTone } from "../../lib/broadcast";
+import { recipientStatus } from "../../lib/broadcast";
+import { statusToneClass } from "../../lib/deliveryStatus";
 
 const broadcastHistoryFragment = graphql`
   fragment BroadcastHistory_broadcasts on Broadcast @relay(plural: true) {
@@ -28,13 +29,6 @@ const broadcastHistoryFragment = graphql`
     }
   }
 `;
-
-const toneClass: Record<RecipientTone, string> = {
-  neutral: "bg-surface-sunken text-ink-muted",
-  good: "bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300",
-  warn: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
-  bad: "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300",
-};
 
 function counts(b: {
   recipientCount: number;
@@ -106,7 +100,7 @@ export function BroadcastHistory({
                           </td>
                           <td className="px-4 py-2">
                             <span
-                              className={`rounded-sm px-2 py-0.5 text-xs font-medium ${toneClass[status.tone]}`}
+                              className={`rounded-sm px-2 py-0.5 text-xs font-medium ${statusToneClass[status.tone]}`}
                             >
                               {status.label}
                             </span>

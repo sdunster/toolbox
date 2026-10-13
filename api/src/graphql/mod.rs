@@ -56,6 +56,11 @@ pub struct ProjectId(pub async_graphql::ID);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct InvoiceId(pub async_graphql::ID);
 
+/// `TicketMessage.deliveries` — every message in a thread reads the same
+/// ticket's `message_delivery` rows, so they're loaded once per ticket.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TicketDeliveriesKey(pub async_graphql::ID);
+
 /// Client IP for the current request, threaded from the HTTP layer so resolvers
 /// (e.g. a future Turnstile verification) can forward it to external services.
 /// `None` when the transport didn't supply one.

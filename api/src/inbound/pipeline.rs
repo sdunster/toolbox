@@ -647,7 +647,16 @@ async fn notify_others<A: App + HasDb + HasMail + Send + Sync>(
             return None;
         }
     };
-    let rfc_message_id = match app.mail().send_raw(&built.raw, &built.to, &built.cc).await {
+    let rfc_message_id = match app
+        .mail()
+        .send_raw_tagged(
+            &built.raw,
+            &built.to,
+            &built.cc,
+            &crate::ticket_delivery::send_tags(&ticket.id),
+        )
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(ses_message_id, "notify: send failed: {e:#}");

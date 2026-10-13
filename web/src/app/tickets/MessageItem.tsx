@@ -1,6 +1,7 @@
 import { graphql, useFragment } from "react-relay";
 import type { MessageItem_message$key } from "./__generated__/MessageItem_message.graphql";
 import { messageKindContainer, messageKindLabel } from "./ticketStyles";
+import { deliveryStatusLabel, statusToneClass } from "../../lib/deliveryStatus";
 
 const messageItemFragment = graphql`
   fragment MessageItem_message on TicketMessage {
@@ -14,6 +15,11 @@ const messageItemFragment = graphql`
     ccEmails
     bodyText
     createdAt
+    deliveries {
+      email
+      status
+      detail
+    }
     attachments {
       filename
       contentType
@@ -22,6 +28,47 @@ const messageItemFragment = graphql`
     }
   }
 `;
+
+type Delivery = {
+  readonly email: string;
+  readonly status: string;
+  readonly detail?: string | null;
+};
+
+/**
+ * What the mail provider reported for each recipient of a message we sent
+ * (`TicketMessage.deliveries`) — nothing at all until the first event
+ * arrives. The reason (a bounce's SMTP diagnostic, say) is in the tooltip.
+ */
+function DeliveryList({
+  deliveries,
+  className,
+}: {
+  deliveries: readonly Delivery[];
+  className?: string;
+}) {
+  if (deliveries.length === 0) return null;
+  return (
+    <ul
+      aria-label="Delivery status"
+      className={`flex flex-wrap gap-1.5 text-xs ${className ?? ""}`}
+    >
+      {deliveries.map((d) => {
+        const status = deliveryStatusLabel(d.status);
+        if (!status) return null;
+        return (
+          <li
+            key={d.email}
+            title={d.detail ?? undefined}
+            className={`rounded-sm px-2 py-0.5 font-medium ${statusToneClass[status.tone]}`}
+          >
+            {d.email}: {status.label}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
 
 function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
@@ -52,11 +99,15 @@ export function MessageItem({ message }: { message: MessageItem_message$key }) {
 
   if (data.kind === "SYSTEM") {
     return (
-      <li className="flex justify-center py-2">
+      <li className="flex flex-col items-center py-2">
         <p className="rounded-full bg-surface-sunken px-3 py-1 text-xs text-ink-muted italic">
           {data.bodyText ?? "System notice"}
           <span className="ml-2 not-italic">· {when}</span>
         </p>
+        <DeliveryList
+          deliveries={data.deliveries}
+          className="mt-1 justify-center"
+        />
       </li>
     );
   }
@@ -87,6 +138,8 @@ export function MessageItem({ message }: { message: MessageItem_message$key }) {
             {data.ccEmails.length > 0 && <>Cc: {data.ccEmails.join(", ")}</>}
           </p>
         )}
+
+      <DeliveryList deliveries={data.deliveries} className="mt-1" />
 
       <div className="mt-2 text-sm whitespace-pre-wrap text-ink">
         {data.bodyText ?? (

@@ -818,6 +818,45 @@ resource "aws_dynamodb_table" "credit_note" {
   }
 }
 
+# ── message_delivery ─────────────────────────────────────────────────────────
+# What SES reported for each recipient of each customer-facing ticket message
+# (api/src/ticket_delivery.rs), written by the inbound-mail lambda from SES
+# events. Keyed `{ses_message_id}#{email}` — the event names SES's message id
+# and (by tag) the ticket, so the write is an upsert by primary key with no
+# lookup. Status only moves forward (conditioned on `delivery_rank`).
+
+resource "aws_dynamodb_table" "message_delivery" {
+  name                        = "${var.db_prefix}_message_delivery"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "id"
+  deletion_protection_enabled = true
+
+  point_in_time_recovery {
+    enabled                 = true
+    recovery_period_in_days = 35
+  }
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+  attribute {
+    name = "ticket_id"
+    type = "S"
+  }
+
+  # A ticket's thread view: every delivery row for the ticket, in one query.
+  # ALL: every field is rendered.
+  global_secondary_index {
+    name = "ticket_id-index"
+    key_schema {
+      attribute_name = "ticket_id"
+      key_type       = "HASH"
+    }
+    projection_type = "ALL"
+  }
+}
+
 # ── broadcast ────────────────────────────────────────────────────────────────
 # One announcement email sent from a support instance to a list of addresses —
 # see CLAUDE.md's "Broadcasts" entry. `recipients` is a list of maps updated in

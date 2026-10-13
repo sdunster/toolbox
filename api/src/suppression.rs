@@ -2,11 +2,11 @@
 //!
 //! Two halves, joined by the `email_suppression` table:
 //!
-//! 1. **Recording.** The SES configuration set (`infra/ses.tf`) publishes
-//!    `BOUNCE` and `COMPLAINT` events to an SNS topic that invokes the
-//!    inbound-mail Lambda directly (`bin/inbound-mail`). That Lambda hands
-//!    each SNS message to [`record_feedback`], which [`parse_feedback`]s it
-//!    and upserts one row per affected address. Only a **permanent** bounce
+//! 1. **Recording.** The SES configuration set publishes its events to an
+//!    SNS topic that invokes the inbound-mail Lambda directly
+//!    (`bin/inbound-mail`). That Lambda parses each one once into a
+//!    [`crate::ses_events::SesEvent`] and hands it to [`record_event`] (among
+//!    other consumers), which upserts one row per affected address. Only a **permanent** bounce
 //!    or a complaint suppresses an address; a transient bounce (mailbox
 //!    full, greylisting) is ignored, and so is a complaint whose feedback
 //!    type is `not-spam`.
@@ -33,11 +33,11 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use tracing::{info, warn};
 
 use crate::app::HasDb;
 use crate::db::{self, Handler as _};
+use crate::ses_events::{EventType, SesEvent};
 
 /// Longest `detail` stored — SES diagnostic codes are normally one SMTP line,
 /// but they are remote-controlled text.
@@ -51,65 +51,9 @@ pub struct Feedback {
     pub detail: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SesEvent {
-    /// Configuration-set event publishing (what `infra/ses.tf` sets up).
-    event_type: Option<String>,
-    /// Identity notifications use this key instead; accepted too, so the
-    /// parser doesn't care which of the two SES features delivered it.
-    notification_type: Option<String>,
-    bounce: Option<Bounce>,
-    complaint: Option<Complaint>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Bounce {
-    bounce_type: String,
-    bounce_sub_type: Option<String>,
-    #[serde(default)]
-    bounced_recipients: Vec<BouncedRecipient>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BouncedRecipient {
-    email_address: String,
-    status: Option<String>,
-    diagnostic_code: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Complaint {
-    #[serde(default)]
-    complained_recipients: Vec<ComplainedRecipient>,
-    complaint_feedback_type: Option<String>,
-    complaint_sub_type: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ComplainedRecipient {
-    email_address: String,
-}
-
-/// Lowercase and trim an address, unwrapping a `Name <addr>` form. `None` for
-/// anything without an `@`.
-pub fn normalize_address(raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    let inner = match (raw.rfind('<'), raw.rfind('>')) {
-        (Some(start), Some(end)) if start < end => &raw[start + 1..end],
-        _ => raw,
-    };
-    let addr = inner.trim().to_lowercase();
-    let (local, domain) = addr.split_once('@')?;
-    if local.is_empty() || domain.is_empty() {
-        return None;
-    }
-    Some(addr)
-}
+/// Lowercase and trim an address, unwrapping a `Name <addr>` form — the one
+/// shared normalizer, in [`crate::ses_events`].
+pub use crate::ses_events::normalize_address;
 
 fn truncate(s: String) -> String {
     if s.len() <= MAX_DETAIL_LEN {
@@ -133,27 +77,23 @@ fn join_detail(parts: &[Option<&str>]) -> Option<String> {
     (!joined.is_empty()).then(|| truncate(joined))
 }
 
-/// Parse one SES event (the SNS message body) into the addresses it
-/// suppresses. Pure. An event of any other type, a transient bounce, or a
-/// `not-spam` complaint yields an empty list — not an error. Malformed JSON
-/// is an error.
-pub fn parse_feedback(message: &str) -> Result<Vec<Feedback>> {
-    let event: SesEvent = serde_json::from_str(message).context("parsing SES event JSON")?;
-    let kind = event
-        .event_type
-        .or(event.notification_type)
-        .unwrap_or_default();
+/// The addresses an SES event suppresses. Pure. Only a **permanent** bounce
+/// or a complaint (other than `not-spam`) suppresses anything; every other
+/// event type — deliveries, delays, rejects, transient bounces — yields an
+/// empty list. Suppression keys on the addresses SES names, never on tags:
+/// it applies to every send, tagged or not.
+pub fn feedback_from(event: &SesEvent) -> Vec<Feedback> {
     let mut out = Vec::new();
-    match kind.as_str() {
-        "Bounce" => {
-            let Some(bounce) = event.bounce else {
-                return Ok(out);
+    match event.event_type {
+        EventType::Bounce => {
+            let Some(bounce) = &event.bounce else {
+                return out;
             };
             if bounce.bounce_type != "Permanent" {
-                return Ok(out);
+                return out;
             }
-            for r in bounce.bounced_recipients {
-                let Some(email) = normalize_address(&r.email_address) else {
+            for r in &bounce.recipients {
+                let Some(email) = normalize_address(&r.email) else {
                     continue;
                 };
                 out.push(Feedback {
@@ -167,38 +107,43 @@ pub fn parse_feedback(message: &str) -> Result<Vec<Feedback>> {
                 });
             }
         }
-        "Complaint" => {
-            let Some(complaint) = event.complaint else {
-                return Ok(out);
+        EventType::Complaint => {
+            let Some(complaint) = &event.complaint else {
+                return out;
             };
-            if complaint.complaint_feedback_type.as_deref() == Some("not-spam") {
-                return Ok(out);
+            if complaint.feedback_type.as_deref() == Some("not-spam") {
+                return out;
             }
-            for r in complaint.complained_recipients {
-                let Some(email) = normalize_address(&r.email_address) else {
+            for r in &complaint.recipients {
+                let Some(email) = normalize_address(r) else {
                     continue;
                 };
                 out.push(Feedback {
                     email,
                     reason: db::SuppressionReason::Complaint,
                     detail: join_detail(&[
-                        complaint.complaint_feedback_type.as_deref(),
-                        complaint.complaint_sub_type.as_deref(),
+                        complaint.feedback_type.as_deref(),
+                        complaint.sub_type.as_deref(),
                     ]),
                 });
             }
         }
         _ => {}
     }
-    Ok(out)
+    out
 }
 
-/// Parse an SES event and record a suppression for every address it names.
-/// Returns how many addresses were recorded. Any write failure is returned,
-/// so the Lambda invocation fails and SNS/Lambda retry it — every write is
-/// an idempotent upsert, so a replay of a half-applied event is harmless.
-pub async fn record_feedback<A: HasDb + Sync>(app: &A, message: &str) -> Result<usize> {
-    let feedback = parse_feedback(message)?;
+/// [`SesEvent::parse`] then [`feedback_from`]. Malformed JSON is an error.
+pub fn parse_feedback(message: &str) -> Result<Vec<Feedback>> {
+    Ok(feedback_from(&SesEvent::parse(message)?))
+}
+
+/// Record a suppression for every address `event` names. Returns how many
+/// addresses were recorded. Any write failure is returned, so the Lambda
+/// invocation fails and SNS/Lambda retry it — every write is an idempotent
+/// upsert, so a replay of a half-applied event is harmless.
+pub async fn record_event<A: HasDb + Sync>(app: &A, event: &SesEvent) -> Result<usize> {
+    let feedback = feedback_from(event);
     let now = crate::clock::now_sec();
     for f in &feedback {
         app.db()
@@ -213,6 +158,11 @@ pub async fn record_feedback<A: HasDb + Sync>(app: &A, message: &str) -> Result<
         );
     }
     Ok(feedback.len())
+}
+
+/// [`SesEvent::parse`] then [`record_event`].
+pub async fn record_feedback<A: HasDb + Sync>(app: &A, message: &str) -> Result<usize> {
+    record_event(app, &SesEvent::parse(message)?).await
 }
 
 /// The suppression rows for whichever of `emails` are suppressed, in

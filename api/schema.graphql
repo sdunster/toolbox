@@ -206,17 +206,6 @@ type Broadcast {
 }
 
 """
-`BroadcastRecipient.deliveryStatus` — see `db::BroadcastDeliveryStatus`.
-"""
-enum BroadcastDeliveryStatusType {
-	DELAYED
-	DELIVERED
-	BOUNCED
-	REJECTED
-	COMPLAINED
-}
-
-"""
 One recipient of a broadcast: what happened when it was sent
 (`sendStatus`/`error`), and what SES reported afterwards
 (`deliveryStatus`/`deliveryDetail`, `null` until an event arrives — see
@@ -226,7 +215,7 @@ type BroadcastRecipient {
 	email: String!
 	sendStatus: BroadcastSendStatusType!
 	error: String
-	deliveryStatus: BroadcastDeliveryStatusType
+	deliveryStatus: DeliveryStatusType
 	deliveryDetail: String
 	deliveryUpdatedAt: Int
 }
@@ -373,6 +362,17 @@ enum CsvExportType {
 	CREDIT_NOTES
 	PAYMENTS
 	EXPENSES
+}
+
+"""
+`BroadcastRecipient.deliveryStatus` — see `db::DeliveryStatus`.
+"""
+enum DeliveryStatusType {
+	DELAYED
+	DELIVERED
+	BOUNCED
+	REJECTED
+	COMPLAINED
 }
 
 type Expense {
@@ -947,6 +947,17 @@ type MembershipInfo {
 enum MembershipRoleType {
 	OWNER
 	AGENT
+}
+
+"""
+One recipient's delivery status for a ticket message — see
+`TicketMessage.deliveries`.
+"""
+type MessageDelivery {
+	email: String!
+	status: DeliveryStatusType!
+	detail: String
+	updatedAt: Int!
 }
 
 type MutationRoot {
@@ -2278,6 +2289,15 @@ type TicketMessage {
 	bodyText: String
 	bodyHtml: String
 	rfcMessageId: String
+	"""
+	What the mail provider reported for each recipient of this message —
+	delivered, delayed, bounced (with the remote server's reason),
+	rejected or marked as spam — from SES events (`ticket_delivery`).
+	Empty for a message we didn't send (`inbound`, `note`), for one sent
+	before tracking existed, and until the first event arrives. Loaded
+	once per ticket, not per message.
+	"""
+	deliveries: [MessageDelivery!]!
 	inReplyTo: String
 	createdAt: Int!
 	attachments: [Attachment!]!

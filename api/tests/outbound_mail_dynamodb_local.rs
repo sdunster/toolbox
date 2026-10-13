@@ -807,3 +807,137 @@ async fn notification_settings_is_forbidden_via_admin_user() {
         response.errors
     );
 }
+
+/// Customer-facing ticket mail carries the `ticket_id` SES tag, and SES
+/// events for it land on `TicketMessage.deliveries`, per recipient, moving
+/// only forward.
+#[tokio::test]
+async fn ticket_mail_is_tagged_and_its_delivery_events_show_on_the_message() {
+    use toolbox::ses_events::SesEvent;
+    use toolbox::ticket_delivery;
+
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner_id, _address) = setup_instance(&db, "track").await;
+    let requester_email = unique_email("requester").to_lowercase();
+    let cc_email = unique_email("cc").to_lowercase();
+    let ticket = make_ticket(&db, &instance.id, &requester_email, &cc_email).await;
+    let (my_app, schema) = build_app_and_schema(db.clone());
+
+    let response = schema
+        .execute(
+            Request::new(REPLY_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "ticketId": ticket.id,
+                    "body": "We're looking into it.",
+                })))
+                .data(user_auth(&owner_id, &instance.id, true)),
+        )
+        .await;
+    expect_data(&response, "replyToTicket.id");
+
+    // A close notice is customer mail too.
+    let response = schema
+        .execute(
+            Request::new(SET_STATUS_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "ticketId": ticket.id,
+                    "status": "CLOSED",
+                })))
+                .data(user_auth(&owner_id, &instance.id, true)),
+        )
+        .await;
+    expect_data(&response, "setTicketStatus.id");
+
+    let sent = my_app.mail.sent_raw();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for msg in &sent {
+        assert_eq!(
+            msg.tags,
+            vec![("ticket_id".to_string(), ticket.id.clone())],
+            "every customer-facing ticket message carries the ticket tag"
+        );
+    }
+    let reply_ses_id = db::ses_message_id_from_rfc(&sent[0].message_id)
+        .expect("mock ids have the SES shape")
+        .to_string();
+
+    let ev = |event_type: &str, key: &str, body: serde_json::Value| {
+        let mut v = json!({
+            "eventType": event_type,
+            "mail": {
+                "messageId": reply_ses_id,
+                "timestamp": "2026-10-13T01:00:00.000Z",
+                "destination": [requester_email, cc_email],
+                "tags": { "ticket_id": [ticket.id] },
+            },
+        });
+        v[key] = body;
+        SesEvent::parse(&v.to_string()).unwrap()
+    };
+    for e in [
+        ev(
+            "Delivery",
+            "delivery",
+            json!({ "recipients": [requester_email], "smtpResponse": "250 OK" }),
+        ),
+        ev(
+            "Bounce",
+            "bounce",
+            json!({
+                "bounceType": "Permanent",
+                "bounceSubType": "General",
+                "bouncedRecipients": [{ "emailAddress": cc_email, "diagnosticCode": "550 unknown" }],
+            }),
+        ),
+        // Late and less final: must not hide the bounce.
+        ev(
+            "DeliveryDelay",
+            "deliveryDelay",
+            json!({ "delayType": "MailboxFull", "delayedRecipients": [{ "emailAddress": cc_email }] }),
+        ),
+    ] {
+        ticket_delivery::apply(&db, &e).await.expect("apply");
+    }
+
+    let response = schema
+        .execute(
+            Request::new(
+                r#"query($id: ID!) { ticket(id: $id) { messages { kind rfcMessageId deliveries { email status detail } } } }"#,
+            )
+            .variables(Variables::from_json(json!({ "id": ticket.id })))
+            .data(user_auth(&owner_id, &instance.id, true))
+            .data(graphql::get_dataloader(my_app.clone())),
+        )
+        .await;
+    let messages = expect_data(&response, "ticket.messages");
+    let reply = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["kind"] == "REPLY")
+        .expect("the reply");
+    let mut deliveries = reply["deliveries"].as_array().unwrap().clone();
+    deliveries.sort_by_key(|d| d["email"].as_str().unwrap().to_string());
+    let by_email = |e: &str| {
+        deliveries
+            .iter()
+            .find(|d| d["email"] == e)
+            .unwrap_or_else(|| panic!("no delivery for {e}: {deliveries:?}"))
+            .clone()
+    };
+    assert_eq!(by_email(&requester_email)["status"], "DELIVERED");
+    assert_eq!(by_email(&cc_email)["status"], "BOUNCED");
+    assert_eq!(
+        by_email(&cc_email)["detail"],
+        "Permanent/General: 550 unknown"
+    );
+    // The close notice has no events yet.
+    let system = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["kind"] == "SYSTEM")
+        .expect("the close notice");
+    assert_eq!(system["deliveries"], json!([]));
+}

@@ -20,7 +20,7 @@ use crate::app::{App, HasDb};
 use crate::db;
 use crate::db::Handler as _;
 
-use super::{InstanceId, InvoiceId, ProjectId, UserId};
+use super::{InstanceId, InvoiceId, ProjectId, TicketDeliveriesKey, UserId};
 
 pub struct DatabaseLoader<A: App + HasDb + Send + Sync> {
     app: Arc<A>,
@@ -119,6 +119,34 @@ impl<A: App + HasDb + Send + Sync + 'static> Loader<InvoiceId> for DatabaseLoade
         let map = zip(keys.iter().cloned(), recs)
             .filter_map(|(key, rec)| rec.map(|r| (key, r)))
             .collect();
+        Ok(map)
+    }
+}
+
+/// Every `message_delivery` row of each requested ticket (one
+/// `ticket_id-index` query per ticket — in practice one per request, since a
+/// thread view shows one ticket). A ticket with none maps to an empty list.
+impl<A: App + HasDb + Send + Sync + 'static> Loader<TicketDeliveriesKey> for DatabaseLoader<A> {
+    type Value = Vec<db::MessageDelivery>;
+    type Error = Arc<anyhow::Error>;
+
+    async fn load(
+        &self,
+        keys: &[TicketDeliveriesKey],
+    ) -> std::result::Result<
+        HashMap<TicketDeliveriesKey, Vec<db::MessageDelivery>>,
+        Arc<anyhow::Error>,
+    > {
+        let mut map = HashMap::new();
+        for key in keys {
+            let rows = self
+                .app
+                .db()
+                .list_message_deliveries(key.0.as_str())
+                .await
+                .map_err(|e| Arc::new(anyhow!("DB error: {:?}", e)))?;
+            map.insert(key.clone(), rows);
+        }
         Ok(map)
     }
 }

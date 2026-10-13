@@ -907,7 +907,16 @@ async fn send_system_notification<A: App + HasDb + HasMail + Send + Sync>(
             return;
         }
     };
-    let message_id = match app.mail().send_raw(&built.raw, &built.to, &built.cc).await {
+    let message_id = match app
+        .mail()
+        .send_raw_tagged(
+            &built.raw,
+            &built.to,
+            &built.cc,
+            &crate::ticket_delivery::send_tags(&ticket.id),
+        )
+        .await
+    {
         Ok(id) => id,
         Err(e) => {
             warn!(
@@ -2809,7 +2818,12 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         let message_id = self
             .app
             .mail()
-            .send_raw(&built.raw, &built.to, &built.cc)
+            .send_raw_tagged(
+                &built.raw,
+                &built.to,
+                &built.cc,
+                &crate::ticket_delivery::send_tags(&ticket.id),
+            )
             .await
             .with_context(|| format!("sending reply for ticket {}", ticket.id))?;
 

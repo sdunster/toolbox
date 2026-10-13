@@ -852,11 +852,9 @@ impl TryInto<db::Broadcast> for Item {
                         error: item.string_field("error")?,
                         delivery_status: match item.string_field("delivery_status")? {
                             None => None,
-                            Some(s) => {
-                                Some(db::BroadcastDeliveryStatus::parse(&s).ok_or_else(|| {
-                                    anyhow!("Broadcast recipient has unknown delivery_status {s:?}")
-                                })?)
-                            }
+                            Some(s) => Some(db::DeliveryStatus::parse(&s).ok_or_else(|| {
+                                anyhow!("Broadcast recipient has unknown delivery_status {s:?}")
+                            })?),
                         },
                         delivery_detail: item.string_field("delivery_detail")?,
                         delivery_updated_at: item
@@ -880,6 +878,30 @@ impl TryInto<db::Broadcast> for Item {
             subject: req_s("subject")?,
             body_text: req_s("body_text")?,
             recipients,
+        })
+    }
+}
+
+impl TryInto<db::MessageDelivery> for Item {
+    type Error = HydrationError;
+    fn try_into(self) -> Result<db::MessageDelivery, Self::Error> {
+        let req_s = |field: &str| -> Result<String, HydrationError> {
+            Ok(self
+                .string_field(field)?
+                .ok_or_else(|| anyhow!("MessageDelivery missing {field}"))?)
+        };
+        let status = req_s("delivery_status")?;
+        Ok(db::MessageDelivery {
+            ticket_id: req_s("ticket_id")?,
+            ses_message_id: req_s("ses_message_id")?,
+            email: req_s("email")?,
+            status: db::DeliveryStatus::parse(&status)
+                .ok_or_else(|| anyhow!("MessageDelivery has unknown delivery_status {status:?}"))?,
+            detail: self.string_field("delivery_detail")?,
+            updated_at: self
+                .i64_field("updated_at")?
+                .ok_or_else(|| anyhow!("MessageDelivery missing updated_at"))?
+                as u64,
         })
     }
 }
@@ -4810,7 +4832,7 @@ impl db::Handler for Handler {
         &self,
         id: &str,
         index: usize,
-        update: &db::BroadcastDeliveryUpdate,
+        update: &db::DeliveryUpdate,
     ) -> db::Result<bool> {
         self.ensure_writable()?;
         let path = format!("recipients[{index}]");
@@ -4885,6 +4907,71 @@ impl db::Handler for Handler {
             .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
         record_capacity("list_broadcasts", resp.consumed_capacity(), CapKind::Read);
         Ok(hydrate_items(resp.items)?)
+    }
+
+    // ── message_delivery ──────────────────────────────────────────────────
+
+    async fn record_message_delivery(
+        &self,
+        ticket_id: &str,
+        ses_message_id: &str,
+        email: &str,
+        update: &db::DeliveryUpdate,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let s = |v: &str| AttributeValue::S(v.to_string());
+        let mut sets = vec![
+            "ticket_id = :ticket_id",
+            "ses_message_id = :mid",
+            "email = :email",
+            "delivery_status = :status",
+            "delivery_rank = :rank",
+            "updated_at = :at",
+        ];
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("message_delivery"))
+            .key("id", s(&format!("{ses_message_id}#{email}")))
+            .condition_expression("attribute_not_exists(delivery_rank) OR delivery_rank <= :rank")
+            .expression_attribute_values(":ticket_id", s(ticket_id))
+            .expression_attribute_values(":mid", s(ses_message_id))
+            .expression_attribute_values(":email", s(email))
+            .expression_attribute_values(":status", s(update.status.as_str()))
+            .expression_attribute_values(
+                ":rank",
+                AttributeValue::N(update.status.rank().to_string()),
+            )
+            .expression_attribute_values(":at", AttributeValue::N(update.at.to_string()));
+        let expr = match &update.detail {
+            Some(detail) => {
+                sets.push("delivery_detail = :detail");
+                req = req.expression_attribute_values(":detail", s(detail));
+                format!("SET {}", sets.join(", "))
+            }
+            None => format!("SET {} REMOVE delivery_detail", sets.join(", ")),
+        };
+        let resp = req
+            .update_expression(expr)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("record_message_delivery", resp)
+    }
+
+    async fn list_message_deliveries(
+        &self,
+        ticket_id: &str,
+    ) -> db::Result<Vec<db::MessageDelivery>> {
+        query_all("list_message_deliveries", || {
+            self.client
+                .query()
+                .table_name(self.table_name("message_delivery"))
+                .index_name("ticket_id-index")
+                .key_condition_expression("ticket_id = :ticket_id")
+                .expression_attribute_values(":ticket_id", AttributeValue::S(ticket_id.to_string()))
+        })
+        .await
     }
 
     // ── ticket ────────────────────────────────────────────────────────────
