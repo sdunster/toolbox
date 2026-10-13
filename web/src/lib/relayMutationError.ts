@@ -41,3 +41,31 @@ export function relayMutationErrorMessage(
   }
   return fallback;
 }
+
+/**
+ * The first GraphQL error's `extensions.code` (`CONFLICT`, `NOT_FOUND`, …),
+ * found the same two ways as {@link relayMutationErrorMessage} finds its
+ * message, or `undefined`. For a form that shows the server's own text only
+ * for an expected, user-actionable error and keeps its generic copy otherwise.
+ */
+export function relayMutationErrorCode(err: unknown): string | undefined {
+  function firstCode(container: unknown): string | undefined {
+    if (
+      !container ||
+      typeof container !== "object" ||
+      !("errors" in container)
+    ) {
+      return undefined;
+    }
+    const errors = (container as { errors?: unknown }).errors;
+    if (!Array.isArray(errors) || errors.length === 0) return undefined;
+    const code = (errors[0] as { extensions?: { code?: unknown } } | undefined)
+      ?.extensions?.code;
+    return typeof code === "string" ? code : undefined;
+  }
+
+  if (err && typeof err === "object") {
+    return firstCode(err) ?? firstCode((err as { source?: unknown }).source);
+  }
+  return undefined;
+}

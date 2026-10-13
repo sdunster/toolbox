@@ -272,6 +272,65 @@ pub enum ApiTokenUpdateShape<'a> {
     TouchLastUsed,
 }
 
+/// Why an address is on the email suppression list — see
+/// [`EmailSuppression`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuppressionReason {
+    /// SES reported a `Permanent` bounce: the mailbox doesn't exist, or SES
+    /// itself refused it because it was already on the account-level
+    /// suppression list. A transient bounce (mailbox full, greylisting) is
+    /// never recorded.
+    HardBounce,
+    /// The recipient marked our mail as spam (an ISP feedback-loop report
+    /// relayed by SES).
+    Complaint,
+}
+
+impl SuppressionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HardBounce => "hard_bounce",
+            Self::Complaint => "complaint",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "hard_bounce" => Some(Self::HardBounce),
+            "complaint" => Some(Self::Complaint),
+            _ => None,
+        }
+    }
+}
+
+/// An `email_suppression` row: an address Toolbox has stopped mailing
+/// because SES reported a hard bounce or a complaint for it. Recorded by
+/// [`crate::suppression::record_feedback`] (the inbound-mail Lambda, fed by
+/// the configuration set's event destination); consulted before every
+/// instance-mail send. Global, not per instance: a dead mailbox is dead for
+/// every tenant, and SES's own account-level suppression list is global too.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EmailSuppression {
+    /// The lowercased address — also the DynamoDB hash key (`id`).
+    pub email: String,
+    /// The *first* reason recorded. Later events for the same address never
+    /// overwrite it (see `record_email_suppression`), so a complaint stays a
+    /// complaint even after SES starts bouncing the address as suppressed.
+    pub reason: SuppressionReason,
+    /// SES's diagnostic for the first event (a bounce's SMTP status and
+    /// diagnostic code, or a complaint's feedback type), for an operator.
+    pub detail: Option<String>,
+    pub suppressed_at: u64,
+    pub last_event_at: u64,
+    pub event_count: u64,
+}
+
+impl HasID for EmailSuppression {
+    fn id(&self) -> &str {
+        &self.email
+    }
+}
+
 /// A registered WebAuthn/passkey credential. `passkey_json` is the serialized
 /// `webauthn_rs::prelude::Passkey` — opaque to everything except the
 /// `webauthn-rs` crate, and the thing the serialized-fixture regression test in
@@ -2602,6 +2661,34 @@ pub trait Handler: Sync {
         now: u64,
         expires_at: u64,
     ) -> impl Future<Output = Result<bool>> + Send;
+
+    // ── email_suppression ─────────────────────────────────────────────────
+    /// Batch-fetch suppression rows for `emails` (already lowercased),
+    /// positionally aligned like `get_instances`.
+    fn get_email_suppressions<T: AsRef<str> + Sync>(
+        &self,
+        emails: &[T],
+    ) -> impl Future<Output = Result<Vec<Option<EmailSuppression>>>> + Send;
+    /// Upsert a suppression for one (lowercased) address. Idempotent and
+    /// safe to replay: `reason`, `detail` and `suppressed_at` are written
+    /// only if the row doesn't have them yet (`if_not_exists`), so the first
+    /// event wins; `last_event_at` is always updated and `event_count`
+    /// incremented.
+    fn record_email_suppression(
+        &self,
+        email: &str,
+        reason: SuppressionReason,
+        detail: Option<&str>,
+        now: u64,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// Delete one address's suppression. `true` if a row was removed.
+    fn delete_email_suppression(&self, email: &str) -> impl Future<Output = Result<bool>> + Send;
+    /// One page of a scan over every suppression — the CLI's `suppression
+    /// list`. A small table: only addresses that have actually failed.
+    fn scan_email_suppressions(
+        &self,
+        cursor: Option<ScanCursor>,
+    ) -> impl Future<Output = Result<ScanPage<EmailSuppression>>> + Send;
 
     // ── webauthn_credential ───────────────────────────────────────────────
     fn create_webauthn_credential(

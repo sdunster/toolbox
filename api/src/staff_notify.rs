@@ -38,13 +38,14 @@
 use anyhow::{Context, Result};
 use mail_builder::MessageBuilder;
 use mail_builder::headers::raw::Raw;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::app::{App, HasDb, HasMail};
 use crate::db;
 use crate::db::Handler as _;
 use crate::mail;
 use crate::mail::Handler as _;
+use crate::suppression;
 
 /// Env var naming this deployment's web app origin — used to build the
 /// `View ticket`/`Change your notification settings` links a staff notice
@@ -557,9 +558,25 @@ pub async fn notify_staff<A: App + HasDb + HasMail + Send + Sync>(
         .filter_map(|(m, u)| u.map(|u| (m, u)))
         .collect();
 
-    let recipients = select_recipients(&candidates, ticket.status, assignee_user_id, actor, &event);
+    let mut recipients =
+        select_recipients(&candidates, ticket.status, assignee_user_id, actor, &event);
     if recipients.is_empty() {
         return;
+    }
+    // A member whose address hard-bounced or complained is skipped, like any
+    // other instance mail — see `crate::suppression`.
+    let emails: Vec<String> = recipients.iter().map(|r| r.email.clone()).collect();
+    let suppressed = suppression::find_suppressed(app, &emails, context).await;
+    if !suppressed.is_empty() {
+        recipients.retain(|r| {
+            !suppressed
+                .iter()
+                .any(|s| s.email == r.email.trim().to_lowercase())
+        });
+        info!(
+            skipped = %suppression::describe_all(&suppressed),
+            "{context}: not mailing suppressed member address(es)"
+        );
     }
 
     let actor_name = actor_display_name(&candidates, actor);

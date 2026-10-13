@@ -690,6 +690,36 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    // ── email_suppression ─────────────────────────────────────────────────
+
+    async fn get_email_suppressions<T: AsRef<str> + Sync>(
+        &self,
+        _emails: &[T],
+    ) -> db::Result<Vec<Option<db::EmailSuppression>>> {
+        Self::unsupported()
+    }
+
+    async fn record_email_suppression(
+        &self,
+        _email: &str,
+        _reason: db::SuppressionReason,
+        _detail: Option<&str>,
+        _now: u64,
+    ) -> db::Result<()> {
+        Self::unsupported()
+    }
+
+    async fn delete_email_suppression(&self, _email: &str) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn scan_email_suppressions(
+        &self,
+        _cursor: Option<db::ScanCursor>,
+    ) -> db::Result<db::ScanPage<db::EmailSuppression>> {
+        Self::unsupported()
+    }
+
     // ── webauthn_credential ───────────────────────────────────────────────
 
     async fn create_webauthn_credential(

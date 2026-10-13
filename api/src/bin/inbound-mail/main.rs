@@ -20,9 +20,19 @@
 //! All the actual work — idempotency, parsing, loop guards, resolution,
 //! storage, notification — lives in `toolbox::inbound::pipeline`,
 //! shared with `bin/cli.rs`'s `mail process` (`make local-mail`).
+//!
+//! **A second trigger: bounce and complaint feedback.** The SES
+//! configuration set publishes `BOUNCE`/`COMPLAINT` events to a second SNS
+//! topic (`infra/ses_feedback.tf`) that invokes this same function
+//! *directly* — an SNS event, not an SQS one. [`function_handler`] tells the
+//! two apart by the records' event source and hands each feedback message
+//! to `toolbox::suppression::record_feedback`. Same function rather than a
+//! third Lambda: it already has the table access and the deploy pipeline,
+//! and the work is a handful of idempotent upserts.
 
 use anyhow::{Context, Result, anyhow};
 use aws_lambda_events::event::ses::SimpleEmailService;
+use aws_lambda_events::event::sns::SnsEvent;
 use aws_lambda_events::event::sqs::SqsEvent;
 use lambda_runtime::{Error, LambdaEvent, run, service_fn, tracing};
 use serde::Deserialize;
@@ -34,6 +44,7 @@ use toolbox::dynamodb;
 use toolbox::inbound::pipeline;
 use toolbox::s3storage;
 use toolbox::sesmail;
+use toolbox::suppression;
 
 /// The outer envelope every SQS message body carries: an SNS notification.
 /// Only `Message` (the inner, JSON-encoded SES event) is needed here.
@@ -85,14 +96,24 @@ async fn handle_record(app: &App, body: &str) -> Result<()> {
     Ok(())
 }
 
-async fn function_handler(app: Arc<App>, event: LambdaEvent<SqsEvent>) -> Result<(), Error> {
+/// SQS records carry `eventSource: "aws:sqs"`; SNS records carry
+/// `EventSource: "aws:sns"` (capitalised — the two services disagree).
+fn is_sns_event(payload: &serde_json::Value) -> bool {
+    payload["Records"]
+        .as_array()
+        .and_then(|r| r.first())
+        .and_then(|r| r["EventSource"].as_str())
+        == Some("aws:sns")
+}
+
+async fn handle_sqs(app: &App, event: SqsEvent) -> Result<(), Error> {
     let mut last_err: Option<anyhow::Error> = None;
-    for record in event.payload.records {
+    for record in event.records {
         let Some(body) = record.body else {
             tracing::warn!("SQS record has no body; skipping");
             continue;
         };
-        if let Err(e) = handle_record(&app, &body).await {
+        if let Err(e) = handle_record(app, &body).await {
             tracing::error!(error = %e, "failed to process an inbound-mail SQS record");
             last_err = Some(e);
         }
@@ -107,6 +128,43 @@ async fn function_handler(app: Arc<App>, event: LambdaEvent<SqsEvent>) -> Result
     match last_err {
         Some(e) => Err(e.into()),
         None => Ok(()),
+    }
+}
+
+/// Bounce/complaint feedback. Failing the invocation makes Lambda retry the
+/// asynchronous SNS delivery (twice, by default); every write is an
+/// idempotent upsert, so a retry of a half-applied event is harmless.
+async fn handle_sns(app: &App, event: SnsEvent) -> Result<(), Error> {
+    let mut last_err: Option<anyhow::Error> = None;
+    for record in event.records {
+        match suppression::record_feedback(app, &record.sns.message).await {
+            Ok(n) => tracing::info!(
+                sns_message_id = record.sns.message_id,
+                suppressed = n,
+                "processed SES feedback event"
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "failed to process an SES feedback event");
+                last_err = Some(e);
+            }
+        }
+    }
+    match last_err {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
+}
+
+async fn function_handler(
+    app: Arc<App>,
+    event: LambdaEvent<serde_json::Value>,
+) -> Result<(), Error> {
+    if is_sns_event(&event.payload) {
+        let sns: SnsEvent = serde_json::from_value(event.payload).context("parsing SNS event")?;
+        handle_sns(&app, sns).await
+    } else {
+        let sqs: SqsEvent = serde_json::from_value(event.payload).context("parsing SQS event")?;
+        handle_sqs(&app, sqs).await
     }
 }
 
@@ -133,4 +191,50 @@ async fn main() -> Result<(), Error> {
         async move { function_handler(app, event).await }
     }))
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tells_sns_from_sqs_events() {
+        let sns = serde_json::json!({"Records": [{"EventSource": "aws:sns", "Sns": {}}]});
+        let sqs = serde_json::json!({"Records": [{"eventSource": "aws:sqs", "body": "{}"}]});
+        assert!(is_sns_event(&sns));
+        assert!(!is_sns_event(&sqs));
+        assert!(!is_sns_event(&serde_json::json!({})));
+    }
+
+    /// The SNS-to-Lambda envelope, as in the Lambda developer guide's
+    /// "Using Lambda with Amazon SNS" sample, carrying an SES bounce event.
+    #[test]
+    fn sns_envelope_yields_the_ses_feedback_message() {
+        let ses = r#"{"eventType":"Bounce","bounce":{"bounceType":"Permanent","bouncedRecipients":[{"emailAddress":"gone@example.com"}]},"mail":{}}"#;
+        let payload = serde_json::json!({
+            "Records": [{
+                "EventVersion": "1.0",
+                "EventSubscriptionArn": "arn:aws:sns:ap-southeast-2:123456789012:toolbox-mail-feedback:abc",
+                "EventSource": "aws:sns",
+                "Sns": {
+                    "SignatureVersion": "1",
+                    "Timestamp": "2019-01-02T12:45:07.000Z",
+                    "Signature": "tcc6faL2yUC6dgZdmrwh1Y4cGa/ebXEkAi6RibDsvpi+tE/1+82j...65r==",
+                    "SigningCertUrl": "https://sns.ap-southeast-2.amazonaws.com/SimpleNotificationService-ac565b8b1a6c5d002d285f9598aa1d9b.pem",
+                    "MessageId": "95df01b4-ee98-5cb9-9903-4c221d41eb5e",
+                    "Message": ses,
+                    "MessageAttributes": {},
+                    "Type": "Notification",
+                    "UnsubscribeUrl": "https://sns.ap-southeast-2.amazonaws.com/?Action=Unsubscribe",
+                    "TopicArn": "arn:aws:sns:ap-southeast-2:123456789012:toolbox-mail-feedback",
+                    "Subject": null
+                }
+            }]
+        });
+        assert!(is_sns_event(&payload));
+        let event: SnsEvent = serde_json::from_value(payload).unwrap();
+        let feedback = suppression::parse_feedback(&event.records[0].sns.message).unwrap();
+        assert_eq!(feedback.len(), 1);
+        assert_eq!(feedback[0].email, "gone@example.com");
+    }
 }

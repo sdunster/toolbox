@@ -285,6 +285,13 @@ const TABLES: &[Table] = &[
         ttl: None,
     },
     Table {
+        name: "email_suppression",
+        hash: "id",
+        attrs: &[Attr("id", S)],
+        gsis: &[],
+        ttl: None,
+    },
+    Table {
         name: "webauthn_credential",
         hash: "id",
         attrs: &[Attr("id", S), Attr("user_id", S)],

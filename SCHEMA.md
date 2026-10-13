@@ -10,7 +10,8 @@ development.
 
 All tables use `PAY_PER_REQUEST` billing (on-demand capacity); there is no provisioned throughput
 to tune. Hash keys are a 12-char nanoid unless noted otherwise (a few tables — `inbound_address`,
-`login_code`, `processed_message` — key on a natural value instead, called out below).
+`login_code`, `email_suppression`, `processed_message` — key on a natural value instead, called out
+below).
 
 DynamoDB only enforces uniqueness on the primary key. All other uniqueness requirements (e.g. one
 `slug` per instance) are enforced at the application layer.
@@ -798,6 +799,37 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
 
 Any member (owner or agent) of the invoicing instance can create/update/delete expenses; superusers
 get no access. An archived project takes no new expenses, but one already on it stays editable.
+
+---
+
+### `{prefix}_email_suppression`
+
+| Attribute | Type | Role                                                              |
+| --------- | ---- | ------------------------------------------------------------------- |
+| `id`      | S    | Hash key (PK) — the lowercased email address itself, not a nanoid |
+
+No GSIs. Durable (deletion protection, 35-day PITR). Addresses Toolbox has stopped mailing because
+SES reported a **permanent** bounce or a **spam complaint** for them (issue #6). Written by the
+inbound-mail Lambda from the SES configuration set's `BOUNCE`/`COMPLAINT` event destination
+(`infra/ses_feedback.tf` → `api/src/suppression.rs`); read with one `BatchGetItem` of the
+recipients before every instance-mail send (ticket replies and notices, staff notifications,
+invoices and credit notes), which then leaves a suppressed address out. Keyed on the address
+rather than an id because that lookup is the only access pattern, and the reason it has to be a
+strongly consistent key read rather than a GSI. Global, not per instance — see
+`suppression.rs`'s doc comment. Rows are only ever removed by an operator (`cli suppression
+remove`).
+
+**Non-obvious attributes:**
+
+- `reason` (S) — `hard_bounce` | `complaint`. Written with `if_not_exists`: the *first* event
+  wins, so a complaint stays a complaint after SES starts bouncing the address as
+  `OnAccountSuppressionList`.
+- `detail` (S) — absent when SES gave none; the first event's bounce sub-type, SMTP status and
+  diagnostic code, or the complaint's feedback type. Capped at 500 chars. Also `if_not_exists`.
+- `suppressed_at` (N) — first event (`if_not_exists`)
+- `last_event_at` (N) — most recent event
+- `event_count` (N) — `ADD`ed on every event, so a redelivered SNS message counts twice; it is
+  for an operator's eye, not a precise tally
 
 ---
 

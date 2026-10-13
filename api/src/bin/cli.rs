@@ -66,6 +66,22 @@ enum Object {
         #[command(subcommand)]
         cmd: MailCmd,
     },
+    /// Addresses Toolbox no longer mails after a hard bounce or a spam
+    /// complaint (see `toolbox::suppression`).
+    Suppression {
+        #[command(subcommand)]
+        cmd: SuppressionCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SuppressionCmd {
+    /// List every suppressed address.
+    List,
+    /// Stop suppressing an address, so instance mail is sent to it again.
+    /// Only Toolbox's own list: SES keeps an account-level suppression list
+    /// of its own, which this does not touch — see the message printed.
+    Remove { email: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -701,6 +717,59 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+async fn run_suppression(db: &impl Handler, cmd: SuppressionCmd, dry_run: bool) -> Result<()> {
+    match cmd {
+        SuppressionCmd::List => {
+            println!(
+                "{:<40}  {:<12}  {:<12}  {:>6}  detail",
+                "email", "reason", "since", "events"
+            );
+            let mut cursor = None;
+            let mut count = 0;
+            loop {
+                let page = db.scan_email_suppressions(cursor).await?;
+                for row in page.rows {
+                    match row {
+                        Ok(s) => {
+                            count += 1;
+                            println!(
+                                "{:<40}  {:<12}  {:<12}  {:>6}  {}",
+                                s.email,
+                                s.reason.as_str(),
+                                s.suppressed_at,
+                                s.event_count,
+                                s.detail.as_deref().unwrap_or("")
+                            );
+                        }
+                        Err(e) => eprintln!("unreadable row: {e}"),
+                    }
+                }
+                match page.next {
+                    Some(next) => cursor = Some(next),
+                    None => break,
+                }
+            }
+            println!("{count} suppressed address(es)");
+        }
+        SuppressionCmd::Remove { email } => {
+            let normalized = email.trim().to_lowercase();
+            if dry_run {
+                println!("[dry-run] would stop suppressing {normalized}");
+                return Ok(());
+            }
+            if !db.delete_email_suppression(&normalized).await? {
+                bail!("{normalized} is not suppressed");
+            }
+            println!("{normalized} is no longer suppressed by Toolbox.");
+            println!(
+                "SES may still hold it on the account-level suppression list; to clear that too:\n  \
+                 aws sesv2 delete-suppressed-destination --email-address {normalized}"
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -724,5 +793,6 @@ async fn main() -> Result<()> {
         Object::User { cmd } => run_user(&db, cmd, cli.dry_run).await,
         Object::Member { cmd } => run_member(&db, cmd, cli.dry_run).await,
         Object::Mail { cmd } => run_mail(db, cmd, cli.dry_run).await,
+        Object::Suppression { cmd } => run_suppression(&db, cmd, cli.dry_run).await,
     }
 }
