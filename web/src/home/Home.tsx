@@ -1,13 +1,24 @@
+import { Navigate } from "react-router";
 import { ButtonLink } from "../components/ui/Button";
 import { Card } from "../components/ui/Card";
+import { getSessionToken } from "../lib/sessionToken";
 
 /**
  * The front door: `/`. Two ways in, matching the build plan — log in (staff
  * working the queue) or submit a new ticket (a member of the public). No
  * data fetching, no auth — this page exists to route the two audiences
  * apart before anything else loads.
+ *
+ * Someone who already holds a session token skips straight to `/app`
+ * rather than being asked to "Log in" again. The token isn't validated
+ * here: if it has expired, `/app`'s `AuthenticatedSession` gets the 401 and
+ * shows the login page in place, same as any other stale session.
  */
 export default function Home() {
+  if (getSessionToken()) {
+    return <Navigate to="/app" replace />;
+  }
+
   return (
     <main className="flex min-h-screen flex-col items-center justify-center gap-10 bg-surface px-4 py-16">
       <div className="text-center">
