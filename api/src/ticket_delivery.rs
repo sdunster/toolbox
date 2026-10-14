@@ -12,6 +12,12 @@
 //! view joins the two on the SES id inside `rfc_message_id`
 //! (`db::ses_message_id_from_rfc`).
 //!
+//! Opens and clicks ([`db::Engagement`]) are recorded per *message*, not per
+//! recipient, in one row keyed by the bare `{ses_message_id}`
+//! (`db::MessageEngagement`): a ticket message goes out as one SES message to
+//! every To/Cc address, so they share one tracking pixel and SES can't say
+//! which of them opened it. Only the first time of each is kept.
+//!
 //! Staff notifications are not tagged: they go to members, not to the people
 //! a ticket is for. Statuses only move forward (`db::DeliveryStatus::rank`),
 //! exactly as for broadcasts. One consumer of [`crate::ses_events`].
@@ -47,6 +53,25 @@ pub fn updates_from(event: &SesEvent) -> Option<(String, String, Vec<RecipientOu
 /// is not an error; only a database failure is (so the Lambda retries, and
 /// every write is idempotent).
 pub async fn apply<H: db::Handler>(db: &H, event: &SesEvent) -> Result<String> {
+    if let Some(engagement) = event.engagement() {
+        let (Some(ticket_id), Some(ses_message_id)) =
+            (event.tag(TAG_TICKET_ID), event.message_id.as_deref())
+        else {
+            return Ok("not a tracked ticket message".to_string());
+        };
+        let at = event.at.unwrap_or_else(crate::clock::now_sec);
+        let recorded = db
+            .record_message_engagement(ticket_id, ses_message_id, engagement, at)
+            .await?;
+        return Ok(format!(
+            "ticket {ticket_id} message {ses_message_id}: {engagement:?} {}",
+            if recorded {
+                "recorded"
+            } else {
+                "not recorded (an earlier one is already stored)"
+            }
+        ));
+    }
     let Some((ticket_id, ses_message_id, outcomes)) = updates_from(event) else {
         return Ok("not a tracked ticket message".to_string());
     };
@@ -111,6 +136,17 @@ mod tests {
             "mail": { "messageId": "m", "tags": { "ticket_id": ["T1"] } }
         }));
         assert!(updates_from(&send).is_none());
+    }
+
+    #[test]
+    fn an_open_is_engagement_not_a_recipient_update() {
+        let open = event(serde_json::json!({
+            "eventType": "Open",
+            "mail": { "messageId": "m", "destination": ["a@example.com", "b@example.com"], "tags": { "ticket_id": ["T1"] } },
+            "open": { "timestamp": "2026-10-13T02:00:00.000Z" }
+        }));
+        assert!(updates_from(&open).is_none());
+        assert_eq!(open.engagement(), Some(db::Engagement::Open));
     }
 
     #[test]

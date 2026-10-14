@@ -812,6 +812,12 @@ fn broadcast_recipient_to_av(r: &db::BroadcastRecipient) -> AttributeValue {
             AttributeValue::N(v.to_string()),
         );
     }
+    if let Some(v) = r.first_opened_at {
+        m.insert("first_opened_at".into(), AttributeValue::N(v.to_string()));
+    }
+    if let Some(v) = r.first_clicked_at {
+        m.insert("first_clicked_at".into(), AttributeValue::N(v.to_string()));
+    }
     AttributeValue::M(m)
 }
 
@@ -860,6 +866,8 @@ impl TryInto<db::Broadcast> for Item {
                         delivery_updated_at: item
                             .i64_field("delivery_updated_at")?
                             .map(|t| t as u64),
+                        first_opened_at: item.i64_field("first_opened_at")?.map(|t| t as u64),
+                        first_clicked_at: item.i64_field("first_clicked_at")?.map(|t| t as u64),
                     })
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?,
@@ -882,16 +890,26 @@ impl TryInto<db::Broadcast> for Item {
     }
 }
 
-impl TryInto<db::MessageDelivery> for Item {
+/// A `message_delivery` row is a per-recipient delivery row when it has an
+/// `email`, else the message's engagement row (`id = {ses_message_id}`).
+impl TryInto<db::MessageDeliveryRow> for Item {
     type Error = HydrationError;
-    fn try_into(self) -> Result<db::MessageDelivery, Self::Error> {
+    fn try_into(self) -> Result<db::MessageDeliveryRow, Self::Error> {
         let req_s = |field: &str| -> Result<String, HydrationError> {
             Ok(self
                 .string_field(field)?
                 .ok_or_else(|| anyhow!("MessageDelivery missing {field}"))?)
         };
+        if self.string_field("email")?.is_none() {
+            return Ok(db::MessageDeliveryRow::Engagement(db::MessageEngagement {
+                ticket_id: req_s("ticket_id")?,
+                ses_message_id: req_s("ses_message_id")?,
+                first_opened_at: self.i64_field("first_opened_at")?.map(|t| t as u64),
+                first_clicked_at: self.i64_field("first_clicked_at")?.map(|t| t as u64),
+            }));
+        }
         let status = req_s("delivery_status")?;
-        Ok(db::MessageDelivery {
+        Ok(db::MessageDeliveryRow::Recipient(db::MessageDelivery {
             ticket_id: req_s("ticket_id")?,
             ses_message_id: req_s("ses_message_id")?,
             email: req_s("email")?,
@@ -902,7 +920,7 @@ impl TryInto<db::MessageDelivery> for Item {
                 .i64_field("updated_at")?
                 .ok_or_else(|| anyhow!("MessageDelivery missing updated_at"))?
                 as u64,
-        })
+        }))
     }
 }
 
@@ -4879,6 +4897,32 @@ impl db::Handler for Handler {
         conditional_write_result("set_broadcast_delivery", resp)
     }
 
+    async fn set_broadcast_engagement(
+        &self,
+        id: &str,
+        index: usize,
+        engagement: db::Engagement,
+        at: u64,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let attr = format!("recipients[{index}].{}", engagement.first_at_attribute());
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .update_expression(format!("SET {attr} = :at"))
+            .condition_expression(format!(
+                "attribute_exists(recipients[{index}]) AND \
+                 (attribute_not_exists({attr}) OR {attr} > :at)"
+            ))
+            .expression_attribute_values(":at", AttributeValue::N(at.to_string()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_broadcast_engagement", resp)
+    }
+
     async fn get_broadcast_consistent(&self, id: &str) -> db::Result<Option<db::Broadcast>> {
         self.get_record_consistent("get_broadcast_consistent", "broadcast", id)
             .await
@@ -4959,10 +5003,38 @@ impl db::Handler for Handler {
         conditional_write_result("record_message_delivery", resp)
     }
 
+    async fn record_message_engagement(
+        &self,
+        ticket_id: &str,
+        ses_message_id: &str,
+        engagement: db::Engagement,
+        at: u64,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let s = |v: &str| AttributeValue::S(v.to_string());
+        let attr = engagement.first_at_attribute();
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("message_delivery"))
+            .key("id", s(ses_message_id))
+            .update_expression(format!(
+                "SET ticket_id = :ticket_id, ses_message_id = :mid, {attr} = :at"
+            ))
+            .condition_expression(format!("attribute_not_exists({attr}) OR {attr} > :at"))
+            .expression_attribute_values(":ticket_id", s(ticket_id))
+            .expression_attribute_values(":mid", s(ses_message_id))
+            .expression_attribute_values(":at", AttributeValue::N(at.to_string()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("record_message_engagement", resp)
+    }
+
     async fn list_message_deliveries(
         &self,
         ticket_id: &str,
-    ) -> db::Result<Vec<db::MessageDelivery>> {
+    ) -> db::Result<Vec<db::MessageDeliveryRow>> {
         query_all("list_message_deliveries", || {
             self.client
                 .query()

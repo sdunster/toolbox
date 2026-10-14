@@ -2,7 +2,7 @@ import { graphql, useFragment } from "react-relay";
 import type { BroadcastHistory_broadcasts$key } from "./__generated__/BroadcastHistory_broadcasts.graphql";
 import { formatTimestamp } from "../../lib/dates";
 import { recipientStatus } from "../../lib/broadcast";
-import { statusToneClass } from "../../lib/deliveryStatus";
+import { ENGAGEMENT_CAVEAT, statusToneClass } from "../../lib/deliveryStatus";
 
 const broadcastHistoryFragment = graphql`
   fragment BroadcastHistory_broadcasts on Broadcast @relay(plural: true) {
@@ -16,6 +16,8 @@ const broadcastHistoryFragment = graphql`
     deliveredCount
     bouncedCount
     complainedCount
+    openedCount
+    clickedCount
     createdBy {
       name
       email
@@ -26,6 +28,8 @@ const broadcastHistoryFragment = graphql`
       error
       deliveryStatus
       deliveryDetail
+      openedAt
+      clickedAt
     }
   }
 `;
@@ -35,11 +39,15 @@ function counts(b: {
   deliveredCount: number;
   bouncedCount: number;
   complainedCount: number;
+  openedCount: number;
+  clickedCount: number;
   failedCount: number;
   suppressedCount: number;
 }): string {
   const parts = [`${b.recipientCount} sent to`];
   if (b.deliveredCount) parts.push(`${b.deliveredCount} delivered`);
+  if (b.openedCount) parts.push(`${b.openedCount} opened`);
+  if (b.clickedCount) parts.push(`${b.clickedCount} clicked a link`);
   if (b.bouncedCount) parts.push(`${b.bouncedCount} bounced`);
   if (b.complainedCount) parts.push(`${b.complainedCount} marked as spam`);
   if (b.failedCount) parts.push(`${b.failedCount} failed`);
@@ -51,8 +59,10 @@ function counts(b: {
 /**
  * Past broadcasts, newest first, each expandable to every recipient's
  * status — what happened at send time, then what SES reported (delivered,
- * bounced with the receiving server's reason, marked as spam). Statuses
- * arrive asynchronously; reloading the page picks up new ones.
+ * bounced with the receiving server's reason, marked as spam), and whether
+ * that recipient's copy was opened or a link in it clicked (approximate —
+ * see `ENGAGEMENT_CAVEAT`). Statuses arrive asynchronously; reloading the
+ * page picks up new ones.
  */
 export function BroadcastHistory({
   broadcasts,
@@ -104,6 +114,22 @@ export function BroadcastHistory({
                             >
                               {status.label}
                             </span>
+                            {r.openedAt != null && (
+                              <span
+                                title={`First opened ${formatTimestamp(r.openedAt)}. ${ENGAGEMENT_CAVEAT}`}
+                                className={`ml-1 rounded-sm px-2 py-0.5 text-xs font-medium ${statusToneClass.neutral}`}
+                              >
+                                Opened
+                              </span>
+                            )}
+                            {r.clickedAt != null && (
+                              <span
+                                title={`First clicked ${formatTimestamp(r.clickedAt)}.`}
+                                className={`ml-1 rounded-sm px-2 py-0.5 text-xs font-medium ${statusToneClass.neutral}`}
+                              >
+                                Clicked
+                              </span>
+                            )}
                           </td>
                           <td className="px-4 py-2 text-xs break-all text-ink-muted">
                             {r.deliveryDetail ?? r.error ?? ""}

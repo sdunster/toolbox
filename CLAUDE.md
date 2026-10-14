@@ -172,13 +172,22 @@ local setup, and `SCHEMA.md` for the data model.
 
 - **SES events: parsed once, many consumers (`api/src/ses_events.rs`).** The `toolbox-mail-feedback`
   event destination (`infra/ses_feedback.tf`) publishes `BOUNCE`, `COMPLAINT`, `DELIVERY`,
-  `DELIVERY_DELAY` and `REJECT` for every send. `bin/inbound-mail`'s SNS handler parses each
+  `DELIVERY_DELAY`, `REJECT`, `OPEN` and `CLICK` for every send. `bin/inbound-mail`'s SNS handler parses each
   message once into a `SesEvent` (typed per-type blocks, the message's tags, and
   `recipient_outcomes()` — one `DeliveryStatus` plus reason per affected recipient) and hands the
   same value to every consumer, each of which acts only on what concerns it:
   - `suppression::record_event` — permanent bounces and complaints, keyed on addresses, every send;
   - `broadcast_events::apply` — the `broadcast_id`/`broadcast_recipient` tags;
   - `ticket_delivery::apply` — the `ticket_id` tag (below).
+
+  **Opens and clicks (`db::Engagement`) are not delivery statuses.** They're stored apart from
+  `delivery_status` (a message is opened *after* it's delivered), as the *first* time each happened
+  (`first_opened_at`/`first_clicked_at`, conditioned on no earlier one — idempotent, no counters).
+  Subscribing to `OPEN`/`CLICK` is what makes SES add its tracking pixel to every HTML send and
+  rewrite `<a href>` links through `awstrack.me`, untagged system mail included. Our HTML bodies are
+  escaped plain text with no `<a>` tags, so in practice only opens arrive. Opens are approximate
+  (Apple Mail Privacy Protection loads every pixel; image blocking hides real reads), and the UI
+  says so (`ENGAGEMENT_CAVEAT` in `web/src/lib/deliveryStatus.ts`).
 
   **A consumer joins on tags, never on a lookup**: SES echoes a message's `EmailTags` on every
   event, and only this system sets them, so the write is by primary key with no GSI and no race
@@ -200,6 +209,11 @@ local setup, and `SCHEMA.md` for the data model.
   ticket's rows once per request (`TicketDeliveriesKey` DataLoader, `ticket_id-index`); it is
   members-only by construction (reached through `Ticket.messages`). The thread view shows a chip per
   recipient (Delivered / Delayed / Bounced / Rejected / Marked as spam, reason in the tooltip).
+  **Opens and clicks are per message, never per recipient** (`TicketMessage.openedAt`/`clickedAt`,
+  one `message_delivery` row keyed by the bare `{ses_message_id}`): one SES message goes to every
+  To/Cc address, so they share one pixel and SES can't say who opened it. Don't attribute one to a
+  recipient. Broadcasts send one copy per recipient, so theirs (`BroadcastRecipient.openedAt`) are
+  exact.
   Mail sent before this shipped simply has no rows.
 
 - **Rows reference an instance by `id`, never by `slug`.** Slugs are editable and exist for

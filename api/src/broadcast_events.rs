@@ -22,8 +22,17 @@ use crate::ses_events::SesEvent;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedEvent {
     /// Nothing to record — not a broadcast message, or an event type that
-    /// carries no delivery outcome (`Send`, `Open`, `Click`, …).
+    /// carries no delivery outcome (`Send`, …).
     Ignored(String),
+    /// The recipient's copy was opened or clicked. A broadcast copy has
+    /// exactly one recipient, so — unlike ticket mail — this is exact about
+    /// who.
+    Engagement {
+        broadcast_id: String,
+        index: usize,
+        engagement: db::Engagement,
+        at: u64,
+    },
     Update {
         broadcast_id: String,
         index: usize,
@@ -47,6 +56,14 @@ pub fn update_from(event: &SesEvent, now: u64) -> ParsedEvent {
             "{kind} event for broadcast {broadcast_id} has no usable recipient tag"
         ));
     };
+    if let Some(engagement) = event.engagement() {
+        return ParsedEvent::Engagement {
+            broadcast_id: broadcast_id.to_string(),
+            index,
+            engagement,
+            at: event.at.unwrap_or(now),
+        };
+    }
     let Some(outcome) = event.recipient_outcomes().into_iter().next() else {
         return ParsedEvent::Ignored(format!(
             "{kind} event for broadcast {broadcast_id} carries no delivery outcome"
@@ -78,6 +95,24 @@ pub async fn apply<H: db::Handler>(db: &H, event: &SesEvent) -> Result<String> {
     let now = crate::clock::now_sec();
     match update_from(event, now) {
         ParsedEvent::Ignored(reason) => Ok(reason),
+        ParsedEvent::Engagement {
+            broadcast_id,
+            index,
+            engagement,
+            at,
+        } => {
+            let applied = db
+                .set_broadcast_engagement(&broadcast_id, index, engagement, at)
+                .await?;
+            Ok(format!(
+                "broadcast {broadcast_id} recipient {index}: {engagement:?} {}",
+                if applied {
+                    "recorded"
+                } else {
+                    "not recorded (unknown recipient, or an earlier one is already stored)"
+                }
+            ))
+        }
         ParsedEvent::Update {
             broadcast_id,
             index,
@@ -244,6 +279,37 @@ mod tests {
         assert!(matches!(
             parse_event(&msg, 0).unwrap(),
             ParsedEvent::Ignored(_)
+        ));
+    }
+
+    #[test]
+    fn an_open_or_click_is_an_engagement_for_its_recipient() {
+        let msg = event(
+            "Open",
+            "open",
+            serde_json::json!({ "timestamp": "2026-10-13T02:00:00.000Z" }),
+        );
+        assert_eq!(
+            parse_event(&msg, 0).unwrap(),
+            ParsedEvent::Engagement {
+                broadcast_id: "AbC123xyz789".into(),
+                index: 2,
+                engagement: db::Engagement::Open,
+                at: 1_791_856_800,
+            }
+        );
+        let msg = event(
+            "Click",
+            "click",
+            serde_json::json!({ "link": "https://example.com/" }),
+        );
+        assert!(matches!(
+            parse_event(&msg, 0).unwrap(),
+            ParsedEvent::Engagement {
+                engagement: db::Engagement::Click,
+                at: 1_791_853_200,
+                ..
+            }
         ));
     }
 

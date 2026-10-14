@@ -771,6 +771,11 @@ upsert conditioned on `delivery_rank`, so status only moves forward. Never delet
 - `delivery_status` (S) — `delayed`/`delivered`/`bounced`/`rejected`/`complained`; `delivery_rank`
   (N) — its forward-only rank; `delivery_detail` (S) — optional reason; `updated_at` (N) — the
   event's time.
+- **Engagement rows** — one per message, `id = {ses_message_id}` (no `#email`, and no `email`
+  attribute, which is how hydration tells them apart): `ticket_id`, `ses_message_id`, and
+  optional `first_opened_at`/`first_clicked_at` (N), each written by
+  `record_message_engagement` only if absent or later than the new time. Per message because all of
+  a message's recipients share one tracking pixel.
 
 ---
 
@@ -806,7 +811,8 @@ recipient as its send returns) and by the inbound-mail Lambda as SES delivery ev
   API) plus, when set, `provider_message_id`, `error` (a reserved word — `#err`), and the
   provider-reported `delivery_status` (`delayed`/`delivered`/`bounced`/`rejected`/`complained`),
   `delivery_rank`, `delivery_detail` and `delivery_updated_at` (written only by
-  `set_broadcast_delivery`). The two halves are written by different processes and never touch each
+  `set_broadcast_delivery`), and `first_opened_at`/`first_clicked_at` (N, written only by
+  `set_broadcast_engagement`, keeping the earliest). The two halves are written by different processes and never touch each
   other's keys. `delivery_rank` (`db::BroadcastDeliveryStatus::rank`) is the condition that keeps a
   late, less-final event (a `DeliveryDelay` after the `Bounce`) from overwriting a final one.
 

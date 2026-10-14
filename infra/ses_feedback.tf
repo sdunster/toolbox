@@ -1,13 +1,21 @@
-# Bounce and complaint feedback for outbound mail (issue #6), plus broadcast
-# delivery tracking:
+# Bounce and complaint feedback for outbound mail (issue #6), plus delivery
+# and open/click tracking:
 #
 #   SES configuration set (ses.tf) -> event destination
-#     (BOUNCE, COMPLAINT, DELIVERY, DELIVERY_DELAY, REJECT)
+#     (BOUNCE, COMPLAINT, DELIVERY, DELIVERY_DELAY, REJECT, OPEN, CLICK)
 #     -> this SNS topic -> inbound-mail Lambda, invoked directly
 #        -> api/src/suppression.rs records the address in email_suppression
 #           (bounces and complaints only)
-#        -> api/src/broadcast_events.rs records the outcome on the broadcast
-#           recipient its message tags name (broadcast mail only)
+#        -> api/src/broadcast_events.rs records the outcome, or the first
+#           open/click, on the broadcast recipient its message tags name
+#        -> api/src/ticket_delivery.rs does the same for ticket mail (per
+#           recipient for delivery, per message for opens/clicks)
+#
+# Subscribing to OPEN and CLICK is what makes SES add an open-tracking pixel
+# to every HTML message sent through the configuration set, and rewrite its
+# links through SES's click-tracking redirect (no custom tracking domain, so
+# links go via awstrack.me). Untagged mail (login codes, staff notices) gets
+# both too; its events are simply not recorded.
 #
 # Every identity uses aws_sesv2_configuration_set.main as its default, so this
 # covers every send — instance mail and system mail alike. The Lambda is the
@@ -53,7 +61,7 @@ resource "aws_sesv2_configuration_set_event_destination" "feedback" {
 
   event_destination {
     enabled              = true
-    matching_event_types = ["BOUNCE", "COMPLAINT", "DELIVERY", "DELIVERY_DELAY", "REJECT"]
+    matching_event_types = ["BOUNCE", "COMPLAINT", "DELIVERY", "DELIVERY_DELAY", "REJECT", "OPEN", "CLICK"]
 
     sns_destination {
       topic_arn = aws_sns_topic.mail_feedback.arn

@@ -27,6 +27,14 @@ export function deliveryStatusLabel(
   }
 }
 
+/**
+ * Why an open or click is only a hint — shown wherever one is. Some mail apps
+ * load every image as mail arrives (Apple Mail's privacy protection), which
+ * SES sees as an open; others block images, so a read message shows none.
+ */
+export const ENGAGEMENT_CAVEAT =
+  "Approximate: some mail apps load images automatically (counted as opened), and others block them (never counted).";
+
 export const statusToneClass: Record<StatusTone, string> = {
   neutral: "bg-surface-sunken text-ink-muted",
   good: "bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-300",
