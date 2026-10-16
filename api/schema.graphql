@@ -231,6 +231,15 @@ enum BroadcastSendStatusType {
 }
 
 """
+A saved broadcast sender — see `db::BroadcastSender`.
+"""
+type BroadcastSender {
+	id: ID!
+	name: String!
+	address: String!
+}
+
+"""
 `createProject`'s argument.
 
 - `clientEmail`: where `sendInvoice` mails by default.
@@ -657,6 +666,13 @@ type Instance {
 	instance.
 	"""
 	broadcastFromDomains: [String!]!
+	"""
+	Saved From name + address pairs to pick from when drafting a
+	broadcast, in the order they were added (`addBroadcastSender`).
+	Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+	instance.
+	"""
+	broadcastSenders: [BroadcastSender!]!
 }
 
 """
@@ -1046,6 +1062,28 @@ type MutationRoot {
 	complaints arrive through `broadcast_events`.
 	"""
 	sendBroadcast(instanceId: ID!, input: SendBroadcastInput!): Broadcast!
+	"""
+	Save a From name + address to pick from when drafting a broadcast
+	(`Instance.broadcastSenders`), e.g. `SES Activity Updates
+	<updates@seslogin.com>`. Sends nothing. The address must pass the
+	same check `sendBroadcast` applies to a From address
+	(`broadcast::validate_sender`); `sendBroadcast` still re-checks it at
+	send time, so a sender whose domain is later removed is refused then
+	rather than trusted. Returns the instance, so a client's cached
+	`broadcastSenders` updates in place.
+	
+	Owner-only — not superuser — like `sendBroadcast`, the only thing a
+	sender is for. An invoicing, deleted or missing instance is
+	`NOT_FOUND`; a concurrent change to the list is `CONFLICT`.
+	"""
+	addBroadcastSender(instanceId: ID!, name: String!, address: String!): Instance!
+	"""
+	Remove a saved broadcast sender. Same guard and `NOT_FOUND`/`CONFLICT`
+	posture as `addBroadcastSender`; an unknown `senderId` is `NOT_FOUND`.
+	Past broadcasts are unaffected — each one stores the From it was
+	actually sent with.
+	"""
+	deleteBroadcastSender(instanceId: ID!, senderId: ID!): Instance!
 	"""
 	Add an inbound address to an instance. Owner-or-superuser — see
 	`Instance::inbound_addresses`'s doc comment. `address` is normalized

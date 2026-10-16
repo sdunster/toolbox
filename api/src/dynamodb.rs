@@ -429,6 +429,11 @@ impl TryInto<db::Instance> for Item {
             gst_registered: self.bool_field("gst_registered")?.unwrap_or(false),
             currency: self.string_field("currency")?,
             payment_terms_days: self.i64_field("payment_terms_days")?.map(|d| d as u32),
+            broadcast_senders: match self.string_field("broadcast_senders")? {
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| anyhow!("Instance has corrupt broadcast_senders: {e}"))?,
+                None => Vec::new(),
+            },
         })
     }
 }
@@ -1896,6 +1901,7 @@ impl db::Handler for Handler {
             gst_registered: false,
             currency: None,
             payment_terms_days: None,
+            broadcast_senders: Vec::new(),
         })
     }
 
@@ -4907,6 +4913,50 @@ impl db::Handler for Handler {
             .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
         record_capacity("list_broadcasts", resp.consumed_capacity(), CapKind::Read);
         Ok(hydrate_items(resp.items)?)
+    }
+
+    async fn set_broadcast_senders(
+        &self,
+        instance_id: &str,
+        previous: &[db::BroadcastSender],
+        senders: &[db::BroadcastSender],
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let to_json = |list: &[db::BroadcastSender]| -> db::Result<Option<String>> {
+            if list.is_empty() {
+                return Ok(None);
+            }
+            serde_json::to_string(list)
+                .map(Some)
+                .map_err(|e| db::Error::Infrastructure(format!("serializing senders: {e}")))
+        };
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("instance"))
+            .key("id", AttributeValue::S(instance_id.to_string()));
+        // The stored string is exactly what serializing `previous` gives
+        // back (it was written by this same code from the same type), so
+        // comparing strings detects any change in between.
+        req = match to_json(previous)? {
+            Some(old) => req
+                .condition_expression("attribute_exists(id) AND broadcast_senders = :old")
+                .expression_attribute_values(":old", AttributeValue::S(old)),
+            None => req.condition_expression(
+                "attribute_exists(id) AND attribute_not_exists(broadcast_senders)",
+            ),
+        };
+        req = match to_json(senders)? {
+            Some(new) => req
+                .update_expression("SET broadcast_senders = :new")
+                .expression_attribute_values(":new", AttributeValue::S(new)),
+            None => req.update_expression("REMOVE broadcast_senders"),
+        };
+        let resp = req
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_broadcast_senders", resp)
     }
 
     // ── message_delivery ──────────────────────────────────────────────────

@@ -73,6 +73,10 @@ instance record, so projecting more into the index would just be wasted storage.
   A non-blank value must be 3 uppercase ASCII letters (`db::validate_currency_code`).
 - `payment_terms_days` (N) — invoicing setting, `0..=365`; absent means 14
   (`db::DEFAULT_PAYMENT_TERMS_DAYS`). A project's own `payment_terms_days` overrides it.
+- `broadcast_senders` (S) — support instances only: JSON list of saved broadcast senders
+  (`db::BroadcastSender` — `{id, name, address}`), at most 20, absent when empty. Written whole by
+  `set_broadcast_senders`, conditioned on the stored string still being the one the caller read
+  (or absent), so concurrent edits fail with `CONFLICT` instead of losing one.
 - `deleted` (Bool) — soft-delete marker, same omit convention: only ever
   written `true`; absent means active. Set/cleared only via
   `InstanceUpdateShape::SetDeleted` (`setInstanceDeleted`/`bin/cli.rs`'s

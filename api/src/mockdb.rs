@@ -633,6 +633,15 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    async fn set_broadcast_senders(
+        &self,
+        _instance_id: &str,
+        _previous: &[db::BroadcastSender],
+        _senders: &[db::BroadcastSender],
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
     // ── message_delivery ──────────────────────────────────────────────────
 
     async fn record_message_delivery(
