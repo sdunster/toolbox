@@ -38,7 +38,10 @@ local setup, and `SCHEMA.md` for the data model.
   delays). `worker::run_job` is the single entry point both use. A new job is a new `Job` variant
   plus one arm in `run_job`; SQS delivers at least once, so every job must be safe to run twice.
   Don't add a second queue or a scheduled "tick" for background work — a delayed job (≤ 15
-  minutes, `queue::MAX_DELAY_SECS`) that re-queues itself covers pacing at no idle cost.
+  minutes, `queue::MAX_DELAY_SECS`) that re-queues itself covers pacing at no idle cost. A job
+  that re-queues itself is the worker invoking itself, which Lambda's recursive loop detection
+  stops after ~16 hops by default (the message silently exhausts its receives into the DLQ);
+  `infra/lambda_worker.tf` sets `recursive_loop = "Allow"` for exactly this — keep it.
 - **Outbound mail: which ticket updates email.** The build plan says "every ticket update that is
   not an internal note mails requesters + CCs" — read literally that would include assignment and
   requester/CC-list edits, which would mean a customer gets an email every time a ticket changes

@@ -50,3 +50,15 @@ resource "aws_lambda_event_source_mapping" "worker" {
   function_name    = aws_lambda_function.worker.arn
   batch_size       = 1
 }
+
+# A broadcast batch queues its own successor (api/src/broadcast_send.rs), so
+# every batch is this function invoking itself through the worker queue.
+# Lambda's recursive loop detection counts those hops via the X-Ray trace
+# header and, by default, refuses the invocation after ~16 — the job then
+# exhausts its receives without ever running and lands in the DLQ, stalling
+# any broadcast past ~80 recipients. The loop is deliberate and bounded
+# (MAX_BROADCAST_RECIPIENTS / BATCH_SIZE hops, BATCH_INTERVAL_SECS apart).
+resource "aws_lambda_function_recursion_config" "worker" {
+  function_name  = aws_lambda_function.worker.function_name
+  recursive_loop = "Allow"
+}
