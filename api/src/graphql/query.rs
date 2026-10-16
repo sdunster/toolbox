@@ -658,6 +658,7 @@ pub struct SendBroadcastInput {
 #[derive(Enum, Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BroadcastSendStatusType {
     Pending,
+    Sending,
     Sent,
     Failed,
     Suppressed,
@@ -667,6 +668,7 @@ impl From<db::BroadcastSendStatus> for BroadcastSendStatusType {
     fn from(s: db::BroadcastSendStatus) -> Self {
         match s {
             db::BroadcastSendStatus::Pending => Self::Pending,
+            db::BroadcastSendStatus::Sending => Self::Sending,
             db::BroadcastSendStatus::Sent => Self::Sent,
             db::BroadcastSendStatus::Failed => Self::Failed,
             db::BroadcastSendStatus::Suppressed => Self::Suppressed,
@@ -819,6 +821,33 @@ impl<A: App + HasDb + Send + Sync + 'static> Broadcast<A> {
     }
     async fn recipient_count(&self) -> i32 {
         self.rec.recipients.len() as i32
+    }
+    /// Still sending: more batches are queued. The worker sends
+    /// `broadcast::BATCH_SIZE` recipients every
+    /// `broadcast::BATCH_INTERVAL_SECS` — see `crate::broadcast_send`.
+    async fn in_progress(&self) -> bool {
+        self.rec.in_progress()
+    }
+    /// Waiting for a later batch.
+    async fn pending_count(&self) -> i32 {
+        self.count(|r| r.send_status == db::BroadcastSendStatus::Pending)
+    }
+    /// When the next batch is due (epoch seconds); `null` once done.
+    async fn next_batch_at(&self) -> Option<i64> {
+        self.rec.next_batch_at.map(|t| t as i64)
+    }
+    /// When the last pending recipient is expected to be sent (epoch
+    /// seconds), at the current pace; `null` once done.
+    async fn estimated_finish_at(&self) -> Option<i64> {
+        let pending = self
+            .rec
+            .recipients
+            .iter()
+            .filter(|r| r.send_status == db::BroadcastSendStatus::Pending)
+            .count();
+        self.rec
+            .next_batch_at
+            .map(|at| (at + crate::broadcast_send::estimated_duration_secs(pending)) as i64)
     }
     async fn sent_count(&self) -> i32 {
         self.count(|r| r.send_status == db::BroadcastSendStatus::Sent)

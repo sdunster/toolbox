@@ -30,7 +30,7 @@
 
 use serde_json::{Value, json};
 
-use crate::app::{App, HasDb, HasMail, HasStorage};
+use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 
 use super::tool::{ToolContext, ToolOutcome, missing_argument};
 
@@ -900,7 +900,7 @@ pub async fn dispatch<A>(
     arguments: &Value,
 ) -> Option<ToolOutcome>
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     Some(match name {
         "list_projects" => list_projects(ctx, arguments).await,
@@ -1325,7 +1325,7 @@ where
 
 async fn list_projects<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(instance_id) = string_arg(arguments, "instanceId") else {
         return missing_argument("instanceId");
@@ -1351,7 +1351,7 @@ where
 
 async fn create_project<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let (Some(instance_id), Some(name), Some(client_name)) = (
         string_arg(arguments, "instanceId"),
@@ -1387,7 +1387,7 @@ where
 /// fields over it. An empty string clears an optional field.
 async fn update_project<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(id) = string_arg(arguments, "id") else {
         return missing_argument("id");
@@ -1440,7 +1440,7 @@ where
 
 async fn list_items<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(instance_id) = string_arg(arguments, "instanceId") else {
         return missing_argument("instanceId");
@@ -1470,7 +1470,7 @@ where
 
 async fn create_item<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let (Some(project_id), Some(date), Some(description), Some(quantity)) = (
         string_arg(arguments, "projectId"),
@@ -1499,7 +1499,7 @@ where
 
 async fn update_item<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let (Some(id), Some(date), Some(description), Some(quantity)) = (
         string_arg(arguments, "id"),
@@ -1527,7 +1527,7 @@ where
 
 async fn list_invoices<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(instance_id) = string_arg(arguments, "instanceId") else {
         return missing_argument("instanceId");
@@ -1616,7 +1616,7 @@ fn expense_input(arguments: &Value) -> Value {
 
 async fn list_expenses<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(instance_id) = string_arg(arguments, "instanceId") else {
         return missing_argument("instanceId");
@@ -1646,7 +1646,7 @@ where
 
 async fn write_expense<A>(ctx: &ToolContext<'_, A>, name: &str, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     if string_arg(arguments, "date").is_none() || string_arg(arguments, "category").is_none() {
         return missing_argument("date/category");

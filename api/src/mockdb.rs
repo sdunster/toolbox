@@ -603,6 +603,19 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    async fn claim_broadcast_recipient(&self, _id: &str, _index: usize) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn set_broadcast_progress(
+        &self,
+        _id: &str,
+        _seq: u64,
+        _next_batch_at: Option<u64>,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
     async fn set_broadcast_send_result(
         &self,
         _id: &str,

@@ -740,6 +740,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         );
         // `mtu_opaquesecret` is the old, pre-id format: rejected outright, not
@@ -764,6 +765,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         );
         for bad in ["mta_no_dot_here", "mta_.secret", "mta_id.", "mta_."] {
@@ -818,6 +820,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         );
         for token in ["mtoa_abc123.somesecret", "mtor_abc123.somesecret"] {
@@ -837,6 +840,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         );
         let result = verify_token(&my_app, "slu_not_our_scheme").await;
@@ -854,6 +858,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         );
         assert!(verify_authorization_header(&my_app, None).await.is_none());
@@ -870,6 +875,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         );
         assert!(
@@ -890,6 +896,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         );
         let result = verify_authorization_header(&my_app, Some("Bearer garbage"))

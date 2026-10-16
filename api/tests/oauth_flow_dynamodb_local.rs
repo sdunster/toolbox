@@ -43,11 +43,13 @@ use toolbox::db::Handler as _;
 use toolbox::dynamodb;
 use toolbox::graphql;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 use toolbox::oauth;
 use toolbox::oauth_http;
 
-type TestApp = app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage>;
+type TestApp =
+    app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage, mockqueue::Queue>;
 type TestSchema = graphql::ToolboxSchema<TestApp>;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
@@ -106,6 +108,7 @@ async fn fixture(prefix: &str) -> Fixture {
         db,
         mockmail::Handler::new(),
         mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
         0,
     ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));

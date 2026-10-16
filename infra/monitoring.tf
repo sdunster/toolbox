@@ -14,10 +14,10 @@ resource "aws_sns_topic_subscription" "alerts_email" {
   endpoint  = var.alert_email
 }
 
-# ── Inbound-mail pipeline ────────────────────────────────────────────────────
+# ── Worker queue ─────────────────────────────────────────────────────────────
 
-resource "aws_cloudwatch_metric_alarm" "inbound_dlq_not_empty" {
-  alarm_name          = "toolbox-inbound-dlq-not-empty"
+resource "aws_cloudwatch_metric_alarm" "worker_dlq_not_empty" {
+  alarm_name          = "toolbox-worker-dlq-not-empty"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "ApproximateNumberOfMessagesVisible"
@@ -25,11 +25,11 @@ resource "aws_cloudwatch_metric_alarm" "inbound_dlq_not_empty" {
   period              = 300
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "A message landed in the inbound-mail DLQ — it failed processing 3 times (maxReceiveCount) and needs manual attention. See sqs.tf."
+  alarm_description   = "A message landed in the worker DLQ (inbound mail or a worker job) — it failed processing 3 times (maxReceiveCount) and needs manual attention. See sqs.tf."
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    QueueName = aws_sqs_queue.inbound_mail_dlq.name
+    QueueName = aws_sqs_queue.worker_dlq.name
   }
 
   alarm_actions = [aws_sns_topic.alerts.arn]
@@ -58,8 +58,8 @@ resource "aws_cloudwatch_metric_alarm" "api_errors" {
   ok_actions    = [aws_sns_topic.alerts.arn]
 }
 
-resource "aws_cloudwatch_metric_alarm" "inbound_mail_errors" {
-  alarm_name          = "toolbox-inbound-mail-errors"
+resource "aws_cloudwatch_metric_alarm" "worker_errors" {
+  alarm_name          = "toolbox-worker-errors"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   metric_name         = "Errors"
@@ -67,11 +67,11 @@ resource "aws_cloudwatch_metric_alarm" "inbound_mail_errors" {
   period              = 300
   statistic           = "Sum"
   threshold           = 0
-  alarm_description   = "toolbox-inbound-mail raised an unhandled error (distinct from a DLQ landing — this fires on the first failed attempt, the DLQ alarm fires after all 3 retries are exhausted)."
+  alarm_description   = "toolbox-worker raised an unhandled error (distinct from a DLQ landing — this fires on the first failed attempt, the DLQ alarm fires after all 3 retries are exhausted)."
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    FunctionName = aws_lambda_function.inbound_mail.function_name
+    FunctionName = aws_lambda_function.worker.function_name
   }
 
   alarm_actions = [aws_sns_topic.alerts.arn]

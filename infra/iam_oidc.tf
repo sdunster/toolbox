@@ -74,7 +74,7 @@ resource "aws_iam_role_policy" "github_lambda_deploy" {
       ]
       Resource = [
         aws_lambda_function.api.arn,
-        aws_lambda_function.inbound_mail.arn,
+        aws_lambda_function.worker.arn,
       ]
     }]
   })

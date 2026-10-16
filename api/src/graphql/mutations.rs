@@ -15,9 +15,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use tracing::{info, warn};
 
-use crate::app::{App, HasDb, HasMail, HasStorage};
+use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 use crate::auth::{self, AuthInfo};
 use crate::broadcast;
+use crate::broadcast_send;
 use crate::db;
 use crate::db::Handler as _;
 use crate::inbound::{attachments, routing};
@@ -1084,7 +1085,7 @@ async fn open_submitted_ticket<A: App + HasDb + Send + Sync>(
     Ok(ticket)
 }
 
-pub struct MutationRoot<A: App + HasDb + HasMail + HasStorage + Send + Sync> {
+pub struct MutationRoot<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync> {
     pub(super) app: Arc<A>,
 }
 
@@ -1154,7 +1155,7 @@ async fn save_broadcast_senders<A: App + HasDb + Send + Sync>(
 }
 
 #[Object]
-impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot<A> {
+impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> MutationRoot<A> {
     /// Approve an OAuth authorization request: the user has seen the consent
     /// screen (`oauthAuthorizationRequest`) and clicked "Approve". Mints a
     /// single-use authorization code and returns the client's `redirect_uri`
@@ -1703,13 +1704,14 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
     /// superuser boundary). An invoicing, deleted or missing instance is
     /// `NOT_FOUND`, per the kind-isolation rule.
     ///
-    /// Everything is validated before anything is sent. Suppressed addresses
-    /// (`crate::suppression`) are recorded `SUPPRESSED` and skipped. The row
-    /// is then written with every other recipient `PENDING`, and each one's outcome
-    /// recorded as soon as its send returns — so a Lambda timeout mid-send
-    /// still leaves an accurate record. A single recipient's send failure is
-    /// recorded as `FAILED` and does not fail the mutation; later bounces and
-    /// complaints arrive through `broadcast_events`.
+    /// **Queues, doesn't send.** Everything is validated (and one copy
+    /// test-built) here; suppressed addresses (`crate::suppression`) are recorded
+    /// `SUPPRESSED`; the row is written with every other recipient `PENDING`
+    /// and the first batch is queued for the worker, which sends
+    /// `broadcast::BATCH_SIZE` recipients every `broadcast::BATCH_INTERVAL_SECS`
+    /// (`crate::broadcast_send`). The result comes back `inProgress`. If the
+    /// batch can't be queued, the pending recipients are recorded `FAILED`
+    /// and the mutation fails — nothing has been sent.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
     async fn send_broadcast(
         &self,
@@ -1717,8 +1719,6 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         instance_id: ID,
         input: SendBroadcastInput,
     ) -> Result<Broadcast<A>> {
-        use futures_util::StreamExt as _;
-
         let user_id = require_user_id(ctx)?;
         let instance = broadcast_instance(&*self.app, &instance_id).await?;
         let addresses = self
@@ -1737,18 +1737,15 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             &instance,
             &addresses,
         )?;
-        // Build every copy up front: a MIME error fails the whole broadcast
-        // before anything has gone out.
-        let built = valid
-            .recipients
-            .iter()
-            .map(|r| broadcast::build_broadcast_message(&valid, &instance.signature, r))
-            .collect::<Result<Vec<_>>>()?;
+        // Build one copy now: a MIME error fails the broadcast here, before
+        // anything is queued, rather than failing every batch later. (Copies
+        // differ only in their `To:` address.)
+        broadcast::build_broadcast_message(&valid, &instance.signature, &valid.recipients[0])?;
 
         // Addresses on the suppression list (a past hard bounce or
         // complaint) are recorded as SUPPRESSED and never sent, like every
         // other instance-mail send skips them. Fails open — see
-        // `crate::suppression`.
+        // `crate::suppression`. Each batch checks again before it sends.
         let suppressed: std::collections::HashMap<String, String> =
             suppression::find_suppressed(&*self.app, &valid.recipients, "sendBroadcast")
                 .await
@@ -1756,11 +1753,12 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                 .map(|s| (s.email.clone(), suppression::describe(&s)))
                 .collect();
 
-        let mut rec = db::Broadcast {
+        let now = crate::clock::now_sec();
+        let rec = db::Broadcast {
             id: crate::dynamodb::new_id(),
             instance_id: instance.id.clone(),
             created_by_user_id: user_id,
-            created_at: crate::clock::now_sec(),
+            created_at: now,
             from_address: valid.from_address.clone(),
             from_name: valid.from_name.clone(),
             reply_to: valid.reply_to.clone(),
@@ -1778,67 +1776,30 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
                     None => db::BroadcastRecipient::pending(email),
                 })
                 .collect(),
+            send_seq: 0,
+            next_batch_at: Some(now),
         };
         self.app.db().create_broadcast(&rec).await?;
 
-        let app = &self.app;
-        let broadcast_id = rec.id.as_str();
-        let results: Vec<(usize, db::BroadcastSendResult)> = futures_util::stream::iter(
-            built
-                .into_iter()
-                .enumerate()
-                .filter(|(index, _)| !suppressed.contains_key(&valid.recipients[*index])),
-        )
-        .map(|(index, msg)| async move {
-            let tags = broadcast::send_tags(broadcast_id, index);
-            let result = match app
-                .mail()
-                .send_raw_tagged(&msg.raw, &msg.to, &msg.cc, &tags)
-                .await
-            {
-                Ok(message_id) => db::BroadcastSendResult {
-                    status: db::BroadcastSendStatus::Sent,
-                    provider_message_id: Some(message_id),
-                    error: None,
-                },
-                Err(e) => {
-                    warn!(broadcast_id, index, "broadcast send failed: {e:#}");
-                    db::BroadcastSendResult {
-                        status: db::BroadcastSendStatus::Failed,
-                        provider_message_id: None,
-                        error: Some(format!("{e:#}")),
-                    }
-                }
-            };
-            if let Err(e) = app
-                .db()
-                .set_broadcast_send_result(broadcast_id, index, &result)
-                .await
-            {
-                // The mail is already out (or not); a lost status
-                // write only leaves this recipient showing PENDING.
+        if let Err(e) = broadcast_send::start(&*self.app, &rec.id).await {
+            warn!(broadcast_id = rec.id, "could not queue broadcast: {e:#}");
+            broadcast_send::fail_pending(&*self.app, &rec, "the broadcast could not be queued")
+                .await;
+            if let Err(e) = self.app.db().set_broadcast_progress(&rec.id, 0, None).await {
                 warn!(
-                    broadcast_id,
-                    index, "could not record broadcast send result: {e:#}"
+                    broadcast_id = rec.id,
+                    "could not finish failed broadcast: {e:#}"
                 );
             }
-            (index, result)
-        })
-        .buffer_unordered(broadcast::SEND_CONCURRENCY)
-        .collect()
-        .await;
-
-        for (index, result) in results {
-            let r = &mut rec.recipients[index];
-            r.send_status = result.status;
-            r.provider_message_id = result.provider_message_id;
-            r.error = result.error;
+            return Err(anyhow!(
+                "the broadcast could not be queued for sending; nothing was sent"
+            ));
         }
         info!(
             broadcast_id = rec.id,
             instance_id = rec.instance_id,
             recipients = rec.recipients.len(),
-            "broadcast sent"
+            "broadcast queued"
         );
         Ok(Broadcast::new(rec))
     }

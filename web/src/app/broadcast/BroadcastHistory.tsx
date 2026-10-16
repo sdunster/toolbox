@@ -1,7 +1,7 @@
 import { graphql, useFragment } from "react-relay";
 import type { BroadcastHistory_broadcasts$key } from "./__generated__/BroadcastHistory_broadcasts.graphql";
 import { formatTimestamp } from "../../lib/dates";
-import { recipientStatus } from "../../lib/broadcast";
+import { formatClockTime, recipientStatus } from "../../lib/broadcast";
 import { ENGAGEMENT_CAVEAT, statusToneClass } from "../../lib/deliveryStatus";
 
 const broadcastHistoryFragment = graphql`
@@ -11,6 +11,10 @@ const broadcastHistoryFragment = graphql`
     fromAddress
     createdAt
     recipientCount
+    inProgress
+    pendingCount
+    nextBatchAt
+    estimatedFinishAt
     failedCount
     suppressedCount
     deliveredCount
@@ -36,6 +40,8 @@ const broadcastHistoryFragment = graphql`
 
 function counts(b: {
   recipientCount: number;
+  inProgress: boolean;
+  pendingCount: number;
   deliveredCount: number;
   bouncedCount: number;
   complainedCount: number;
@@ -44,7 +50,11 @@ function counts(b: {
   failedCount: number;
   suppressedCount: number;
 }): string {
-  const parts = [`${b.recipientCount} sent to`];
+  const parts = [
+    b.inProgress
+      ? `${b.recipientCount - b.pendingCount} of ${b.recipientCount} sent`
+      : `${b.recipientCount} sent to`,
+  ];
   if (b.deliveredCount) parts.push(`${b.deliveredCount} delivered`);
   if (b.openedCount) parts.push(`${b.openedCount} opened`);
   if (b.clickedCount) parts.push(`${b.clickedCount} clicked a link`);
@@ -56,13 +66,26 @@ function counts(b: {
   return parts.join(" · ");
 }
 
+/** "Sending · next batch at 2:35 pm · done around 4:20 pm". */
+function progress(b: {
+  nextBatchAt: number | null | undefined;
+  estimatedFinishAt: number | null | undefined;
+}): string {
+  const parts = ["Sending"];
+  if (b.nextBatchAt != null)
+    parts.push(`next batch at ${formatClockTime(b.nextBatchAt)}`);
+  if (b.estimatedFinishAt != null)
+    parts.push(`done around ${formatClockTime(b.estimatedFinishAt)}`);
+  return parts.join(" · ");
+}
+
 /**
  * Past broadcasts, newest first, each expandable to every recipient's
  * status — what happened at send time, then what SES reported (delivered,
  * bounced with the receiving server's reason, marked as spam), and whether
  * that recipient's copy was opened or a link in it clicked (approximate —
- * see `ENGAGEMENT_CAVEAT`). Statuses arrive asynchronously; reloading the
- * page picks up new ones.
+ * see `ENGAGEMENT_CAVEAT`). A broadcast still sending shows its progress;
+ * the page refetches while one is.
  */
 export function BroadcastHistory({
   broadcasts,
@@ -92,6 +115,11 @@ export function BroadcastHistory({
                       : ""}
                   </span>
                   <span className="text-xs text-ink-muted">{counts(b)}</span>
+                  {b.inProgress && (
+                    <span className="text-xs font-medium text-ink">
+                      {progress(b)}
+                    </span>
+                  )}
                 </summary>
                 <table className="w-full border-t border-line text-sm">
                   <tbody>
@@ -99,6 +127,7 @@ export function BroadcastHistory({
                       const status = recipientStatus(
                         r.sendStatus,
                         r.deliveryStatus,
+                        b.inProgress,
                       );
                       return (
                         <tr

@@ -33,6 +33,9 @@ resource "aws_lambda_function" "api" {
         # CloudFront, which doesn't forward Host: without it the fallback would
         # name the Function URL's host, and OAuth clients would reject the mismatch.
         API_BASE_URL = "https://${var.web_domain}"
+        # api/src/sqsqueue.rs: sendBroadcast queues a broadcast's first batch
+        # for the worker here.
+        WORKER_QUEUE_URL = aws_sqs_queue.worker.url
       },
       # api/src/oauth.rs: secret the stateless OAuth client ids are signed with.
       # Unset (empty), dynamic client registration answers 503 and no client can

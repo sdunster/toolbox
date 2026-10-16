@@ -3,6 +3,7 @@ pub mod auth;
 pub mod base_url;
 pub mod broadcast;
 pub mod broadcast_events;
+pub mod broadcast_send;
 pub mod clock;
 pub mod db;
 pub mod dynamodb;
@@ -17,22 +18,26 @@ pub mod mailloop;
 pub mod mcp;
 pub mod mockdb;
 pub mod mockmail;
+pub mod mockqueue;
 pub mod mockstorage;
 pub mod nonce;
 pub mod oauth;
 pub mod oauth_http;
 pub mod outbound;
+pub mod queue;
 pub mod request_metrics;
 pub mod s3storage;
 pub mod server;
 pub mod ses_events;
 pub mod sesmail;
+pub mod sqsqueue;
 pub mod staff_notify;
 pub mod storage;
 pub mod suppression;
 pub mod telemetry;
 pub mod ticket_delivery;
 pub mod turnstile;
+pub mod worker;
 
 /// Load local `.env`/`.env.secret` for CLI / dev binaries. The Lambda binaries
 /// don't call this. AWS profile defaulting is handled natively by

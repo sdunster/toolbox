@@ -33,6 +33,7 @@ use toolbox::db::Handler as _;
 use toolbox::dynamodb;
 use toolbox::graphql;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 
 async fn local_db_prefix() -> Option<String> {
@@ -147,7 +148,13 @@ async fn verify_auth_code_rejects_a_code_minted_by_request_submit_code() {
         .await
         .expect("create_instance");
 
-    let my_app = Arc::new(app::new(db, mail, mockstorage::Storage::new(), 0));
+    let my_app = Arc::new(app::new(
+        db,
+        mail,
+        mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
+        0,
+    ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));
     let schema = graphql::build_schema(my_app.clone(), webauthn);
 
@@ -222,7 +229,13 @@ async fn verify_submit_code_rejects_a_code_minted_by_request_auth_code() {
         .await
         .expect("create_instance");
 
-    let my_app = Arc::new(app::new(db, mail, mockstorage::Storage::new(), 0));
+    let my_app = Arc::new(app::new(
+        db,
+        mail,
+        mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
+        0,
+    ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));
     let schema = graphql::build_schema(my_app.clone(), webauthn);
 
@@ -291,7 +304,13 @@ async fn request_submit_code_is_a_noop_for_an_instance_without_public_submission
         .await
         .expect("create_instance");
 
-    let my_app = Arc::new(app::new(db, mail, mockstorage::Storage::new(), 0));
+    let my_app = Arc::new(app::new(
+        db,
+        mail,
+        mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
+        0,
+    ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));
     let schema = graphql::build_schema(my_app.clone(), webauthn);
 

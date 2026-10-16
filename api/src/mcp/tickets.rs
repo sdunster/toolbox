@@ -22,7 +22,7 @@
 
 use serde_json::{Value, json};
 
-use crate::app::{App, HasDb, HasMail, HasStorage};
+use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 
 use super::tool::{ToolContext, ToolOutcome, missing_argument};
 
@@ -320,7 +320,7 @@ pub async fn dispatch<A>(
     arguments: &Value,
 ) -> Option<ToolOutcome>
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     Some(match name {
         "list_tickets" => list_tickets(ctx, arguments).await,
@@ -416,7 +416,7 @@ fn rename(result: Result<Value, Vec<String>>, from: &str, to: &str) -> ToolOutco
 
 async fn list_tickets<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(instance_id) = string_arg(arguments, "instanceId") else {
         return missing_argument("instanceId");
@@ -471,7 +471,7 @@ where
 
 async fn get_ticket<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(id) = string_arg(arguments, "ticketId") else {
         return missing_argument("ticketId");
@@ -496,7 +496,7 @@ where
 
 async fn update_recipients<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let (Some(id), Some(list), Some(action), Some(email)) = (
         string_arg(arguments, "ticketId"),
@@ -528,7 +528,7 @@ where
 
 async fn list_instance_members<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let Some(instance_id) = string_arg(arguments, "instanceId") else {
         return missing_argument("instanceId");

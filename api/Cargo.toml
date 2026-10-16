@@ -15,13 +15,13 @@ path = "src/bin/export-schema.rs"
 name = "api-lambda"
 path = "src/bin/lambda/main.rs"
 
-# Same auto-discovery quirk as api-lambda: src/bin/inbound-mail/main.rs would
-# otherwise be named "inbound-mail", not "inbound-mail-lambda" — matching
-# `cargo lambda build --bin inbound-mail-lambda` in CI and Terraform's
+# Same auto-discovery quirk as api-lambda: src/bin/worker/main.rs would
+# otherwise be named "worker", not "worker-lambda" — matching
+# `cargo lambda build --bin worker-lambda` in CI and Terraform's
 # `handler = "bootstrap"` setup.
 [[bin]]
-name = "inbound-mail-lambda"
-path = "src/bin/inbound-mail/main.rs"
+name = "worker-lambda"
+path = "src/bin/worker/main.rs"
 
 [dependencies]
 anyhow = "1.0.99"

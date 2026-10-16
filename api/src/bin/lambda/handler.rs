@@ -15,30 +15,33 @@ use toolbox::auth::{self, AuthInfo};
 use toolbox::db;
 use toolbox::graphql;
 use toolbox::mail;
+use toolbox::queue;
 use toolbox::request_metrics::{self, RequestMetrics};
 use toolbox::storage;
 use toolbox::telemetry::{self, RequestTelemetry};
 
 use crate::errors::{ClientError, ServerError};
 
-type GraphQlSchema<H, M, S> = graphql::ToolboxSchema<app::MyApp<H, M, S>>;
+type GraphQlSchema<H, M, S, Q> = graphql::ToolboxSchema<app::MyApp<H, M, S, Q>>;
 
 pub struct Handler<
     H: db::Handler + Send + Sync,
     M: mail::Handler + Send + Sync,
     S: storage::Handler + Send + Sync,
+    Q: queue::Handler + Send + Sync,
 > {
-    app: Arc<app::MyApp<H, M, S>>,
-    schema: GraphQlSchema<H, M, S>,
+    app: Arc<app::MyApp<H, M, S, Q>>,
+    schema: GraphQlSchema<H, M, S, Q>,
 }
 
 impl<
     H: db::Handler + Send + Sync + 'static,
     M: mail::Handler + Send + Sync + 'static,
     S: storage::Handler + Send + Sync + 'static,
-> Handler<H, M, S>
+    Q: queue::Handler + Send + Sync + 'static,
+> Handler<H, M, S, Q>
 {
-    pub fn new(app: Arc<app::MyApp<H, M, S>>, schema: GraphQlSchema<H, M, S>) -> Self {
+    pub fn new(app: Arc<app::MyApp<H, M, S, Q>>, schema: GraphQlSchema<H, M, S, Q>) -> Self {
         Self { app, schema }
     }
 

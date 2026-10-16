@@ -107,7 +107,7 @@ themselves, so a re-`local-seed` afterward is a clean overwrite rather than a pi
 local-reset` is the blunter tool: it destroys and rebuilds every table, discarding the seed too.
 
 `make local-mail FILE=local/mail/new-ticket.eml` feeds a raw `.eml` fixture straight into the same
-parse/route/store pipeline the deployed inbound-mail Lambda uses, with no AWS involved — the
+parse/route/store pipeline the deployed worker Lambda uses, with no AWS involved — the
 fixtures under `local/mail/` cover a plain new ticket, a reply via `+tag`, a reply via
 `In-Reply-To`, a reply from an unknown sender, an autoresponder (must be dropped), a message
 addressed to a wildcard address, and a cross-tenant reply attempt. Add `FRESH=1` to replay a
@@ -115,6 +115,14 @@ fixture as a brand-new delivery — without it, the idempotency key is the file'
 second run of the same fixture is correctly a no-op. Outbound mail sent as a result (a reply
 notification, for instance) lands as a `.eml` under `MOCK_MAIL_DIR` if you've set it (see
 `local/local.env`), or is just logged if you haven't.
+
+Background jobs queued for the worker — a broadcast's paced batches — never leave the process
+under `make dev-local`: `poem-local` keeps them in an in-memory queue and runs them itself every
+few seconds, ignoring their delays, so a broadcast "sends" (to the log or `MOCK_MAIL_DIR`) a batch
+every few seconds rather than every five minutes. Background jobs only run with
+`--enable-mutations`. `make dev` (`bin/poem`, real AWS) instead sends jobs to the real worker queue
+named by `WORKER_QUEUE_URL`, for the deployed worker to run, and refuses to queue one when it's
+unset.
 
 ## 6. The admin CLI and bootstrapping an organisation
 
@@ -337,7 +345,7 @@ aws sesv2 get-account --profile <profile>                         # ProductionAc
 ```
 
 Send a real email to one of an instance's inbound addresses — the ticket should appear in the
-queue within seconds (`aws logs tail /aws/lambda/toolbox-inbound-mail --follow --profile
+queue within seconds (`aws logs tail /aws/lambda/toolbox-worker --follow --profile
 <profile>` if it doesn't). Reply from the web UI and confirm the reply arrives threaded in the
 original mail client, and that replying to *that* lands back on the same ticket. Check the DLQ
 alarm (`monitoring.tf`) is `OK`, and that a deliberately malformed message lands in the DLQ rather

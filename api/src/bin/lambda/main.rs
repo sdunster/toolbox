@@ -15,6 +15,7 @@ use toolbox::dynamodb;
 use toolbox::graphql;
 use toolbox::s3storage;
 use toolbox::sesmail;
+use toolbox::sqsqueue;
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
@@ -36,7 +37,9 @@ async fn main() -> Result<(), Error> {
 
     let db_prefix = env::var("DB_PREFIX").expect("DB_PREFIX must be set for dynamodb backend");
     let db = dynamodb::Handler::new(&db_prefix, read_only).await;
-    let app = Arc::new(app::new(db, mailer, storage, 0));
+    // `sendBroadcast` queues a broadcast's first batch for the worker.
+    let queue = sqsqueue::Queue::new().await;
+    let app = Arc::new(app::new(db, mailer, storage, queue, 0));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));
     let schema = graphql::build_schema(app.clone(), webauthn);
     let handler = handler::Handler::new(app, schema);

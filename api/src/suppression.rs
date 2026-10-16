@@ -3,8 +3,8 @@
 //! Two halves, joined by the `email_suppression` table:
 //!
 //! 1. **Recording.** The SES configuration set publishes its events to an
-//!    SNS topic that invokes the inbound-mail Lambda directly
-//!    (`bin/inbound-mail`). That Lambda parses each one once into a
+//!    SNS topic that invokes the worker Lambda directly
+//!    (`bin/worker`). That Lambda parses each one once into a
 //!    [`crate::ses_events::SesEvent`] and hands it to [`record_event`] (among
 //!    other consumers), which upserts one row per affected address. Only a **permanent** bounce
 //!    or a complaint suppresses an address; a transient bounce (mailbox

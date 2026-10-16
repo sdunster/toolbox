@@ -1,4 +1,4 @@
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { graphql } from "react-relay";
 import type { BroadcastPageQuery } from "./__generated__/BroadcastPageQuery.graphql";
 import { useRetryableLazyLoadQuery } from "../../components/useRetryableLazyLoadQuery";
@@ -26,6 +26,7 @@ const broadcastPageQuery = graphql`
         address
       }
       broadcasts(first: 25) {
+        inProgress
         ...BroadcastHistory_broadcasts
       }
     }
@@ -33,14 +34,30 @@ const broadcastPageQuery = graphql`
 `;
 /* eslint-enable relay/unused-fields */
 
+/** How often to refetch while a broadcast is still sending in the background. */
+const PROGRESS_POLL_MS = 30_000;
+
 function Content({ slug }: { slug: string }) {
-  // Bumped after a send so the history below picks the new broadcast up.
+  // Bumped after a send so the history below picks the new broadcast up, and
+  // periodically while one is still sending.
   const [fetchKey, setFetchKey] = useState(0);
   const data = useRetryableLazyLoadQuery<BroadcastPageQuery>(
     broadcastPageQuery,
     { slug },
     { fetchKey, fetchPolicy: "store-and-network" },
   );
+
+  // A broadcast goes out in batches over minutes or hours: keep its progress
+  // current while one is sending, and stop once none is.
+  const sending = data.instance?.broadcasts.some((b) => b.inProgress) ?? false;
+  useEffect(() => {
+    if (!sending) return;
+    const timer = setInterval(
+      () => setFetchKey((k) => k + 1),
+      PROGRESS_POLL_MS,
+    );
+    return () => clearInterval(timer);
+  }, [sending]);
 
   if (!data.instance) {
     return (

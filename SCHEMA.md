@@ -753,7 +753,7 @@ Written by `create_credit_note` in one `TransactWriteItems` with the invoice's `
 ### `{prefix}_message_delivery`
 
 What SES reported for one recipient of one customer-facing ticket message — see CLAUDE.md's "Ticket
-mail delivery tracking". Written only by the inbound-mail Lambda (`ticket_delivery::apply`), as an
+mail delivery tracking". Written only by the worker Lambda (`ticket_delivery::apply`), as an
 upsert conditioned on `delivery_rank`, so status only moves forward. Never deleted.
 
 | Attribute   | Type | Role                                             |
@@ -786,9 +786,10 @@ upsert conditioned on `delivery_rank`, so status only moves forward. Never delet
 ### `{prefix}_broadcast`
 
 One announcement email sent from a support instance to a list of addresses, one copy per recipient —
-see CLAUDE.md's "Broadcasts" entry. Written by `sendBroadcast` (`Put`, then one `UpdateItem` per
-recipient as its send returns) and by the inbound-mail Lambda as SES delivery events arrive
-(`broadcast_events`). Never deleted.
+see CLAUDE.md's "Broadcasts" entry. Written by `sendBroadcast` (`Put`, every recipient `pending`),
+then by the worker Lambda: each paced batch (`broadcast_send`) claims, sends and records its
+recipients one `UpdateItem` at a time and records its progress, and SES delivery events arrive
+through `broadcast_events`. Never deleted.
 
 | Attribute     | Type | Role                   |
 | ------------- | ---- | ---------------------- |
@@ -809,10 +810,16 @@ recipient as its send returns) and by the inbound-mail Lambda as SES delivery ev
   carrying a `+t…` reply tag).
 - `from_name` (S) — optional; omitted when blank.
 - `subject`, `body_text`, `created_by_user_id` (S), `created_at` (N).
+- `send_seq` (N) — the `seq` of the next `BroadcastBatch` job expected; a batch advances it
+  (`set_broadcast_progress`, conditioned `send_seq <= seq`) and a job below it is a duplicate.
+  Absent on rows from before background sending (read as 0).
+- `next_batch_at` (N) — epoch seconds the next batch is due. **Present exactly while the broadcast
+  is still sending**; removed (never nulled) by the batch that leaves nothing `pending`.
 - `recipients` (L of M) — one map per recipient, in the order given, **updated in place by index**
-  (`recipients[i].…`). Each has `email` and `send_status` (`pending`/`sent`/`failed`/`suppressed` — the last for an address on
-  `email_suppression`, never sent — written by the
-  API) plus, when set, `provider_message_id`, `error` (a reserved word — `#err`), and the
+  (`recipients[i].…`). Each has `email` and `send_status` (`pending`/`sending`/`sent`/`failed`/
+  `suppressed` — `sending` is a batch's conditional claim, from `pending` only, taken before the
+  copy is sent, and one left behind by a crash is never retried; `suppressed` is an address on
+  `email_suppression`, never sent) plus, when set, `provider_message_id`, `error` (a reserved word — `#err`), and the
   provider-reported `delivery_status` (`delayed`/`delivered`/`bounced`/`rejected`/`complained`),
   `delivery_rank`, `delivery_detail` and `delivery_updated_at` (written only by
   `set_broadcast_delivery`), and `first_opened_at`/`first_clicked_at` (N, written only by
@@ -890,7 +897,7 @@ get no access. An archived project takes no new expenses, but one already on it 
 
 No GSIs. Durable (deletion protection, 35-day PITR). Addresses Toolbox has stopped mailing because
 SES reported a **permanent** bounce or a **spam complaint** for them (issue #6). Written by the
-inbound-mail Lambda from the SES configuration set's `BOUNCE`/`COMPLAINT` event destination
+worker Lambda from the SES configuration set's `BOUNCE`/`COMPLAINT` event destination
 (`infra/ses_feedback.tf` → `api/src/suppression.rs`); read with one `BatchGetItem` of the
 recipients before every instance-mail send (ticket replies and notices, staff notifications,
 invoices and credit notes), which then leaves a suppressed address out. Keyed on the address
@@ -990,7 +997,7 @@ build plan). Update it as steps land, rather than leaving it purely speculative.
 #### `counter` — the per-instance ticket number must come from an atomic `ADD`, never read-then-write
 
 The obvious-looking implementation — `GetItem` the counter row, add 1 in application code,
-`PutItem` the result back — has an unavoidable race: two inbound-mail Lambda invocations
+`PutItem` the result back — has an unavoidable race: two worker Lambda invocations
 processing two new messages for the same instance at (nearly) the same time can both read
 `next_ticket_number = 41`, both compute 42, and both write 42. The result is two tickets sharing
 one `[#{slug}-42]` subject tag and one `instance_number` GSI value — which breaks

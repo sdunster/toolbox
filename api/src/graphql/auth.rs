@@ -267,6 +267,7 @@ mod tests {
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         ));
         Schema::build(TruthTableQuery, EmptyMutation, EmptySubscription)

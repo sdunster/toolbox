@@ -1,9 +1,10 @@
 //! Broadcast email — pure validation and MIME construction, no I/O.
 //!
 //! A broadcast is one announcement sent from a support instance to a list of
-//! addresses, one copy per recipient (`sendBroadcast` in
-//! `graphql::mutations` is the impure caller). See CLAUDE.md's "Broadcasts"
-//! entry for the rules this module encodes; in short:
+//! addresses, one copy per recipient. `sendBroadcast` in `graphql::mutations`
+//! validates and queues it; the worker sends it in paced batches
+//! (`broadcast_send`). See CLAUDE.md's "Broadcasts" entry for the rules this
+//! module encodes; in short:
 //!
 //! - **A reply must open a new ticket, one per reply.** The inbound pipeline
 //!   threads a message onto an existing ticket only by a
@@ -30,15 +31,25 @@ use mail_builder::headers::raw::Raw;
 use crate::db;
 use crate::outbound::{self, BuiltMessage};
 
-/// Most recipients one broadcast may have. Sending is inline in the API
-/// Lambda (30 s timeout); 100 sends at [`SEND_CONCURRENCY`] in flight
-/// finishes in a few seconds, with plenty of headroom.
-pub const MAX_BROADCAST_RECIPIENTS: usize = 100;
+/// Most recipients one broadcast may have. Sending happens in the worker, a
+/// batch at a time, so this is bounded by the `broadcast` row instead: every
+/// recipient's status lives in one DynamoDB item (400 KB at most), and a
+/// recipient map with a bounce diagnostic can reach ~500 bytes, next to a
+/// body of up to 50,000 characters.
+pub const MAX_BROADCAST_RECIPIENTS: usize = 500;
 
-/// How many sends `sendBroadcast` keeps in flight at once — enough to finish
-/// [`MAX_BROADCAST_RECIPIENTS`] quickly, well under SES's default
-/// per-second sending rate.
-pub const SEND_CONCURRENCY: usize = 5;
+/// Recipients sent per batch — one worker job, one at a time.
+pub const BATCH_SIZE: usize = 5;
+
+/// Gap between batches: each batch queues the next with this SQS delay
+/// (must be at most `queue::MAX_DELAY_SECS`). Slow on purpose — a steady
+/// trickle is kinder to the sending domain's reputation than a burst. At
+/// [`BATCH_SIZE`] every five minutes, 100 recipients take ~1h40m.
+pub const BATCH_INTERVAL_SECS: u32 = 300;
+
+// One SQS message can only be delayed so long, and an empty batch would
+// never finish a broadcast.
+const _: () = assert!(BATCH_INTERVAL_SECS <= crate::queue::MAX_DELAY_SECS && BATCH_SIZE > 0);
 
 /// Most saved senders one instance may have — a short pick-list, stored as
 /// one JSON attribute on the instance row.
@@ -73,6 +84,22 @@ pub struct ValidBroadcast {
     pub subject: String,
     pub body: String,
     pub recipients: Vec<String>,
+}
+
+impl ValidBroadcast {
+    /// The validated broadcast a stored row was created from — what the
+    /// worker builds each copy with. `validate` ran before the row was
+    /// written, so its fields need no re-checking.
+    pub fn from_record(rec: &db::Broadcast) -> Self {
+        Self {
+            from_address: rec.from_address.clone(),
+            from_name: rec.from_name.clone(),
+            reply_to: rec.reply_to.clone(),
+            subject: rec.subject.clone(),
+            body: rec.body_text.clone(),
+            recipients: rec.recipients.iter().map(|r| r.email.clone()).collect(),
+        }
+    }
 }
 
 /// The domains this instance's inbound addresses live on, sorted and
@@ -580,7 +607,10 @@ mod tests {
         let ok: Vec<String> = (0..MAX_BROADCAST_RECIPIENTS)
             .map(|i| format!("r{i}@example.com"))
             .collect();
-        assert_eq!(normalize_recipients(&ok, &exact_only()).unwrap().len(), 100);
+        assert_eq!(
+            normalize_recipients(&ok, &exact_only()).unwrap().len(),
+            MAX_BROADCAST_RECIPIENTS
+        );
         let too_many: Vec<String> = (0..=MAX_BROADCAST_RECIPIENTS)
             .map(|i| format!("r{i}@example.com"))
             .collect();
@@ -646,6 +676,31 @@ mod tests {
                 .contains("We've shipped something.")
         );
         assert!(msg.body_text(0).unwrap().contains("The seslogin team"));
+    }
+
+    #[test]
+    fn from_record_rebuilds_what_validate_produced() {
+        let r = emails(&["one@example.com", "two@example.com"]);
+        let v = validate(input("news@seslogin.test", &r), &instance(), &exact_only()).unwrap();
+        let rec = db::Broadcast {
+            id: "b1".to_string(),
+            instance_id: "inst1".to_string(),
+            created_by_user_id: "u1".to_string(),
+            created_at: 1,
+            from_address: v.from_address.clone(),
+            from_name: v.from_name.clone(),
+            reply_to: v.reply_to.clone(),
+            subject: v.subject.clone(),
+            body_text: v.body.clone(),
+            recipients: v
+                .recipients
+                .iter()
+                .map(db::BroadcastRecipient::pending)
+                .collect(),
+            send_seq: 0,
+            next_batch_at: Some(1),
+        };
+        assert_eq!(ValidBroadcast::from_record(&rec), v);
     }
 
     #[test]

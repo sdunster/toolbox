@@ -9,7 +9,12 @@ import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
 import { inputBase } from "../../components/ui/inputStyles";
 import {
+  BROADCAST_BATCH_INTERVAL_SECS,
+  BROADCAST_BATCH_SIZE,
   MAX_BROADCAST_RECIPIENTS,
+  estimatedSendSecs,
+  formatClockTime,
+  formatDuration,
   formatSender,
   invalidRecipients,
   parseRecipients,
@@ -25,7 +30,9 @@ const CUSTOM_SENDER = "";
 /**
  * Compose and send a broadcast (`sendBroadcast`). Sending is irreversible,
  * so "Review" first shows exactly who it will go to and from where, and
- * only "Send now" on that step actually sends. With saved senders, "Send as"
+ * only "Send now" on that step actually sends. The API queues it and the
+ * worker sends it in small batches spread over time, so the review step
+ * says how long that will take. With saved senders, "Send as"
  * picks one (the first by default); "Another address…" falls back to typing
  * the From address and name.
  */
@@ -64,7 +71,9 @@ export function BroadcastForm({
         subject
         fromAddress
         recipientCount
-        sentCount
+        pendingCount
+        inProgress
+        estimatedFinishAt
         recipients {
           email
           sendStatus
@@ -160,7 +169,10 @@ export function BroadcastForm({
           <dd className="break-all text-ink">{recipients.join(", ")}</dd>
         </dl>
         <p className="text-sm text-ink-muted">
-          This can&apos;t be undone. Each person gets their own copy.
+          This can&apos;t be undone. Each person gets their own copy.{" "}
+          {recipients.length > BROADCAST_BATCH_SIZE
+            ? `To protect the sending domain's reputation, it goes out ${BROADCAST_BATCH_SIZE} at a time, every ${BROADCAST_BATCH_INTERVAL_SECS / 60} minutes — about ${formatDuration(estimatedSendSecs(recipients.length))} in all.`
+            : "It goes out within a minute or so."}
         </p>
         <div className="flex gap-2">
           <Button onClick={send} disabled={isSending}>
@@ -310,8 +322,8 @@ function SentSummary({
   sent: SentBroadcast;
   onDismiss: () => void;
 }) {
-  // Failed at send time, or skipped because the address is suppressed (a
-  // past hard bounce or spam complaint) — `error` says which.
+  // Skipped because the address is suppressed (a past hard bounce or spam
+  // complaint), or failed — `error` says which.
   const notSent = sent.recipients.filter(
     (r) => r.sendStatus === "FAILED" || r.sendStatus === "SUPPRESSED",
   );
@@ -321,9 +333,17 @@ function SentSummary({
       className="flex flex-col gap-2 rounded-lg border border-green-300 bg-green-50 p-4 text-sm dark:border-green-800 dark:bg-green-950/40"
     >
       <p className="font-medium text-green-800 dark:text-green-300">
-        Sent “{sent.subject}” to {sent.sentCount} of {sent.recipientCount}{" "}
+        Queued “{sent.subject}” for {sent.pendingCount} of {sent.recipientCount}{" "}
         {sent.recipientCount === 1 ? "recipient" : "recipients"}.
       </p>
+      {sent.inProgress && sent.estimatedFinishAt != null && (
+        <p className="text-ink">
+          Sending {BROADCAST_BATCH_SIZE} every{" "}
+          {BROADCAST_BATCH_INTERVAL_SECS / 60} minutes — the last should go out
+          around {formatClockTime(sent.estimatedFinishAt)}. You can leave this
+          page; progress shows in the history below.
+        </p>
+      )}
       {notSent.length > 0 && (
         <ul className="list-disc pl-5 text-red-700 dark:text-red-400">
           {notSent.map((r) => (

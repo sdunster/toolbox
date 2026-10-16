@@ -305,7 +305,7 @@ impl SuppressionReason {
 
 /// An `email_suppression` row: an address Toolbox has stopped mailing
 /// because SES reported a hard bounce or a complaint for it. Recorded by
-/// [`crate::suppression::record_feedback`] (the inbound-mail Lambda, fed by
+/// [`crate::suppression::record_feedback`] (the worker Lambda, fed by
 /// the configuration set's event destination); consulted before every
 /// instance-mail send. Global, not per instance: a dead mailbox is dead for
 /// every tenant, and SES's own account-level suppression list is global too.
@@ -1220,11 +1220,17 @@ pub struct FinalizeInvoice<'a> {
 // ── broadcast ─────────────────────────────────────────────────────────────
 
 /// What happened when a broadcast recipient's copy was handed to the mail
-/// provider — written by `sendBroadcast` itself, one recipient at a time.
+/// provider — written by the worker (`broadcast_send::run_batch`), one
+/// recipient at a time (`Suppressed` by `sendBroadcast`, up front).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BroadcastSendStatus {
-    /// Not attempted yet (or the send was cut short, e.g. a Lambda timeout).
+    /// Not attempted yet — waiting for a later batch.
     Pending,
+    /// Claimed by a batch ([`Handler::claim_broadcast_recipient`]) and being
+    /// sent. Normally replaced within seconds by `Sent`/`Failed`; one that
+    /// stays here was cut short mid-send (a crash or timeout) and is never
+    /// retried, because the mail may already have gone out.
+    Sending,
     /// Accepted by the provider.
     Sent,
     /// Refused by the provider at send time; see `BroadcastRecipient::error`.
@@ -1238,6 +1244,7 @@ impl BroadcastSendStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Sending => "sending",
             Self::Sent => "sent",
             Self::Failed => "failed",
             Self::Suppressed => "suppressed",
@@ -1247,6 +1254,7 @@ impl BroadcastSendStatus {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
+            "sending" => Some(Self::Sending),
             "sent" => Some(Self::Sent),
             "failed" => Some(Self::Failed),
             "suppressed" => Some(Self::Suppressed),
@@ -1359,6 +1367,22 @@ pub struct Broadcast {
     pub subject: String,
     pub body_text: String,
     pub recipients: Vec<BroadcastRecipient>,
+    /// The batch chain's position: the `seq` of the next
+    /// `queue::Job::BroadcastBatch` expected. A job whose `seq` is below it
+    /// is a duplicate delivery and is dropped. Absent (0) on rows written
+    /// before background sending existed.
+    pub send_seq: u64,
+    /// When the next batch is due (epoch seconds). Present exactly while the
+    /// broadcast is still sending; removed by the batch that finds nothing
+    /// left `Pending`.
+    pub next_batch_at: Option<u64>,
+}
+
+impl Broadcast {
+    /// Still sending — see [`Broadcast::next_batch_at`].
+    pub fn in_progress(&self) -> bool {
+        self.next_batch_at.is_some()
+    }
 }
 
 impl HasID for Broadcast {
@@ -2799,8 +2823,27 @@ pub trait Handler: Sync {
 
     // ── broadcast ─────────────────────────────────────────────────────────
     /// `Put` a new broadcast (`attribute_not_exists(id)`), every recipient
-    /// `pending`.
+    /// `pending` or `suppressed`, with its `send_seq`/`next_batch_at`.
     fn create_broadcast(&self, broadcast: &Broadcast) -> impl Future<Output = Result<()>> + Send;
+    /// Claim recipient `index` for sending: `pending` → `sending`, conditioned
+    /// on it still being `pending`. `Ok(false)` when it isn't (already
+    /// claimed by another batch, or no such recipient) — the caller must then
+    /// not send it. This is what makes each copy go out at most once.
+    fn claim_broadcast_recipient(
+        &self,
+        id: &str,
+        index: usize,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Record that batch `seq` has finished: `send_seq = seq + 1`, and
+    /// `next_batch_at` set (another batch is queued) or removed (done).
+    /// Conditioned on `send_seq <= seq`; `Ok(false)` when a later batch
+    /// already recorded progress.
+    fn set_broadcast_progress(
+        &self,
+        id: &str,
+        seq: u64,
+        next_batch_at: Option<u64>,
+    ) -> impl Future<Output = Result<bool>> + Send;
     /// Record what happened when recipient `index` was handed to the mail
     /// provider (`SET recipients[index].send_status`, plus the message id or
     /// error). Conditioned on that recipient existing; `Ok(false)` if not.

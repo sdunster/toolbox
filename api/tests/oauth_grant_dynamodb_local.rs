@@ -32,10 +32,12 @@ use toolbox::db;
 use toolbox::db::Handler as _;
 use toolbox::dynamodb;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 use toolbox::oauth;
 
-type TestApp = app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage>;
+type TestApp =
+    app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage, mockqueue::Queue>;
 
 async fn local_db_prefix() -> Option<String> {
     toolbox::local_dev::require_local_dynamodb_endpoint().ok()?;
@@ -66,7 +68,13 @@ macro_rules! require_local_db {
 const RESOURCE: &str = "https://toolbox.test/mcp";
 
 fn test_app(db: dynamodb::Handler) -> TestApp {
-    app::new(db, mockmail::Handler::new(), mockstorage::Storage::new(), 0)
+    app::new(
+        db,
+        mockmail::Handler::new(),
+        mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
+        0,
+    )
 }
 
 async fn make_user(db: &dynamodb::Handler) -> String {

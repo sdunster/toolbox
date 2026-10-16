@@ -50,7 +50,7 @@ jobs:
       # compromised dependency in this build can't reach AWS.
       - name: Build lambda binaries
         working-directory: ./api
-        run: cargo lambda build --release --bin api-lambda --bin inbound-mail-lambda
+        run: cargo lambda build --release --bin api-lambda --bin worker-lambda
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -60,15 +60,15 @@ jobs:
 
       # Functions already exist (Terraform-managed, with their execution
       # roles and env vars — see infra/lambda_api.tf and
-      # infra/lambda_inbound.tf's ignore_changes lifecycle blocks). Update
+      # infra/lambda_worker.tf's ignore_changes lifecycle blocks). Update
       # code only — no --role, so the deploy role never needs iam:PassRole.
       - name: Deploy toolbox-api
         working-directory: ./api
         run: cargo lambda deploy --binary-name api-lambda toolbox-api
 
-      - name: Deploy toolbox-inbound-mail
+      - name: Deploy toolbox-worker
         working-directory: ./api
-        run: cargo lambda deploy --binary-name inbound-mail-lambda toolbox-inbound-mail
+        run: cargo lambda deploy --binary-name worker-lambda toolbox-worker
 
   # Runs after deploy_lambdas (not in parallel) so the frontend is never
   # newer than the schema it queries — a web deploy that outran the API

@@ -210,7 +210,7 @@ enum MemberCmd {
 #[derive(Subcommand, Debug)]
 enum MailCmd {
     /// Feed a raw `.eml` file straight into the same parse → route →
-    /// resolve → store pipeline the inbound-mail Lambda uses
+    /// resolve → store pipeline the worker Lambda uses
     /// (`inbound::pipeline::process_raw_message`) — no S3, no SQS. Mail
     /// sending is mocked (`mockmail`, logged/written under `MOCK_MAIL_DIR`)
     /// and attachment/raw-MIME storage is a local directory (`mockstorage`,
@@ -661,6 +661,7 @@ async fn run_mail(db: dynamodb::Handler, cmd: MailCmd, dry_run: bool) -> Result<
                 db,
                 toolbox::mockmail::Handler::from_env(),
                 toolbox::mockstorage::Storage::from_env(),
+                toolbox::mockqueue::Queue::new(),
                 0,
             );
 

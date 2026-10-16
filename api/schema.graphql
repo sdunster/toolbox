@@ -187,6 +187,25 @@ type Broadcast {
 	createdAt: Int!
 	recipients: [BroadcastRecipient!]!
 	recipientCount: Int!
+	"""
+	Still sending: more batches are queued. The worker sends
+	`broadcast::BATCH_SIZE` recipients every
+	`broadcast::BATCH_INTERVAL_SECS` — see `crate::broadcast_send`.
+	"""
+	inProgress: Boolean!
+	"""
+	Waiting for a later batch.
+	"""
+	pendingCount: Int!
+	"""
+	When the next batch is due (epoch seconds); `null` once done.
+	"""
+	nextBatchAt: Int
+	"""
+	When the last pending recipient is expected to be sent (epoch
+	seconds), at the current pace; `null` once done.
+	"""
+	estimatedFinishAt: Int
 	sentCount: Int!
 	failedCount: Int!
 	"""
@@ -240,6 +259,7 @@ type BroadcastRecipient {
 """
 enum BroadcastSendStatusType {
 	PENDING
+	SENDING
 	SENT
 	FAILED
 	SUPPRESSED
@@ -1068,13 +1088,14 @@ type MutationRoot {
 	superuser boundary). An invoicing, deleted or missing instance is
 	`NOT_FOUND`, per the kind-isolation rule.
 	
-	Everything is validated before anything is sent. Suppressed addresses
-	(`crate::suppression`) are recorded `SUPPRESSED` and skipped. The row
-	is then written with every other recipient `PENDING`, and each one's outcome
-	recorded as soon as its send returns — so a Lambda timeout mid-send
-	still leaves an accurate record. A single recipient's send failure is
-	recorded as `FAILED` and does not fail the mutation; later bounces and
-	complaints arrive through `broadcast_events`.
+	**Queues, doesn't send.** Everything is validated (and one copy
+	test-built) here; suppressed addresses (`crate::suppression`) are recorded
+	`SUPPRESSED`; the row is written with every other recipient `PENDING`
+	and the first batch is queued for the worker, which sends
+	`broadcast::BATCH_SIZE` recipients every `broadcast::BATCH_INTERVAL_SECS`
+	(`crate::broadcast_send`). The result comes back `inProgress`. If the
+	batch can't be queued, the pending recipients are recorded `FAILED`
+	and the mutation fails — nothing has been sent.
 	"""
 	sendBroadcast(instanceId: ID!, input: SendBroadcastInput!): Broadcast!
 	"""

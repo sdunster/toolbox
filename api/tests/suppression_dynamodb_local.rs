@@ -30,10 +30,12 @@ use toolbox::db::Handler as _;
 use toolbox::dynamodb;
 use toolbox::graphql;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 use toolbox::suppression;
 
-type TestApp = app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage>;
+type TestApp =
+    app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage, mockqueue::Queue>;
 type TestSchema = graphql::ToolboxSchema<TestApp>;
 
 /// See `tests/auth_dynamodb_local.rs`'s identically-named helper for the
@@ -196,6 +198,7 @@ fn build_app_and_schema(db: dynamodb::Handler) -> (Arc<TestApp>, TestSchema) {
         db,
         mockmail::Handler::new(),
         mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
         0,
     ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));

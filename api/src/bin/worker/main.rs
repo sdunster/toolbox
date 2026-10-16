@@ -1,14 +1,24 @@
-//! The inbound-mail Lambda (`inbound-mail-lambda`), triggered by the SQS
-//! queue an SNS topic feeds from SES's receipt rule.
+//! The worker Lambda (`worker-lambda`, function `toolbox-worker`): everything
+//! the system does in the background. Three kinds of work arrive:
 //!
-//! Wiring, per the build plan:
+//! 1. **Inbound mail**, on the worker SQS queue, fed by SNS from SES's
+//!    receipt rule.
+//! 2. **Worker jobs** ([`toolbox::queue::Job`]), on the same SQS queue,
+//!    produced by the API and by earlier jobs — today, the paced batches of a
+//!    broadcast ([`toolbox::worker::run_job`]).
+//! 3. **SES events** (bounces, complaints, deliveries), from a second SNS
+//!    topic that invokes this function directly — see below.
+//!
+//! Wiring for inbound mail, per the build plan:
 //! ```text
 //! MX → SES receipt rule set
 //!       ├─ S3 action  → s3://{mail bucket}/inbound/{ses_message_id}
-//!       └─ SNS action → SNS topic → SQS queue (+ DLQ, 3 retries) → this Lambda
+//!       └─ SNS action → SNS topic → worker SQS queue (+ DLQ, 3 retries) → this Lambda
 //! ```
 //!
-//! Each SQS record's body is an SNS notification envelope; its `Message`
+//! An SQS record whose body is a job (a JSON object with a `job` field —
+//! [`toolbox::queue::Job::parse`]) is run as one. Anything else is inbound
+//! mail: an SNS notification envelope, whose `Message`
 //! field is itself a JSON-encoded SES receipt event
 //! (`aws_lambda_events::event::ses::SimpleEmailService`) carrying
 //! `mail.message_id` — this Lambda never trusts anything else in that event
@@ -49,11 +59,14 @@ use toolbox::app::{HasDb as _, HasStorage as _};
 use toolbox::broadcast_events;
 use toolbox::dynamodb;
 use toolbox::inbound::pipeline;
+use toolbox::queue::Job;
 use toolbox::s3storage;
 use toolbox::ses_events::SesEvent;
 use toolbox::sesmail;
+use toolbox::sqsqueue;
 use toolbox::suppression;
 use toolbox::ticket_delivery;
+use toolbox::worker;
 
 /// The outer envelope every SQS message body carries: an SNS notification.
 /// Only `Message` (the inner, JSON-encoded SES event) is needed here.
@@ -69,9 +82,17 @@ struct SnsEnvelope {
 /// baked in on both sides.
 const RAW_MAIL_PREFIX: &str = "inbound";
 
-type App = app::MyApp<dynamodb::Handler, sesmail::Mailer, s3storage::Storage>;
+type App = app::MyApp<dynamodb::Handler, sesmail::Mailer, s3storage::Storage, sqsqueue::Queue>;
 
+/// One SQS record: a worker job, or else an inbound-mail SNS envelope.
 async fn handle_record(app: &App, body: &str) -> Result<()> {
+    match Job::parse(body)? {
+        Some(job) => worker::run_job(app, &job).await,
+        None => handle_inbound_mail(app, body).await,
+    }
+}
+
+async fn handle_inbound_mail(app: &App, body: &str) -> Result<()> {
     let envelope: SnsEnvelope =
         serde_json::from_str(body).context("parsing SQS record body as an SNS envelope")?;
     let ses_event: SimpleEmailService = serde_json::from_str(&envelope.message)
@@ -123,7 +144,7 @@ async fn handle_sqs(app: &App, event: SqsEvent) -> Result<(), Error> {
             continue;
         };
         if let Err(e) = handle_record(app, &body).await {
-            tracing::error!(error = %e, "failed to process an inbound-mail SQS record");
+            tracing::error!(error = %e, "failed to process a worker SQS record");
             last_err = Some(e);
         }
     }
@@ -208,7 +229,7 @@ async fn main() -> Result<(), Error> {
     let mailer = sesmail::Mailer::new().await;
     let storage = s3storage::Storage::new()
         .await
-        .expect("MAIL_BUCKET must be set for the inbound-mail lambda");
+        .expect("MAIL_BUCKET must be set for the worker lambda");
 
     let read_only = std::env::var("READ_ONLY")
         .map(|v| v == "true" || v == "1")
@@ -217,7 +238,9 @@ async fn main() -> Result<(), Error> {
         std::env::var("DB_PREFIX").expect("DB_PREFIX must be set for the dynamodb backend");
     let db = dynamodb::Handler::new(&db_prefix, read_only).await;
 
-    let app = Arc::new(app::new(db, mailer, storage, 0));
+    // Broadcast batches queue their successors on the worker queue.
+    let queue = sqsqueue::Queue::new().await;
+    let app = Arc::new(app::new(db, mailer, storage, queue, 0));
 
     run(service_fn(move |event| {
         let app = app.clone();
@@ -229,6 +252,27 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_job_body_is_a_job_and_an_sns_envelope_is_mail() {
+        let job = Job::BroadcastBatch {
+            broadcast_id: "b1".to_string(),
+            seq: 2,
+        };
+        assert_eq!(Job::parse(&job.to_body()).unwrap(), Some(job));
+        // The envelope SNS wraps an SES receipt notification in (raw message
+        // delivery off), as the inbound-mail path receives it.
+        let envelope = serde_json::json!({
+            "Type": "Notification",
+            "MessageId": "95df01b4-ee98-5cb9-9903-4c221d41eb5e",
+            "TopicArn": "arn:aws:sns:ap-southeast-2:123456789012:toolbox-inbound",
+            "Message": "{\"mail\":{\"messageId\":\"abc\"}}",
+        })
+        .to_string();
+        assert_eq!(Job::parse(&envelope).unwrap(), None);
+        let parsed: SnsEnvelope = serde_json::from_str(&envelope).unwrap();
+        assert!(parsed.message.contains("abc"));
+    }
 
     #[test]
     fn tells_sns_from_sqs_events() {
