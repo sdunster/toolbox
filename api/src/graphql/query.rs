@@ -709,6 +709,11 @@ pub struct BroadcastRecipientInfo {
     pub delivery_status: Option<DeliveryStatusType>,
     pub delivery_detail: Option<String>,
     pub delivery_updated_at: Option<i64>,
+    /// When SES first saw this copy opened (its tracking pixel loaded) —
+    /// approximate: some mail apps load images up front, others block them.
+    pub opened_at: Option<i64>,
+    /// When SES first saw a link in this copy followed.
+    pub clicked_at: Option<i64>,
 }
 
 impl From<db::BroadcastRecipient> for BroadcastRecipientInfo {
@@ -720,6 +725,8 @@ impl From<db::BroadcastRecipient> for BroadcastRecipientInfo {
             delivery_status: r.delivery_status.map(Into::into),
             delivery_detail: r.delivery_detail,
             delivery_updated_at: r.delivery_updated_at.map(|t| t as i64),
+            opened_at: r.first_opened_at.map(|t| t as i64),
+            clicked_at: r.first_clicked_at.map(|t| t as i64),
         }
     }
 }
@@ -837,6 +844,14 @@ impl<A: App + HasDb + Send + Sync + 'static> Broadcast<A> {
     }
     async fn complained_count(&self) -> i32 {
         self.count(|r| r.delivery_status == Some(db::DeliveryStatus::Complained))
+    }
+    /// Recipients whose copy SES saw opened — approximate, see
+    /// `BroadcastRecipient.openedAt`.
+    async fn opened_count(&self) -> i32 {
+        self.count(|r| r.first_opened_at.is_some())
+    }
+    async fn clicked_count(&self) -> i32 {
+        self.count(|r| r.first_clicked_at.is_some())
     }
     /// Dataloaded — see [`TicketMessage::author`]'s doc comment.
     async fn created_by(&self, ctx: &Context<'_>) -> Result<Option<User<A>>> {
@@ -1288,6 +1303,53 @@ impl<A: App + HasDb + Send + Sync> TicketMessage<A> {
     }
 }
 
+impl<A: App + HasDb + Send + Sync + 'static> TicketMessage<A> {
+    /// This message's `message_delivery` rows (per-recipient delivery and
+    /// the message's engagement), from the whole ticket's rows loaded once
+    /// per request. Empty for a message we didn't send (`inbound`, `note`)
+    /// and for one sent before tracking existed.
+    async fn delivery_rows(&self, ctx: &Context<'_>) -> Result<Vec<db::MessageDeliveryRow>> {
+        let Some(ses_id) = self
+            .rec
+            .rfc_message_id
+            .as_deref()
+            .and_then(db::ses_message_id_from_rfc)
+        else {
+            return Ok(vec![]);
+        };
+        if !matches!(
+            self.rec.kind,
+            db::TicketMessageKind::Reply | db::TicketMessageKind::System
+        ) {
+            return Ok(vec![]);
+        }
+        let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+        let rows = loader
+            .load_one(TicketDeliveriesKey(ID(self.rec.ticket_id.clone())))
+            .await
+            .map_err(|e| anyhow!("Failed to load deliveries via DataLoader: {}", e))?
+            .unwrap_or_default();
+        Ok(rows
+            .into_iter()
+            .filter(|row| match row {
+                db::MessageDeliveryRow::Recipient(d) => d.ses_message_id == ses_id,
+                db::MessageDeliveryRow::Engagement(e) => e.ses_message_id == ses_id,
+            })
+            .collect())
+    }
+
+    async fn engagement(&self, ctx: &Context<'_>) -> Result<Option<db::MessageEngagement>> {
+        Ok(self
+            .delivery_rows(ctx)
+            .await?
+            .into_iter()
+            .find_map(|row| match row {
+                db::MessageDeliveryRow::Engagement(e) => Some(e),
+                db::MessageDeliveryRow::Recipient(_) => None,
+            }))
+    }
+}
+
 impl<A: App + HasDb + Send + Sync> Clone for TicketMessage<A> {
     fn clone(&self) -> Self {
         Self {
@@ -1351,31 +1413,37 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> TicketMessage<A> {
     /// before tracking existed, and until the first event arrives. Loaded
     /// once per ticket, not per message.
     async fn deliveries(&self, ctx: &Context<'_>) -> Result<Vec<MessageDeliveryInfo>> {
-        let Some(ses_id) = self
-            .rec
-            .rfc_message_id
-            .as_deref()
-            .and_then(db::ses_message_id_from_rfc)
-        else {
-            return Ok(vec![]);
-        };
-        if !matches!(
-            self.rec.kind,
-            db::TicketMessageKind::Reply | db::TicketMessageKind::System
-        ) {
-            return Ok(vec![]);
-        }
-        let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
-        let rows = loader
-            .load_one(TicketDeliveriesKey(ID(self.rec.ticket_id.clone())))
-            .await
-            .map_err(|e| anyhow!("Failed to load deliveries via DataLoader: {}", e))?
-            .unwrap_or_default();
-        Ok(rows
+        Ok(self
+            .delivery_rows(ctx)
+            .await?
             .into_iter()
-            .filter(|d| d.ses_message_id == ses_id)
-            .map(MessageDeliveryInfo::from)
+            .filter_map(|row| match row {
+                db::MessageDeliveryRow::Recipient(d) => Some(MessageDeliveryInfo::from(d)),
+                db::MessageDeliveryRow::Engagement(_) => None,
+            })
             .collect())
+    }
+    /// When SES first saw this message opened (its tracking pixel loaded),
+    /// from SES events (`ticket_delivery`). For the message as a whole, never
+    /// a particular recipient: every To/Cc address gets the same copy, so SES
+    /// can't say which of them opened it. Approximate either way — some mail
+    /// apps load images up front (an "open" nobody read), others block them.
+    /// `null` for a message we didn't send, or one not opened yet.
+    async fn opened_at(&self, ctx: &Context<'_>) -> Result<Option<i64>> {
+        Ok(self
+            .engagement(ctx)
+            .await?
+            .and_then(|e| e.first_opened_at)
+            .map(|t| t as i64))
+    }
+    /// When SES first saw a link in this message followed — for the message
+    /// as a whole, like `openedAt`.
+    async fn clicked_at(&self, ctx: &Context<'_>) -> Result<Option<i64>> {
+        Ok(self
+            .engagement(ctx)
+            .await?
+            .and_then(|e| e.first_clicked_at)
+            .map(|t| t as i64))
     }
     async fn in_reply_to(&self) -> Option<&str> {
         self.rec.in_reply_to.as_deref()

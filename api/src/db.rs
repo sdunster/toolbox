@@ -1323,6 +1323,10 @@ pub struct BroadcastRecipient {
     /// diagnostic code, the complaint feedback type, the reject reason.
     pub delivery_detail: Option<String>,
     pub delivery_updated_at: Option<u64>,
+    /// When SES first saw this copy opened / a link in it clicked — see
+    /// [`Engagement`]. Independent of `delivery_status`.
+    pub first_opened_at: Option<u64>,
+    pub first_clicked_at: Option<u64>,
 }
 
 impl BroadcastRecipient {
@@ -1335,6 +1339,8 @@ impl BroadcastRecipient {
             delivery_status: None,
             delivery_detail: None,
             delivery_updated_at: None,
+            first_opened_at: None,
+            first_clicked_at: None,
         }
     }
 }
@@ -1380,6 +1386,28 @@ pub struct DeliveryUpdate {
     pub at: u64,
 }
 
+/// An SES engagement event: the open-tracking pixel loaded, or a tracked
+/// link followed. Recorded as the *first* time each happened — kept apart
+/// from [`DeliveryStatus`], since a message is opened *after* it is
+/// delivered, not instead of it. Approximate by nature: some mail apps load
+/// every image up front (Apple Mail Privacy Protection — an "open" nobody
+/// read), others block images (a read with no open).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Engagement {
+    Open,
+    Click,
+}
+
+impl Engagement {
+    /// The attribute recording the first time it happened.
+    pub fn first_at_attribute(self) -> &'static str {
+        match self {
+            Self::Open => "first_opened_at",
+            Self::Click => "first_clicked_at",
+        }
+    }
+}
+
 /// One `message_delivery` row: what SES reported for one recipient of one
 /// customer-facing ticket message. Keyed `{ses_message_id}#{email}` — SES's
 /// own message id, not the `ticket_message` row id, because an event names
@@ -1397,6 +1425,28 @@ pub struct MessageDelivery {
     pub status: DeliveryStatus,
     pub detail: Option<String>,
     pub updated_at: u64,
+}
+
+/// The engagement row of one customer-facing ticket message, keyed by the
+/// bare `{ses_message_id}` (no `#email`). Per message, not per recipient: a
+/// ticket message goes out as one SES message to every To/Cc address, so
+/// they share one tracking pixel and one set of tracked links, and SES can't
+/// say which of them opened or clicked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageEngagement {
+    pub ticket_id: String,
+    pub ses_message_id: String,
+    pub first_opened_at: Option<u64>,
+    pub first_clicked_at: Option<u64>,
+}
+
+/// A `message_delivery` row of either shape — what
+/// [`Handler::list_message_deliveries`] returns. An engagement row is the
+/// one without an `email`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MessageDeliveryRow {
+    Recipient(MessageDelivery),
+    Engagement(MessageEngagement),
 }
 
 /// The bare SES message id inside a stored `rfc_message_id`
@@ -2772,6 +2822,17 @@ pub trait Handler: Sync {
         index: usize,
         update: &DeliveryUpdate,
     ) -> impl Future<Output = Result<bool>> + Send;
+    /// Record the first time recipient `index`'s copy was opened or clicked
+    /// (`recipients[index].first_opened_at`/`first_clicked_at`), conditioned
+    /// on the recipient existing and no earlier time being stored.
+    /// `Ok(false)` — not an error — when the condition fails.
+    fn set_broadcast_engagement(
+        &self,
+        id: &str,
+        index: usize,
+        engagement: Engagement,
+        at: u64,
+    ) -> impl Future<Output = Result<bool>> + Send;
     fn get_broadcast_consistent(
         &self,
         id: &str,
@@ -2807,13 +2868,25 @@ pub trait Handler: Sync {
         email: &str,
         update: &DeliveryUpdate,
     ) -> impl Future<Output = Result<bool>> + Send;
-    /// Every delivery row for a ticket — one `ticket_id-index` query, for the
-    /// whole thread. Eventually consistent, which only means a status that
-    /// arrived a moment ago may show on the next load.
+    /// Record the first time a ticket message was opened or clicked
+    /// ([`MessageEngagement`], row `id = {ses_message_id}`): an upsert
+    /// conditioned on no earlier time being stored, so a replayed or
+    /// out-of-order event is a harmless `Ok(false)`.
+    fn record_message_engagement(
+        &self,
+        ticket_id: &str,
+        ses_message_id: &str,
+        engagement: Engagement,
+        at: u64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Every delivery and engagement row for a ticket — one
+    /// `ticket_id-index` query, for the whole thread. Eventually consistent,
+    /// which only means a status that arrived a moment ago may show on the
+    /// next load.
     fn list_message_deliveries(
         &self,
         ticket_id: &str,
-    ) -> impl Future<Output = Result<Vec<MessageDelivery>>> + Send;
+    ) -> impl Future<Output = Result<Vec<MessageDeliveryRow>>> + Send;
 
     // ── ticket ────────────────────────────────────────────────────────────
     fn get_tickets<T: AsRef<str> + Sync>(

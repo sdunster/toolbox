@@ -90,6 +90,8 @@ function baseTicket() {
         createdAt: Math.floor(Date.now() / 1000) - 7200,
         attachments: [],
         deliveries: [],
+        openedAt: null as number | null,
+        clickedAt: null as number | null,
       },
       {
         __typename: "TicketMessage",
@@ -108,6 +110,8 @@ function baseTicket() {
         createdAt: Math.floor(Date.now() / 1000) - 3600,
         attachments: [],
         deliveries: [],
+        openedAt: null as number | null,
+        clickedAt: null as number | null,
       },
     ],
   };
@@ -197,6 +201,8 @@ describe("TicketThread — delivery status", () => {
           detail: "Permanent/General: 550 5.1.1 user unknown",
         },
       ],
+      openedAt: Math.floor(Date.now() / 1000),
+      clickedAt: null,
     } as (typeof ticket.messages)[number]);
     server.use(
       relayEndpoint.query("TicketThreadHarnessQuery", () =>
@@ -214,6 +220,12 @@ describe("TicketThread — delivery status", () => {
       "title",
       "Permanent/General: 550 5.1.1 user unknown",
     );
+    // Opened is for the message as a whole, not one recipient; no click yet.
+    expect(screen.getByText("Opened")).toHaveAttribute(
+      "title",
+      expect.stringContaining("Approximate"),
+    );
+    expect(screen.queryByText("Link clicked")).not.toBeInTheDocument();
     // Messages with no events (the inbound one, the note) show nothing.
     expect(
       screen.getAllByRole("list", { name: "Delivery status" }),
@@ -283,6 +295,8 @@ describe("TicketThread — reply mutation", () => {
               createdAt: Math.floor(Date.now() / 1000),
               attachments: [],
               deliveries: [],
+              openedAt: null,
+              clickedAt: null,
             },
           },
         }),

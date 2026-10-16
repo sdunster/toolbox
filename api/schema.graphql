@@ -200,6 +200,12 @@ type Broadcast {
 	bouncedCount: Int!
 	complainedCount: Int!
 	"""
+	Recipients whose copy SES saw opened — approximate, see
+	`BroadcastRecipient.openedAt`.
+	"""
+	openedCount: Int!
+	clickedCount: Int!
+	"""
 	Dataloaded — see [`TicketMessage::author`]'s doc comment.
 	"""
 	createdBy: User
@@ -218,6 +224,15 @@ type BroadcastRecipient {
 	deliveryStatus: DeliveryStatusType
 	deliveryDetail: String
 	deliveryUpdatedAt: Int
+	"""
+	When SES first saw this copy opened (its tracking pixel loaded) —
+	approximate: some mail apps load images up front, others block them.
+	"""
+	openedAt: Int
+	"""
+	When SES first saw a link in this copy followed.
+	"""
+	clickedAt: Int
 }
 
 """
@@ -2336,6 +2351,20 @@ type TicketMessage {
 	once per ticket, not per message.
 	"""
 	deliveries: [MessageDelivery!]!
+	"""
+	When SES first saw this message opened (its tracking pixel loaded),
+	from SES events (`ticket_delivery`). For the message as a whole, never
+	a particular recipient: every To/Cc address gets the same copy, so SES
+	can't say which of them opened it. Approximate either way — some mail
+	apps load images up front (an "open" nobody read), others block them.
+	`null` for a message we didn't send, or one not opened yet.
+	"""
+	openedAt: Int
+	"""
+	When SES first saw a link in this message followed — for the message
+	as a whole, like `openedAt`.
+	"""
+	clickedAt: Int
 	inReplyTo: String
 	createdAt: Int!
 	attachments: [Attachment!]!

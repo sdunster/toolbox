@@ -1,7 +1,12 @@
 import { graphql, useFragment } from "react-relay";
 import type { MessageItem_message$key } from "./__generated__/MessageItem_message.graphql";
 import { messageKindContainer, messageKindLabel } from "./ticketStyles";
-import { deliveryStatusLabel, statusToneClass } from "../../lib/deliveryStatus";
+import {
+  deliveryStatusLabel,
+  ENGAGEMENT_CAVEAT,
+  statusToneClass,
+} from "../../lib/deliveryStatus";
+import { formatTimestamp } from "../../lib/dates";
 
 const messageItemFragment = graphql`
   fragment MessageItem_message on TicketMessage {
@@ -20,6 +25,8 @@ const messageItemFragment = graphql`
       status
       detail
     }
+    openedAt
+    clickedAt
     attachments {
       filename
       contentType
@@ -37,17 +44,28 @@ type Delivery = {
 
 /**
  * What the mail provider reported for each recipient of a message we sent
- * (`TicketMessage.deliveries`) — nothing at all until the first event
+ * (`TicketMessage.deliveries`), then whether it was opened or a link in it
+ * clicked (`openedAt`/`clickedAt`) — nothing at all until the first event
  * arrives. The reason (a bounce's SMTP diagnostic, say) is in the tooltip.
+ * Opens and clicks are for the message as a whole: every recipient shares one
+ * copy, so SES can't say which of them opened it.
  */
 function DeliveryList({
   deliveries,
+  openedAt,
+  clickedAt,
   className,
 }: {
   deliveries: readonly Delivery[];
+  openedAt?: number | null;
+  clickedAt?: number | null;
   className?: string;
 }) {
-  if (deliveries.length === 0) return null;
+  const engagement: { label: string; at: number }[] = [];
+  if (openedAt != null) engagement.push({ label: "Opened", at: openedAt });
+  if (clickedAt != null)
+    engagement.push({ label: "Link clicked", at: clickedAt });
+  if (deliveries.length === 0 && engagement.length === 0) return null;
   return (
     <ul
       aria-label="Delivery status"
@@ -66,6 +84,15 @@ function DeliveryList({
           </li>
         );
       })}
+      {engagement.map((e) => (
+        <li
+          key={e.label}
+          title={`First seen ${formatTimestamp(e.at)}. ${ENGAGEMENT_CAVEAT}`}
+          className={`rounded-sm px-2 py-0.5 font-medium ${statusToneClass.neutral}`}
+        >
+          {e.label}
+        </li>
+      ))}
     </ul>
   );
 }
@@ -106,6 +133,8 @@ export function MessageItem({ message }: { message: MessageItem_message$key }) {
         </p>
         <DeliveryList
           deliveries={data.deliveries}
+          openedAt={data.openedAt}
+          clickedAt={data.clickedAt}
           className="mt-1 justify-center"
         />
       </li>
@@ -139,7 +168,12 @@ export function MessageItem({ message }: { message: MessageItem_message$key }) {
           </p>
         )}
 
-      <DeliveryList deliveries={data.deliveries} className="mt-1" />
+      <DeliveryList
+        deliveries={data.deliveries}
+        openedAt={data.openedAt}
+        clickedAt={data.clickedAt}
+        className="mt-1"
+      />
 
       <div className="mt-2 text-sm whitespace-pre-wrap text-ink">
         {data.bodyText ?? (

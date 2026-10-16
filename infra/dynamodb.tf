@@ -823,7 +823,9 @@ resource "aws_dynamodb_table" "credit_note" {
 # (api/src/ticket_delivery.rs), written by the inbound-mail lambda from SES
 # events. Keyed `{ses_message_id}#{email}` — the event names SES's message id
 # and (by tag) the ticket, so the write is an upsert by primary key with no
-# lookup. Status only moves forward (conditioned on `delivery_rank`).
+# lookup. Status only moves forward (conditioned on `delivery_rank`). Plus one
+# row per message, keyed by the bare `{ses_message_id}`, holding the first
+# open/click time (opens and clicks can't be told apart per recipient).
 
 resource "aws_dynamodb_table" "message_delivery" {
   name                        = "${var.db_prefix}_message_delivery"

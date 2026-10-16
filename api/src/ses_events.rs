@@ -1,19 +1,20 @@
 //! SES event publishing records, parsed once.
 //!
 //! The `toolbox` configuration set publishes `BOUNCE`, `COMPLAINT`,
-//! `DELIVERY`, `DELIVERY_DELAY` and `REJECT` events for every message sent
-//! through it to the `toolbox-mail-feedback` SNS topic
+//! `DELIVERY`, `DELIVERY_DELAY`, `REJECT`, `OPEN` and `CLICK` events for
+//! every message sent through it to the `toolbox-mail-feedback` SNS topic
 //! (`infra/ses_feedback.tf`), which invokes the inbound-mail Lambda directly.
 //! That Lambda's SNS handler parses each message here, once, into a
 //! [`SesEvent`], and hands the same value to every consumer:
 //!
 //! - `suppression::feedback_from` — permanent bounces and complaints add the
 //!   address to `email_suppression`, whatever was sent;
-//! - `broadcast_events::update_from` — the outcome for one broadcast
-//!   recipient, found by the `broadcast_id`/`broadcast_recipient` tags;
+//! - `broadcast_events::update_from` — the outcome, or the first open or
+//!   click, for one broadcast recipient, found by the
+//!   `broadcast_id`/`broadcast_recipient` tags;
 //! - `ticket_delivery::updates_from` — the outcome for each recipient of one
-//!   customer-facing ticket message, found by the `ticket_id` tag and SES's
-//!   message id.
+//!   customer-facing ticket message, or its first open or click, found by
+//!   the `ticket_id` tag and SES's message id.
 //!
 //! **Tags are the join key, never a lookup.** SES echoes a message's
 //! `EmailTags` on every event about it, and only this system sets them, so a
@@ -44,8 +45,10 @@ pub enum EventType {
     Bounce,
     Complaint,
     Reject,
-    /// Anything else SES may publish (`Open`, `Click`, `RenderingFailure`,
-    /// `Subscription`, …) — no consumer acts on these.
+    Open,
+    Click,
+    /// Anything else SES may publish (`RenderingFailure`, `Subscription`,
+    /// …) — no consumer acts on these.
     Other(String),
 }
 
@@ -58,6 +61,8 @@ impl EventType {
             "Bounce" => Self::Bounce,
             "Complaint" => Self::Complaint,
             "Reject" => Self::Reject,
+            "Open" => Self::Open,
+            "Click" => Self::Click,
             other => Self::Other(other.to_string()),
         }
     }
@@ -145,6 +150,8 @@ struct RawEvent {
     delivery: Option<RawDelivery>,
     delivery_delay: Option<RawDeliveryDelay>,
     reject: Option<RawReject>,
+    open: Option<RawEngagement>,
+    click: Option<RawEngagement>,
 }
 
 #[derive(Deserialize, Default)]
@@ -210,6 +217,14 @@ struct RawDeliveryDelay {
     delay_type: Option<String>,
     #[serde(default)]
     delayed_recipients: Vec<RawAffected>,
+    timestamp: Option<String>,
+}
+
+/// An `open` or `click` block — only its time is used. (A click's `link` is
+/// deliberately not kept: it's whatever URL the message contained.)
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEngagement {
     timestamp: Option<String>,
 }
 
@@ -289,7 +304,9 @@ impl SesEvent {
                 raw.delivery_delay
                     .as_ref()
                     .and_then(|d| d.timestamp.clone())
-            });
+            })
+            .or_else(|| raw.open.as_ref().and_then(|o| o.timestamp.clone()))
+            .or_else(|| raw.click.as_ref().and_then(|c| c.timestamp.clone()));
         let at = unix_seconds(event_ts.as_deref())
             .or_else(|| unix_seconds(raw.mail.timestamp.as_deref()));
         Ok(SesEvent {
@@ -329,9 +346,20 @@ impl SesEvent {
         self.tags.get(name)?.first().map(String::as_str)
     }
 
+    /// Whether this is an engagement event (an open or a click) — about the
+    /// message as a whole: SES names no recipient for one, since every
+    /// recipient of one message shares its tracking pixel and links.
+    pub fn engagement(&self) -> Option<db::Engagement> {
+        match self.event_type {
+            EventType::Open => Some(db::Engagement::Open),
+            EventType::Click => Some(db::Engagement::Click),
+            _ => None,
+        }
+    }
+
     /// What this event means for each recipient it concerns, in the order
     /// SES lists them. Empty for event types that carry no delivery outcome
-    /// (`Send`, `Open`, …). A `Reject` concerns every original recipient.
+    /// (`Send`, `Open`, `Click`, …). A `Reject` concerns every original recipient.
     ///
     /// The detail strings: a delivery's SMTP response; a bounce's
     /// `{type}/{subType}: {diagnosticCode}`; a delay's
@@ -410,7 +438,7 @@ impl SesEvent {
                     push(r, S::Rejected, self.reject_reason.clone());
                 }
             }
-            EventType::Send | EventType::Other(_) => {}
+            EventType::Send | EventType::Open | EventType::Click | EventType::Other(_) => {}
         }
         out
     }
@@ -538,9 +566,34 @@ mod tests {
     }
 
     #[test]
+    fn opens_and_clicks_are_engagement_not_delivery_outcomes() {
+        let open = event(serde_json::json!({
+            "eventType": "Open",
+            "mail": { "timestamp": "2026-10-13T01:00:00.000Z", "destination": ["a@example.com"] },
+            "open": { "timestamp": "2026-10-13T02:00:00.000Z", "userAgent": "Mozilla", "ipAddress": "192.0.2.1" }
+        }));
+        assert_eq!(open.event_type, EventType::Open);
+        assert_eq!(open.engagement(), Some(db::Engagement::Open));
+        assert_eq!(open.at, Some(1_791_856_800), "the open's own time wins");
+        assert!(open.recipient_outcomes().is_empty());
+
+        let click = event(serde_json::json!({
+            "eventType": "Click",
+            "mail": { "destination": ["a@example.com"] },
+            "click": { "timestamp": "2026-10-13T02:00:05.000Z", "link": "https://example.com/" }
+        }));
+        assert_eq!(click.engagement(), Some(db::Engagement::Click));
+        assert_eq!(click.at, Some(1_791_856_805));
+
+        let delivery = event(serde_json::json!({ "eventType": "Delivery", "mail": {} }));
+        assert_eq!(delivery.engagement(), None);
+    }
+
+    #[test]
     fn unknown_types_and_missing_blocks_yield_no_outcomes() {
-        let e = event(serde_json::json!({ "eventType": "Open", "mail": {} }));
-        assert_eq!(e.event_type, EventType::Other("Open".into()));
+        let e = event(serde_json::json!({ "eventType": "RenderingFailure", "mail": {} }));
+        assert_eq!(e.event_type, EventType::Other("RenderingFailure".into()));
+        assert_eq!(e.engagement(), None);
         assert!(e.recipient_outcomes().is_empty());
         let e = event(serde_json::json!({ "eventType": "Bounce", "mail": {} }));
         assert!(e.recipient_outcomes().is_empty());

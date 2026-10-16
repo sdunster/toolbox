@@ -810,7 +810,8 @@ async fn notification_settings_is_forbidden_via_admin_user() {
 
 /// Customer-facing ticket mail carries the `ticket_id` SES tag, and SES
 /// events for it land on `TicketMessage.deliveries`, per recipient, moving
-/// only forward.
+/// only forward — and opens/clicks on `openedAt`/`clickedAt`, per message,
+/// keeping the earliest.
 #[tokio::test]
 async fn ticket_mail_is_tagged_and_its_delivery_events_show_on_the_message() {
     use toolbox::ses_events::SesEvent;
@@ -896,6 +897,27 @@ async fn ticket_mail_is_tagged_and_its_delivery_events_show_on_the_message() {
             "deliveryDelay",
             json!({ "delayType": "MailboxFull", "delayedRecipients": [{ "emailAddress": cc_email }] }),
         ),
+        ev(
+            "Open",
+            "open",
+            json!({ "timestamp": "2026-10-13T03:00:00.000Z" }),
+        ),
+        // An earlier open arriving late wins; a replay changes nothing.
+        ev(
+            "Open",
+            "open",
+            json!({ "timestamp": "2026-10-13T02:00:00.000Z" }),
+        ),
+        ev(
+            "Open",
+            "open",
+            json!({ "timestamp": "2026-10-13T03:00:00.000Z" }),
+        ),
+        ev(
+            "Click",
+            "click",
+            json!({ "timestamp": "2026-10-13T02:00:30.000Z" }),
+        ),
     ] {
         ticket_delivery::apply(&db, &e).await.expect("apply");
     }
@@ -903,7 +925,7 @@ async fn ticket_mail_is_tagged_and_its_delivery_events_show_on_the_message() {
     let response = schema
         .execute(
             Request::new(
-                r#"query($id: ID!) { ticket(id: $id) { messages { kind rfcMessageId deliveries { email status detail } } } }"#,
+                r#"query($id: ID!) { ticket(id: $id) { messages { kind rfcMessageId deliveries { email status detail } openedAt clickedAt } } }"#,
             )
             .variables(Variables::from_json(json!({ "id": ticket.id })))
             .data(user_auth(&owner_id, &instance.id, true))
@@ -917,6 +939,10 @@ async fn ticket_mail_is_tagged_and_its_delivery_events_show_on_the_message() {
         .iter()
         .find(|m| m["kind"] == "REPLY")
         .expect("the reply");
+    assert_eq!(reply["openedAt"], 1_791_856_800);
+    assert_eq!(reply["clickedAt"], 1_791_856_830);
+    // The engagement row is the message's, never listed as a recipient.
+    assert_eq!(reply["deliveries"].as_array().unwrap().len(), 2, "{reply}");
     let mut deliveries = reply["deliveries"].as_array().unwrap().clone();
     deliveries.sort_by_key(|d| d["email"].as_str().unwrap().to_string());
     let by_email = |e: &str| {
@@ -940,4 +966,5 @@ async fn ticket_mail_is_tagged_and_its_delivery_events_show_on_the_message() {
         .find(|m| m["kind"] == "SYSTEM")
         .expect("the close notice");
     assert_eq!(system["deliveries"], json!([]));
+    assert_eq!(system["openedAt"], json!(null));
 }

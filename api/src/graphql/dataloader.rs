@@ -123,18 +123,18 @@ impl<A: App + HasDb + Send + Sync + 'static> Loader<InvoiceId> for DatabaseLoade
     }
 }
 
-/// Every `message_delivery` row of each requested ticket (one
+/// Every `message_delivery` row (delivery and engagement) of each requested ticket (one
 /// `ticket_id-index` query per ticket — in practice one per request, since a
 /// thread view shows one ticket). A ticket with none maps to an empty list.
 impl<A: App + HasDb + Send + Sync + 'static> Loader<TicketDeliveriesKey> for DatabaseLoader<A> {
-    type Value = Vec<db::MessageDelivery>;
+    type Value = Vec<db::MessageDeliveryRow>;
     type Error = Arc<anyhow::Error>;
 
     async fn load(
         &self,
         keys: &[TicketDeliveriesKey],
     ) -> std::result::Result<
-        HashMap<TicketDeliveriesKey, Vec<db::MessageDelivery>>,
+        HashMap<TicketDeliveriesKey, Vec<db::MessageDeliveryRow>>,
         Arc<anyhow::Error>,
     > {
         let mut map = HashMap::new();

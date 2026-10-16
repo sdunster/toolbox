@@ -182,7 +182,8 @@ const LIST_BROADCASTS: &str = r#"
         instance(slug: $slug) {
             broadcastFromDomains
             broadcasts { id subject deliveredCount bouncedCount complainedCount
-                recipients { email sendStatus deliveryStatus deliveryDetail } }
+                openedCount clickedCount
+                recipients { email sendStatus deliveryStatus deliveryDetail openedAt clickedAt } }
         }
     }
 "#;
@@ -703,6 +704,72 @@ async fn delivery_events_update_the_right_recipient_and_only_move_forward() {
     assert_eq!(listed["bouncedCount"], 1);
     assert_eq!(listed["complainedCount"], 1);
     assert_eq!(listed["recipients"][1]["deliveryStatus"], "BOUNCED");
+}
+
+#[tokio::test]
+async fn opens_and_clicks_keep_the_earliest_time_on_the_right_recipient() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) =
+        setup_instance(&db, "engagement", db::InstanceKind::Support).await;
+    let (_app, schema) = build_app_and_schema(db.clone());
+    let recipients = vec![unique_email("reader"), unique_email("ignorer")];
+    let resp = send(
+        &schema,
+        user_auth(&owner, &instance.id, true),
+        &instance.id,
+        &format!("news@{domain}"),
+        &recipients,
+    )
+    .await;
+    let id = expect_data(&resp, "sendBroadcast")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let at = |t: &str| json!({ "timestamp": t });
+    for msg in [
+        ses_event(
+            "Delivery",
+            &id,
+            0,
+            "delivery",
+            json!({ "smtpResponse": "250 OK" }),
+        ),
+        ses_event("Open", &id, 0, "open", at("2026-10-13T03:00:00.000Z")),
+        // An earlier open arriving late wins; a later one changes nothing.
+        ses_event("Open", &id, 0, "open", at("2026-10-13T02:00:00.000Z")),
+        ses_event("Open", &id, 0, "open", at("2026-10-13T04:00:00.000Z")),
+        ses_event("Click", &id, 0, "click", at("2026-10-13T02:00:30.000Z")),
+        // Out-of-range index: a no-op, not an error.
+        ses_event("Open", &id, 99, "open", at("2026-10-13T02:00:00.000Z")),
+    ] {
+        broadcast_events::apply(&db, &SesEvent::parse(&msg).unwrap())
+            .await
+            .expect("apply");
+    }
+
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    let r = &stored.recipients;
+    assert_eq!(r[0].first_opened_at, Some(1_791_856_800));
+    assert_eq!(r[0].first_clicked_at, Some(1_791_856_830));
+    // Engagement never touches delivery status.
+    assert_eq!(r[0].delivery_status, Some(db::DeliveryStatus::Delivered));
+    assert_eq!(r[1].first_opened_at, None);
+    assert_eq!(r[1].first_clicked_at, None);
+
+    let resp = schema
+        .execute(
+            Request::new(LIST_BROADCASTS)
+                .variables(Variables::from_json(json!({ "slug": instance.slug })))
+                .data(user_auth(&owner, &instance.id, true)),
+        )
+        .await;
+    let listed = &expect_data(&resp, "instance")["broadcasts"][0];
+    assert_eq!(listed["openedCount"], 1);
+    assert_eq!(listed["clickedCount"], 1);
+    assert_eq!(listed["recipients"][0]["openedAt"], 1_791_856_800);
+    assert_eq!(listed["recipients"][1]["openedAt"], json!(null));
 }
 
 #[tokio::test]

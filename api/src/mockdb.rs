@@ -621,6 +621,16 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    async fn set_broadcast_engagement(
+        &self,
+        _id: &str,
+        _index: usize,
+        _engagement: db::Engagement,
+        _at: u64,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
     async fn get_broadcast_consistent(&self, _id: &str) -> db::Result<Option<db::Broadcast>> {
         Self::unsupported()
     }
@@ -654,10 +664,20 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    async fn record_message_engagement(
+        &self,
+        _ticket_id: &str,
+        _ses_message_id: &str,
+        _engagement: db::Engagement,
+        _at: u64,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
     async fn list_message_deliveries(
         &self,
         _ticket_id: &str,
-    ) -> db::Result<Vec<db::MessageDelivery>> {
+    ) -> db::Result<Vec<db::MessageDeliveryRow>> {
         Self::unsupported()
     }
 
