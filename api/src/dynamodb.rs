@@ -891,6 +891,8 @@ impl TryInto<db::Broadcast> for Item {
             subject: req_s("subject")?,
             body_text: req_s("body_text")?,
             recipients,
+            send_seq: self.i64_field("send_seq")?.unwrap_or(0) as u64,
+            next_batch_at: self.i64_field("next_batch_at")?.map(|t| t as u64),
         })
     }
 }
@@ -4797,9 +4799,19 @@ impl db::Handler for Handler {
                 "recipients".to_string(),
                 AttributeValue::L(b.recipients.iter().map(broadcast_recipient_to_av).collect()),
             ),
+            (
+                "send_seq".to_string(),
+                AttributeValue::N(b.send_seq.to_string()),
+            ),
         ]);
         if !b.from_name.is_empty() {
             item.insert("from_name".to_string(), s(&b.from_name));
+        }
+        if let Some(at) = b.next_batch_at {
+            item.insert(
+                "next_batch_at".to_string(),
+                AttributeValue::N(at.to_string()),
+            );
         }
         let resp = self
             .client
@@ -4813,6 +4825,62 @@ impl db::Handler for Handler {
             .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
         record_capacity("create_broadcast", resp.consumed_capacity(), CapKind::Write);
         Ok(())
+    }
+
+    async fn claim_broadcast_recipient(&self, id: &str, index: usize) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let path = format!("recipients[{index}]");
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .update_expression(format!("SET {path}.send_status = :sending"))
+            .condition_expression(format!("{path}.send_status = :pending"))
+            .expression_attribute_values(
+                ":sending",
+                AttributeValue::S(db::BroadcastSendStatus::Sending.as_str().to_string()),
+            )
+            .expression_attribute_values(
+                ":pending",
+                AttributeValue::S(db::BroadcastSendStatus::Pending.as_str().to_string()),
+            )
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("claim_broadcast_recipient", resp)
+    }
+
+    async fn set_broadcast_progress(
+        &self,
+        id: &str,
+        seq: u64,
+        next_batch_at: Option<u64>,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .condition_expression(
+                "attribute_exists(id) AND (attribute_not_exists(send_seq) OR send_seq <= :seq)",
+            )
+            .expression_attribute_values(":seq", AttributeValue::N(seq.to_string()))
+            .expression_attribute_values(":next", AttributeValue::N((seq + 1).to_string()));
+        let expr = match next_batch_at {
+            Some(at) => {
+                req = req.expression_attribute_values(":at", AttributeValue::N(at.to_string()));
+                "SET send_seq = :next, next_batch_at = :at"
+            }
+            None => "SET send_seq = :next REMOVE next_batch_at",
+        };
+        let resp = req
+            .update_expression(expr)
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_broadcast_progress", resp)
     }
 
     async fn set_broadcast_send_result(

@@ -16,12 +16,13 @@ use std::sync::Arc;
 use async_graphql::Variables;
 use serde_json::{Value, json};
 
-use crate::app::{App, HasDb, HasMail, HasStorage};
+use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 use crate::auth::AuthInfo;
 use crate::graphql::{self, ClientIp, ToolboxSchema};
 
 /// Everything a tool needs to run GraphQL as the authenticated caller.
-pub struct ToolContext<'a, A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> {
+pub struct ToolContext<'a, A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static>
+{
     pub app: &'a Arc<A>,
     pub schema: &'a ToolboxSchema<A>,
     pub auth_info: &'a AuthInfo,
@@ -30,7 +31,7 @@ pub struct ToolContext<'a, A: App + HasDb + HasMail + HasStorage + Send + Sync +
 
 impl<A> ToolContext<'_, A>
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     /// Run a fixed GraphQL document as the caller (see the module doc). Returns
     /// the response's `data` as plain JSON on success, or every error message on

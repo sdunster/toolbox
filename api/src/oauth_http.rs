@@ -551,11 +551,14 @@ mod tests {
     use crate::mockmail;
     use crate::mockstorage;
 
-    fn app() -> MyApp<mockdb::Handler, mockmail::Handler, mockstorage::Storage> {
+    fn app()
+    -> MyApp<mockdb::Handler, mockmail::Handler, mockstorage::Storage, crate::mockqueue::Queue>
+    {
         app::new(
             mockdb::Handler::new(),
             mockmail::Handler::new(),
             mockstorage::Storage::new(),
+            crate::mockqueue::Queue::new(),
             0,
         )
     }

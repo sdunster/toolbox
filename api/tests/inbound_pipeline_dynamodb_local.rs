@@ -30,9 +30,11 @@ use toolbox::db::Handler as _;
 use toolbox::dynamodb;
 use toolbox::inbound::pipeline;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 
-type TestApp = app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage>;
+type TestApp =
+    app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage, mockqueue::Queue>;
 
 async fn local_db_prefix() -> Option<String> {
     let endpoint = toolbox::local_dev::require_local_dynamodb_endpoint().ok()?;
@@ -106,6 +108,7 @@ fn test_app(db: dynamodb::Handler, storage_dir_label: &str) -> TestApp {
         db,
         mockmail::Handler::new(),
         mockstorage::Storage::with_dir(dir),
+        mockqueue::Queue::new(),
         0,
     )
 }

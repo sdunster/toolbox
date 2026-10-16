@@ -1,7 +1,8 @@
 # Per-Lambda execution roles. Each gets only the inline policies its own
 # function needs (named by capability, not by resource), rather than one
-# shared role — the API lambda never touches SQS, the inbound lambda never
-# needs a broader DynamoDB grant than the API lambda does, etc.
+# shared role — the API lambda can only send to the worker queue, never
+# consume it, the worker lambda never needs a broader DynamoDB grant than the
+# API lambda does, etc.
 
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
@@ -97,21 +98,37 @@ resource "aws_iam_role_policy" "api_lambda_s3_mail" {
   })
 }
 
-# ── Inbound-mail lambda role ────────────────────────────────────────────────
+# sendBroadcast queues a broadcast's first batch for the worker
+# (api/src/broadcast_send.rs). Send only — the worker consumes.
+resource "aws_iam_role_policy" "api_lambda_sqs_send" {
+  name = "sqs-send"
+  role = aws_iam_role.api_lambda.id
 
-resource "aws_iam_role" "inbound_mail_lambda" {
-  name               = "toolbox-inbound-mail-lambda-role"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["sqs:SendMessage"]
+      Resource = aws_sqs_queue.worker.arn
+    }]
+  })
+}
+
+# ── Worker lambda role ──────────────────────────────────────────────────────
+
+resource "aws_iam_role" "worker_lambda" {
+  name               = "toolbox-worker-lambda-role"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
 }
 
-resource "aws_iam_role_policy_attachment" "inbound_mail_lambda_logs" {
-  role       = aws_iam_role.inbound_mail_lambda.name
+resource "aws_iam_role_policy_attachment" "worker_lambda_logs" {
+  role       = aws_iam_role.worker_lambda.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-resource "aws_iam_role_policy" "inbound_mail_lambda_dynamodb" {
+resource "aws_iam_role_policy" "worker_lambda_dynamodb" {
   name = "dynamodb-access"
-  role = aws_iam_role.inbound_mail_lambda.id
+  role = aws_iam_role.worker_lambda.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -135,9 +152,9 @@ resource "aws_iam_role_policy" "inbound_mail_lambda_dynamodb" {
 # Reads the raw MIME the SES receipt rule wrote (inbound/) and writes
 # extracted attachments (attachments/). See api/src/s3storage.rs and
 # api/src/inbound/pipeline.rs.
-resource "aws_iam_role_policy" "inbound_mail_lambda_s3" {
+resource "aws_iam_role_policy" "worker_lambda_s3" {
   name = "s3-mail"
-  role = aws_iam_role.inbound_mail_lambda.id
+  role = aws_iam_role.worker_lambda.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -152,11 +169,11 @@ resource "aws_iam_role_policy" "inbound_mail_lambda_s3" {
   })
 }
 
-# Step 7's "notify requesters and CCs" — the inbound lambda sends outbound
-# mail directly, the same as the API lambda's replyToTicket path.
-resource "aws_iam_role_policy" "inbound_mail_lambda_ses" {
+# Step 7's "notify requesters and CCs" — the worker lambda sends outbound
+# mail directly (and broadcast batches), the same as the API lambda's replyToTicket path.
+resource "aws_iam_role_policy" "worker_lambda_ses" {
   name = "ses-send"
-  role = aws_iam_role.inbound_mail_lambda.id
+  role = aws_iam_role.worker_lambda.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -168,9 +185,9 @@ resource "aws_iam_role_policy" "inbound_mail_lambda_ses" {
   })
 }
 
-resource "aws_iam_role_policy" "inbound_mail_lambda_sqs_consume" {
+resource "aws_iam_role_policy" "worker_lambda_sqs_consume" {
   name = "sqs-consume"
-  role = aws_iam_role.inbound_mail_lambda.id
+  role = aws_iam_role.worker_lambda.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -181,7 +198,22 @@ resource "aws_iam_role_policy" "inbound_mail_lambda_sqs_consume" {
         "sqs:DeleteMessage",
         "sqs:GetQueueAttributes",
       ]
-      Resource = aws_sqs_queue.inbound_mail.arn
+      Resource = aws_sqs_queue.worker.arn
+    }]
+  })
+}
+
+# Each broadcast batch queues the next (api/src/broadcast_send.rs).
+resource "aws_iam_role_policy" "worker_lambda_sqs_send" {
+  name = "sqs-send"
+  role = aws_iam_role.worker_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["sqs:SendMessage"]
+      Resource = aws_sqs_queue.worker.arn
     }]
   })
 }

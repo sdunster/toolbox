@@ -1,5 +1,5 @@
 //! The impure inbound-mail orchestration: idempotency, parse, loop guards,
-//! resolve, store, notify. Shared by `bin/inbound-mail/` (the SQS-triggered
+//! resolve, store, notify. Shared by `bin/worker/` (the SQS-triggered
 //! Lambda) and `bin/cli.rs`'s `mail process` subcommand (`make local-mail`)
 //! — both call [`process_raw_message`] with the same raw MIME bytes; the
 //! only difference is where those bytes came from (S3 vs. a local `.eml`

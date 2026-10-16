@@ -1,5 +1,6 @@
 //! Integration tests for broadcast email against **DynamoDB Local** and the
-//! **mock** mailer: `sendBroadcast` through the real GraphQL schema, replies
+//! **mock** mailer and queue: `sendBroadcast` through the real GraphQL schema,
+//! its queued batches through the worker's own job runner, replies
 //! through the real inbound pipeline, and SES delivery events through
 //! `broadcast_events::apply`. Proves the three promises CLAUDE.md's
 //! "Broadcasts" entry makes: one copy per recipient, a reply from each
@@ -25,6 +26,7 @@ use async_graphql::{Request, Response, Variables};
 use serde_json::json;
 use toolbox::app;
 use toolbox::auth::{AuthInfo, Membership};
+use toolbox::broadcast;
 use toolbox::broadcast_events;
 use toolbox::db;
 use toolbox::db::Handler as _;
@@ -32,10 +34,13 @@ use toolbox::dynamodb;
 use toolbox::graphql;
 use toolbox::inbound::pipeline;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 use toolbox::ses_events::SesEvent;
+use toolbox::worker;
 
-type TestApp = app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage>;
+type TestApp =
+    app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage, mockqueue::Queue>;
 type TestSchema = graphql::ToolboxSchema<TestApp>;
 
 async fn local_db_prefix() -> Option<String> {
@@ -161,6 +166,7 @@ fn build_app_and_schema(db: dynamodb::Handler) -> (Arc<TestApp>, TestSchema) {
         db,
         mockmail::Handler::new(),
         mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
         0,
     ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));
@@ -172,6 +178,7 @@ const SEND_BROADCAST: &str = r#"
     mutation($instanceId: ID!, $input: SendBroadcastInput!) {
         sendBroadcast(instanceId: $instanceId, input: $input) {
             id fromAddress fromName replyTo subject recipientCount sentCount failedCount
+            inProgress pendingCount nextBatchAt estimatedFinishAt
             recipients { email sendStatus error deliveryStatus deliveryDetail }
         }
     }
@@ -187,6 +194,22 @@ const LIST_BROADCASTS: &str = r#"
         }
     }
 "#;
+
+/// Stand in for the worker: run every queued job, and every job those
+/// queue, until the queue is empty (delays ignored). Returns the jobs run.
+async fn run_queued_jobs(app: &TestApp) -> Vec<mockqueue::QueuedJob> {
+    let mut ran = Vec::new();
+    loop {
+        let jobs = app.queue.drain();
+        if jobs.is_empty() {
+            return ran;
+        }
+        for queued in jobs {
+            worker::run_job(app, &queued.job).await.expect("run_job");
+            ran.push(queued);
+        }
+    }
+}
 
 async fn send(
     schema: &TestSchema,
@@ -237,9 +260,16 @@ async fn sends_one_copy_per_recipient_and_records_each_result() {
     assert_eq!(b["fromName"], "bcast Support");
     assert_eq!(b["replyTo"], format!("support@{domain}"));
     assert_eq!(b["recipientCount"], 3);
-    assert_eq!(b["sentCount"], 3);
-    assert_eq!(b["failedCount"], 0);
+    // Queued, not sent: the worker sends it.
+    assert_eq!(b["sentCount"], 0);
+    assert_eq!(b["pendingCount"], 3);
+    assert_eq!(b["inProgress"], true);
+    assert!(b["nextBatchAt"].is_i64(), "{b}");
+    assert!(app.mail.sent_raw().is_empty(), "nothing is sent inline");
 
+    let ran = run_queued_jobs(&app).await;
+    assert_eq!(ran.len(), 1, "three recipients fit in one batch");
+    assert_eq!(ran[0].delay_secs, 0, "the first batch runs straight away");
     let sent = app.mail.sent_raw();
     assert_eq!(sent.len(), 3);
     let broadcast_id = b["id"].as_str().unwrap().to_string();
@@ -270,6 +300,8 @@ async fn sends_one_copy_per_recipient_and_records_each_result() {
         assert_eq!(r.send_status, db::BroadcastSendStatus::Sent);
         assert!(r.provider_message_id.is_some());
     }
+    assert!(!stored.in_progress(), "done: no next batch");
+    assert_eq!(stored.send_seq, 1);
 }
 
 #[tokio::test]
@@ -291,6 +323,7 @@ async fn replies_from_different_recipients_open_separate_new_tickets() {
     .await;
     let b = expect_data(&resp, "sendBroadcast");
     let reply_to = b["replyTo"].as_str().unwrap().to_string();
+    run_queued_jobs(&app).await;
     let sent = app.mail.sent_raw();
 
     let mut ticket_ids = Vec::new();
@@ -607,7 +640,7 @@ async fn delivery_events_update_the_right_recipient_and_only_move_forward() {
     let prefix = require_local_db!();
     let db = dynamodb::Handler::new(&prefix, false).await;
     let (instance, owner, domain) = setup_instance(&db, "events", db::InstanceKind::Support).await;
-    let (_app, schema) = build_app_and_schema(db.clone());
+    let (app, schema) = build_app_and_schema(db.clone());
     let recipients = vec![
         unique_email("ok"),
         unique_email("gone"),
@@ -625,6 +658,7 @@ async fn delivery_events_update_the_right_recipient_and_only_move_forward() {
         .as_str()
         .unwrap()
         .to_string();
+    run_queued_jobs(&app).await;
 
     let delivery = json!({ "timestamp": "2026-10-13T01:00:01.000Z", "smtpResponse": "250 OK" });
     let bounce = json!({
@@ -799,7 +833,8 @@ async fn a_suppressed_address_is_recorded_and_never_sent() {
     )
     .await;
     let b = expect_data(&resp, "sendBroadcast");
-    assert_eq!(b["sentCount"], 1);
+    // Known suppressed at queue time, so recorded up front.
+    assert_eq!(b["pendingCount"], 1);
     assert_eq!(b["recipients"][0]["sendStatus"], "SUPPRESSED");
     assert!(
         b["recipients"][0]["error"]
@@ -808,8 +843,9 @@ async fn a_suppressed_address_is_recorded_and_never_sent() {
             .contains("hard bounce"),
         "{b}"
     );
-    assert_eq!(b["recipients"][1]["sendStatus"], "SENT");
+    assert_eq!(b["recipients"][1]["sendStatus"], "PENDING");
 
+    run_queued_jobs(&app).await;
     let sent = app.mail.sent_raw();
     assert_eq!(sent.len(), 1, "only the unsuppressed address is mailed");
     assert_eq!(sent[0].to, vec![ok]);
@@ -827,5 +863,244 @@ async fn a_suppressed_address_is_recorded_and_never_sent() {
     assert_eq!(
         stored.recipients[0].send_status,
         db::BroadcastSendStatus::Suppressed
+    );
+}
+
+// ── background sending ───────────────────────────────────────────────────
+
+/// Queue a broadcast to `count` fresh recipients; returns its id and them.
+async fn queue_broadcast(
+    schema: &TestSchema,
+    instance: &db::Instance,
+    owner: &str,
+    domain: &str,
+    count: usize,
+) -> (String, Vec<String>) {
+    let recipients: Vec<String> = (0..count).map(|i| unique_email(&format!("r{i}"))).collect();
+    let resp = send(
+        schema,
+        user_auth(owner, &instance.id, true),
+        &instance.id,
+        &format!("news@{domain}"),
+        &recipients,
+    )
+    .await;
+    let id = expect_data(&resp, "sendBroadcast")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    (id, recipients)
+}
+
+fn batch_job(id: &str, seq: u64) -> toolbox::queue::Job {
+    toolbox::queue::Job::BroadcastBatch {
+        broadcast_id: id.to_string(),
+        seq,
+    }
+}
+
+#[tokio::test]
+async fn sends_a_batch_at_a_time_each_queueing_the_next_after_a_delay() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "pace", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+    let n = broadcast::BATCH_SIZE * 2 + 2;
+    let (id, recipients) = queue_broadcast(&schema, &instance, &owner, &domain, n).await;
+
+    let first = app.queue.drain();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].job, batch_job(&id, 0));
+    worker::run_job(&*app, &first[0].job).await.unwrap();
+
+    // Exactly one batch's worth went out, in order, and the next is queued
+    // behind the pacing delay.
+    let sent = app.mail.sent_raw();
+    assert_eq!(sent.len(), broadcast::BATCH_SIZE);
+    for (msg, email) in sent.iter().zip(&recipients) {
+        assert_eq!(&msg.to[0], email);
+    }
+    let next = app.queue.drain();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].job, batch_job(&id, 1));
+    assert_eq!(next[0].delay_secs, broadcast::BATCH_INTERVAL_SECS);
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    assert_eq!(stored.send_seq, 1);
+    assert!(stored.in_progress());
+
+    // The rest follow, one batch per job, until nothing is queued.
+    worker::run_job(&*app, &next[0].job).await.unwrap();
+    let ran = run_queued_jobs(&app).await;
+    assert_eq!(ran.len(), 1, "a third and final batch");
+    assert_eq!(app.mail.sent_raw().len(), n);
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    assert_eq!(stored.send_seq, 3);
+    assert!(!stored.in_progress());
+    assert!(
+        stored
+            .recipients
+            .iter()
+            .all(|r| r.send_status == db::BroadcastSendStatus::Sent)
+    );
+}
+
+#[tokio::test]
+async fn a_list_over_the_old_limit_of_100_is_accepted_and_all_sent() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "big", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+
+    let (id, _) = queue_broadcast(&schema, &instance, &owner, &domain, 117).await;
+    let ran = run_queued_jobs(&app).await;
+    assert_eq!(ran.len(), 117usize.div_ceil(broadcast::BATCH_SIZE));
+    let sent = app.mail.sent_raw();
+    assert_eq!(sent.len(), 117);
+    let unique: std::collections::HashSet<_> = sent.iter().map(|m| m.to[0].clone()).collect();
+    assert_eq!(unique.len(), 117, "nobody mailed twice");
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    assert!(!stored.in_progress());
+
+    // Over the cap is refused outright, before anything is queued.
+    let too_many: Vec<String> = (0..=broadcast::MAX_BROADCAST_RECIPIENTS)
+        .map(|i| format!("r{i}@example.com"))
+        .collect();
+    let resp = send(
+        &schema,
+        user_auth(&owner, &instance.id, true),
+        &instance.id,
+        &format!("news@{domain}"),
+        &too_many,
+    )
+    .await;
+    assert!(!resp.errors.is_empty());
+    assert!(app.queue.drain().is_empty());
+}
+
+#[tokio::test]
+async fn a_duplicate_or_stale_job_never_sends_anyone_twice() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "dupe", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+    let n = broadcast::BATCH_SIZE + 1;
+    let (id, _) = queue_broadcast(&schema, &instance, &owner, &domain, n).await;
+    app.queue.drain();
+
+    // SQS delivers seq 0 twice: the second copy is stale once the first has
+    // recorded its progress.
+    worker::run_job(&*app, &batch_job(&id, 0)).await.unwrap();
+    let outcome = toolbox::broadcast_send::run_batch(&*app, &id, 0)
+        .await
+        .unwrap();
+    assert_eq!(outcome, toolbox::broadcast_send::BatchOutcome::Stale);
+    assert_eq!(app.mail.sent_raw().len(), broadcast::BATCH_SIZE);
+
+    // A recipient already claimed by a concurrent run is skipped, and left
+    // `sending` — never retried, since it may have gone out.
+    assert!(
+        db.claim_broadcast_recipient(&id, broadcast::BATCH_SIZE)
+            .await
+            .unwrap()
+    );
+    let next = app.queue.drain();
+    worker::run_job(&*app, &next[0].job).await.unwrap();
+    assert_eq!(app.mail.sent_raw().len(), broadcast::BATCH_SIZE);
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.recipients[broadcast::BATCH_SIZE].send_status,
+        db::BroadcastSendStatus::Sending
+    );
+    assert!(!stored.in_progress(), "nothing left pending");
+    assert!(app.queue.drain().is_empty());
+
+    // A job for a broadcast that doesn't exist is a harmless no-op.
+    assert_eq!(
+        toolbox::broadcast_send::run_batch(&*app, "nonexistent0", 0)
+            .await
+            .unwrap(),
+        toolbox::broadcast_send::BatchOutcome::Missing
+    );
+}
+
+#[tokio::test]
+async fn an_instance_deleted_mid_broadcast_fails_the_rest_and_stops() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "gone", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+    let n = broadcast::BATCH_SIZE + 2;
+    let (id, _) = queue_broadcast(&schema, &instance, &owner, &domain, n).await;
+    let first = app.queue.drain();
+    worker::run_job(&*app, &first[0].job).await.unwrap();
+
+    db.update_instance(&instance.id, db::InstanceUpdateShape::SetDeleted(true))
+        .await
+        .unwrap();
+    let ran = run_queued_jobs(&app).await;
+    assert_eq!(ran.len(), 1);
+    assert_eq!(
+        app.mail.sent_raw().len(),
+        broadcast::BATCH_SIZE,
+        "no more sent"
+    );
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    assert!(!stored.in_progress());
+    for r in &stored.recipients[broadcast::BATCH_SIZE..] {
+        assert_eq!(r.send_status, db::BroadcastSendStatus::Failed);
+        assert!(r.error.as_deref().unwrap().contains("deleted"), "{r:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_address_suppressed_after_queueing_is_skipped_at_send_time() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "late", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+    let (id, recipients) = queue_broadcast(&schema, &instance, &owner, &domain, 2).await;
+
+    db.record_email_suppression(&recipients[0], db::SuppressionReason::Complaint, None, 1)
+        .await
+        .unwrap();
+    run_queued_jobs(&app).await;
+
+    let sent = app.mail.sent_raw();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].to, vec![recipients[1].clone()]);
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    assert_eq!(
+        stored.recipients[0].send_status,
+        db::BroadcastSendStatus::Suppressed
+    );
+}
+
+#[tokio::test]
+async fn a_broadcast_that_cannot_be_queued_fails_and_sends_nothing() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "noq", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+    app.queue.set_failing(true);
+
+    let resp = send(
+        &schema,
+        user_auth(&owner, &instance.id, true),
+        &instance.id,
+        &format!("news@{domain}"),
+        &[unique_email("a"), unique_email("b")],
+    )
+    .await;
+    assert!(!resp.errors.is_empty(), "{resp:?}");
+    assert!(app.mail.sent_raw().is_empty());
+
+    let rows = db.list_broadcasts(&instance.id, 10).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].in_progress());
+    assert!(
+        rows[0]
+            .recipients
+            .iter()
+            .all(|r| r.send_status == db::BroadcastSendStatus::Failed)
     );
 }

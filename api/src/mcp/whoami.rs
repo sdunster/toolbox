@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use crate::app::{App, HasDb, HasMail, HasStorage};
+use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 
 use super::tool::{ToolContext, ToolOutcome};
 
@@ -69,7 +69,7 @@ pub async fn dispatch<A>(
     _arguments: &Value,
 ) -> Option<ToolOutcome>
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     if name != "whoami" {
         return None;

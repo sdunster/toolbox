@@ -74,7 +74,7 @@ pub trait Handler: Sync {
         content_type: &str,
     ) -> impl Future<Output = Result<()>> + Send;
 
-    /// Read bytes directly — the inbound Lambda's fetch of the raw MIME SES
+    /// Read bytes directly — the worker Lambda's fetch of the raw MIME SES
     /// already wrote to `inbound/{ses_message_id}`.
     fn get_bytes(&self, key: &str) -> impl Future<Output = Result<Vec<u8>>> + Send;
 

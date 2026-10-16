@@ -3,7 +3,7 @@
 //! This module is pure by construction — no I/O — so the resolution *order* is
 //! exhaustively unit-tested without a database. [`resolve_instance_id`] at the
 //! bottom is the one function that does I/O: it's the "db helper" the caller
-//! (step 7's inbound-mail Lambda, and this step's CLI/seed-fixture tests) uses
+//! (the worker Lambda's inbound-mail path, and this step's CLI/seed-fixture tests) uses
 //! to turn a real DynamoDB read into an answer, wired to the same ordering
 //! logic [`resolve`] encodes.
 //!

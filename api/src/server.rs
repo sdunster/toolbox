@@ -28,11 +28,12 @@ use crate::auth;
 use crate::db;
 use crate::graphql;
 use crate::mail;
+use crate::queue;
 use crate::request_metrics::{self, RequestMetrics};
 use crate::storage;
 use crate::telemetry;
 
-type Schema<H, M, S> = graphql::ToolboxSchema<MyApp<H, M, S>>;
+type Schema<H, M, S, Q> = graphql::ToolboxSchema<MyApp<H, M, S, Q>>;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -96,9 +97,9 @@ pub fn init() -> Result<Startup, Box<dyn Error>> {
 }
 
 #[handler]
-async fn index<H, M, S>(
-    schema: Data<&Schema<H, M, S>>,
-    app: Data<&Arc<MyApp<H, M, S>>>,
+async fn index<H, M, S, Q>(
+    schema: Data<&Schema<H, M, S, Q>>,
+    app: Data<&Arc<MyApp<H, M, S, Q>>>,
     dev_auth: Data<&Arc<Option<auth::DevAuthConfig>>>,
     headers: &HeaderMap,
     body: Vec<u8>,
@@ -107,6 +108,7 @@ where
     H: db::Handler + Send + Sync + 'static,
     M: mail::Handler + Send + Sync + 'static,
     S: storage::Handler + Send + Sync + 'static,
+    Q: queue::Handler + Send + Sync + 'static,
 {
     if app.response_lag() > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(app.response_lag())).await;
@@ -242,8 +244,8 @@ async fn oauth_register(body: Vec<u8>) -> impl IntoResponse {
 }
 
 #[handler]
-async fn oauth_token<H, M, S>(
-    app: Data<&Arc<MyApp<H, M, S>>>,
+async fn oauth_token<H, M, S, Q>(
+    app: Data<&Arc<MyApp<H, M, S, Q>>>,
     headers: &HeaderMap,
     body: Vec<u8>,
 ) -> impl IntoResponse
@@ -251,6 +253,7 @@ where
     H: db::Handler + Send + Sync + 'static,
     M: mail::Handler + Send + Sync + 'static,
     S: storage::Handler + Send + Sync + 'static,
+    Q: queue::Handler + Send + Sync + 'static,
 {
     let request_start = Instant::now();
     let reply = crate::oauth_http::token(
@@ -278,9 +281,9 @@ async fn oauth_protected_resource_metadata(headers: &HeaderMap) -> impl IntoResp
 }
 
 #[handler]
-async fn mcp_post<H, M, S>(
-    app: Data<&Arc<MyApp<H, M, S>>>,
-    schema: Data<&Schema<H, M, S>>,
+async fn mcp_post<H, M, S, Q>(
+    app: Data<&Arc<MyApp<H, M, S, Q>>>,
+    schema: Data<&Schema<H, M, S, Q>>,
     headers: &HeaderMap,
     body: Vec<u8>,
 ) -> impl IntoResponse
@@ -288,6 +291,7 @@ where
     H: db::Handler + Send + Sync + 'static,
     M: mail::Handler + Send + Sync + 'static,
     S: storage::Handler + Send + Sync + 'static,
+    Q: queue::Handler + Send + Sync + 'static,
 {
     let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     let reply = crate::mcp::handle_post(
@@ -307,28 +311,34 @@ async fn mcp_method_not_allowed() -> impl IntoResponse {
     oauth_response(crate::mcp::method_not_allowed())
 }
 
-/// Serve the GraphQL API on :8000 until interrupted.
-pub async fn run<H, M, S>(
+/// Serve the GraphQL API on :8000 until interrupted. `on_start` is handed the
+/// app once it is built, before serving begins — `poem-local` uses it to run
+/// queued worker jobs in-process.
+pub async fn run<H, M, S, Q>(
     startup: Startup,
     db: H,
     mailer: M,
     storage: S,
+    queue: Q,
+    on_start: impl FnOnce(Arc<MyApp<H, M, S, Q>>),
 ) -> Result<(), Box<dyn Error>>
 where
     H: db::Handler + Send + Sync + 'static,
     M: mail::Handler + Send + Sync + 'static,
     S: storage::Handler + Send + Sync + 'static,
+    Q: queue::Handler + Send + Sync + 'static,
 {
     let Startup { cli, dev_auth, .. } = startup;
     let webauthn = Arc::new(app::build_webauthn()?);
-    let app = Arc::new(app::new(db, mailer, storage, cli.response_lag_ms));
+    let app = Arc::new(app::new(db, mailer, storage, queue, cli.response_lag_ms));
+    on_start(app.clone());
     let schema = graphql::build_schema(app.clone(), webauthn);
     std::fs::write("schema.graphql", schema.sdl())?;
     let allow_cross_origin = Cors::new();
     let routes = Route::new()
         .at(
             "/",
-            get(graphiql).post(index::<H, M, S> {
+            get(graphiql).post(index::<H, M, S, Q> {
                 ..Default::default()
             }),
         )
@@ -348,14 +358,14 @@ where
             "/mcp",
             get(mcp_method_not_allowed)
                 .delete(mcp_method_not_allowed)
-                .post(mcp_post::<H, M, S> {
+                .post(mcp_post::<H, M, S, Q> {
                     ..Default::default()
                 }),
         )
         .at("/oauth/register", post(oauth_register))
         .at(
             "/oauth/token",
-            post(oauth_token::<H, M, S> {
+            post(oauth_token::<H, M, S, Q> {
                 ..Default::default()
             }),
         )

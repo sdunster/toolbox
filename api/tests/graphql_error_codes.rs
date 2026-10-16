@@ -23,6 +23,7 @@ use toolbox::graphql::RequestMetricsExt;
 use toolbox::graphql::auth::{AuthGuard, AuthRequirement};
 use toolbox::mockdb;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 
 struct TestQuery;
@@ -48,6 +49,7 @@ fn build_test_schema() -> Schema<TestQuery, EmptyMutation, EmptySubscription> {
         mockdb::Handler::new(),
         mockmail::Handler::new(),
         mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
         0,
     ));
     Schema::build(TestQuery, EmptyMutation, EmptySubscription)
@@ -86,6 +88,7 @@ async fn real_schema_guarded_field_with_no_credentials_is_unauthenticated() {
         mockdb::Handler::new(),
         mockmail::Handler::new(),
         mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
         0,
     ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));

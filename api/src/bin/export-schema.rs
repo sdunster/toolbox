@@ -17,6 +17,7 @@ fn main() {
         mockdb::Handler::new(),
         mockmail::Handler::new(),
         mockstorage::Storage::new(),
+        toolbox::mockqueue::Queue::new(),
         0,
     ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));

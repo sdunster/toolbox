@@ -20,10 +20,12 @@ use toolbox::dynamodb;
 use toolbox::graphql::{self, ClientIp};
 use toolbox::mcp;
 use toolbox::mockmail;
+use toolbox::mockqueue;
 use toolbox::mockstorage;
 use toolbox::oauth;
 
-pub type TestApp = app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage>;
+pub type TestApp =
+    app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage, mockqueue::Queue>;
 pub type TestSchema = graphql::ToolboxSchema<TestApp>;
 
 /// The `Host` the tests present. `api_base_url` derives `https://toolbox.test`
@@ -69,6 +71,7 @@ pub async fn fixture(prefix: &str) -> Fixture {
         dynamodb::Handler::new(prefix, false).await,
         mockmail::Handler::new(),
         mockstorage::Storage::new(),
+        mockqueue::Queue::new(),
         0,
     ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));

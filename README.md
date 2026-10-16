@@ -59,7 +59,7 @@ only — AWS credentials.
 ## Project structure
 
 ```
-api/     Rust crate `toolbox` — GraphQL API lambda, inbound-mail lambda, dev server, CLI
+api/     Rust crate `toolbox` — GraphQL API lambda, worker lambda (inbound mail + background jobs), dev server, CLI
 web/     React 19 + Relay + Vite + Tailwind v4
 infra/   Terraform (prod only) — nothing hardcoded, so a fork can `terraform apply`
 local/   DynamoDB Local + seed + local mail fixtures

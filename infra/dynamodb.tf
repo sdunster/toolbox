@@ -820,7 +820,7 @@ resource "aws_dynamodb_table" "credit_note" {
 
 # ── message_delivery ─────────────────────────────────────────────────────────
 # What SES reported for each recipient of each customer-facing ticket message
-# (api/src/ticket_delivery.rs), written by the inbound-mail lambda from SES
+# (api/src/ticket_delivery.rs), written by the worker lambda from SES
 # events. Keyed `{ses_message_id}#{email}` — the event names SES's message id
 # and (by tag) the ticket, so the write is an upsert by primary key with no
 # lookup. Status only moves forward (conditioned on `delivery_rank`). Plus one
@@ -862,8 +862,9 @@ resource "aws_dynamodb_table" "message_delivery" {
 # ── broadcast ────────────────────────────────────────────────────────────────
 # One announcement email sent from a support instance to a list of addresses —
 # see CLAUDE.md's "Broadcasts" entry. `recipients` is a list of maps updated in
-# place by index: each send's result by the API, each SES delivery event by
-# the inbound-mail lambda (api/src/broadcast_events.rs). Never deleted.
+# place by index — each send's result, and each SES delivery event, by the
+# worker lambda (api/src/broadcast_send.rs, api/src/broadcast_events.rs).
+# `send_seq`/`next_batch_at` track the paced batch chain. Never deleted.
 
 resource "aws_dynamodb_table" "broadcast" {
   name                        = "${var.db_prefix}_broadcast"
@@ -963,7 +964,7 @@ resource "aws_dynamodb_table" "ephemeral_state" {
 
 # ── email_suppression ────────────────────────────────────────────────────────
 # Addresses Toolbox stops mailing after SES reports a hard bounce or a spam
-# complaint (api/src/suppression.rs, written by the inbound-mail Lambda from
+# complaint (api/src/suppression.rs, written by the worker Lambda from
 # the configuration set's feedback events — ses_feedback.tf). Hash key `id` is
 # the lowercased address itself, so a send checks its recipients with one
 # BatchGetItem. Durable: an address stays suppressed until an operator removes

@@ -1,6 +1,9 @@
-resource "aws_lambda_function" "inbound_mail" {
-  function_name = "toolbox-inbound-mail"
-  role          = aws_iam_role.inbound_mail_lambda.arn
+# The worker: inbound mail and background jobs from the worker queue
+# (sqs.tf), and SES events from the feedback topic (ses_feedback.tf). See
+# api/src/bin/worker/main.rs.
+resource "aws_lambda_function" "worker" {
+  function_name = "toolbox-worker"
+  role          = aws_iam_role.worker_lambda.arn
   runtime       = "provided.al2023"
   handler       = "bootstrap"
   timeout       = 60
@@ -23,6 +26,8 @@ resource "aws_lambda_function" "inbound_mail" {
       # "Change your notification settings" links a staff notification
       # email carries. See lambda_api.tf's identical variable.
       APP_BASE_URL = "https://${var.web_domain}"
+      # api/src/sqsqueue.rs: each broadcast batch queues the next one here.
+      WORKER_QUEUE_URL = aws_sqs_queue.worker.url
     }
   }
 
@@ -40,8 +45,8 @@ resource "aws_lambda_function" "inbound_mail" {
 # A second trigger, not configured here: ses_feedback.tf's SNS topic invokes
 # this function directly with bounce/complaint events (aws_lambda_permission
 # + an SNS subscription). The binary tells the two event shapes apart itself.
-resource "aws_lambda_event_source_mapping" "inbound_mail" {
-  event_source_arn = aws_sqs_queue.inbound_mail.arn
-  function_name    = aws_lambda_function.inbound_mail.arn
+resource "aws_lambda_event_source_mapping" "worker" {
+  event_source_arn = aws_sqs_queue.worker.arn
+  function_name    = aws_lambda_function.worker.arn
   batch_size       = 1
 }

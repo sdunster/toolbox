@@ -3,7 +3,7 @@
 //! The `toolbox` configuration set publishes `BOUNCE`, `COMPLAINT`,
 //! `DELIVERY`, `DELIVERY_DELAY`, `REJECT`, `OPEN` and `CLICK` events for
 //! every message sent through it to the `toolbox-mail-feedback` SNS topic
-//! (`infra/ses_feedback.tf`), which invokes the inbound-mail Lambda directly.
+//! (`infra/ses_feedback.tf`), which invokes the worker Lambda directly.
 //! That Lambda's SNS handler parses each message here, once, into a
 //! [`SesEvent`], and hands the same value to every consumer:
 //!

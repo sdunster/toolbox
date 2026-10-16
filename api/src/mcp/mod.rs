@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use serde_json::{Value, json};
 
-use crate::app::{App, HasDb, HasMail, HasStorage};
+use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 use crate::auth::{self, AuthError, AuthInfo};
 use crate::base_url::api_base_url;
 use crate::graphql::{ClientIp, ToolboxSchema};
@@ -161,7 +161,7 @@ fn tool_catalogue() -> Vec<Value> {
 
 async fn dispatch_tool<A>(ctx: &ToolContext<'_, A>, name: &str, arguments: &Value) -> ToolOutcome
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     if let Some(outcome) = whoami::dispatch(ctx, name, arguments).await {
         return outcome;
@@ -193,7 +193,7 @@ pub async fn handle_post<A>(
     body: &[u8],
 ) -> HttpReply
 where
-    A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static,
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     let request_start = Instant::now();
     let api_base = api_base_url(host);

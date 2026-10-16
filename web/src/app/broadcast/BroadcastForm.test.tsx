@@ -78,13 +78,19 @@ describe("BroadcastForm", () => {
               subject: "New in seslogin",
               fromAddress: "news@seslogin.test",
               recipientCount: 2,
-              sentCount: 1,
+              pendingCount: 1,
+              inProgress: true,
+              estimatedFinishAt: 1_800_000_000,
               recipients: [
-                { email: "alice@example.com", sendStatus: "SENT", error: null },
+                {
+                  email: "alice@example.com",
+                  sendStatus: "PENDING",
+                  error: null,
+                },
                 {
                   email: "bob@example.com",
-                  sendStatus: "FAILED",
-                  error: "Address blacklisted",
+                  sendStatus: "SUPPRESSED",
+                  error: "bob@example.com (hard bounce)",
                 },
               ],
             },
@@ -98,6 +104,7 @@ describe("BroadcastForm", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Review" }));
     expect(screen.getByText("Send to 2 recipients?")).toBeTruthy();
+    expect(screen.getByText(/within a minute/)).toBeTruthy();
     expect(
       screen.getByText("seslogin Support <news@seslogin.test>"),
     ).toBeTruthy();
@@ -106,10 +113,13 @@ describe("BroadcastForm", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send now" }));
     await waitFor(() =>
       expect(screen.getByRole("status").textContent).toContain(
-        "to 1 of 2 recipients",
+        "Queued “New in seslogin” for 1 of 2 recipients",
       ),
     );
-    expect(screen.getByText(/Address blacklisted/)).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toContain(
+      "Sending 5 every 5 minutes",
+    );
+    expect(screen.getByText(/hard bounce/)).toBeTruthy();
     expect(onSent).toHaveBeenCalledOnce();
     expect(variables).toEqual({
       instanceId: "inst-1",
@@ -121,6 +131,19 @@ describe("BroadcastForm", () => {
         recipients: ["alice@example.com", "bob@example.com"],
       },
     });
+  });
+
+  it("accepts more than 100 recipients and says how long they'll take", () => {
+    renderForm();
+    fill();
+    const many = Array.from({ length: 117 }, (_, i) => `r${i}@example.com`);
+    fireEvent.change(screen.getByLabelText("Recipients"), {
+      target: { value: many.join("\n") },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(screen.getByText("Send to 117 recipients?")).toBeTruthy();
+    expect(screen.getByText(/5 at a time, every 5 minutes/)).toBeTruthy();
+    expect(screen.getByText(/about 1 h 55 min in all/)).toBeTruthy();
   });
 
   it("won't review with an invalid recipient", () => {
@@ -171,7 +194,9 @@ describe("BroadcastForm", () => {
               subject: "New in seslogin",
               fromAddress: "updates@seslogin.test",
               recipientCount: 2,
-              sentCount: 2,
+              pendingCount: 2,
+              inProgress: true,
+              estimatedFinishAt: 1_800_000_000,
               recipients: [],
             },
           },

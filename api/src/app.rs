@@ -11,16 +11,16 @@
 //! easily be turned on in a real build); a second binary can't be turned on by
 //! accident.
 //!
-//! **Deliberate simplification vs seslogin: there is no queue abstraction.**
-//! seslogin has `HasQueues`/`queue.rs`/`sqs.rs`/`mockqueue.rs` because its API
-//! *produces* to SQS (member sync, NITC export, healthcheck pings). Toolbox's
-//! API never produces to SQS — the only queue in this system carries inbound mail,
-//! and that queue is *consumed* by the inbound-mail Lambda (step 7), which is a
-//! separate binary with no GraphQL surface. So there is nothing here to abstract;
-//! this decision is also recorded in `CLAUDE.md`.
+//! **The queue** (`HasQueue`, [`crate::queue`]) carries background jobs for
+//! the worker Lambda — today, the paced batches of a broadcast. Both the API
+//! (`sendBroadcast` queues a broadcast's first batch) and the worker (each
+//! batch queues the next) produce to it; the worker consumes it, alongside the
+//! inbound mail that arrives on the same SQS queue. See CLAUDE.md's "Worker
+//! jobs" entry.
 
 use crate::db;
 use crate::mail;
+use crate::queue;
 use crate::storage;
 use webauthn_rs::prelude::{Webauthn, WebauthnBuilder};
 
@@ -78,49 +78,73 @@ pub trait HasStorage {
     fn storage(&self) -> &impl storage::Handler;
 }
 
+/// The worker job queue — see [`crate::queue`].
+pub trait HasQueue {
+    fn queue(&self) -> &impl queue::Handler;
+}
+
 /// Struct holding our global singletons. See the module doc for why every backend
-/// is a type parameter and there is no queue field.
-pub struct MyApp<DBH: db::Handler, M: mail::Handler, S: storage::Handler> {
+/// is a type parameter.
+pub struct MyApp<DBH: db::Handler, M: mail::Handler, S: storage::Handler, Q: queue::Handler> {
     pub db: DBH,
     pub mail: M,
     pub storage: S,
+    pub queue: Q,
     pub response_lag: u64,
 }
 
-pub fn new<DBH: db::Handler, M: mail::Handler, S: storage::Handler>(
+pub fn new<DBH: db::Handler, M: mail::Handler, S: storage::Handler, Q: queue::Handler>(
     db: DBH,
     mail: M,
     storage: S,
+    queue: Q,
     response_lag: u64,
-) -> MyApp<DBH, M, S> {
+) -> MyApp<DBH, M, S, Q> {
     MyApp {
         db,
         mail,
         storage,
+        queue,
         response_lag,
     }
 }
 
-impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler> App for MyApp<DBH, M, S> {
+impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler, Q: queue::Handler> App
+    for MyApp<DBH, M, S, Q>
+{
     fn response_lag(&self) -> u64 {
         self.response_lag
     }
 }
 
-impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler> HasDb for MyApp<DBH, M, S> {
+impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler, Q: queue::Handler> HasDb
+    for MyApp<DBH, M, S, Q>
+{
     fn db(&self) -> &impl db::Handler {
         &self.db
     }
 }
 
-impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler> HasMail for MyApp<DBH, M, S> {
+impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler, Q: queue::Handler> HasMail
+    for MyApp<DBH, M, S, Q>
+{
     fn mail(&self) -> &impl mail::Handler {
         &self.mail
     }
 }
 
-impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler> HasStorage for MyApp<DBH, M, S> {
+impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler, Q: queue::Handler> HasStorage
+    for MyApp<DBH, M, S, Q>
+{
     fn storage(&self) -> &impl storage::Handler {
         &self.storage
+    }
+}
+
+impl<DBH: db::Handler, M: mail::Handler, S: storage::Handler, Q: queue::Handler> HasQueue
+    for MyApp<DBH, M, S, Q>
+{
+    fn queue(&self) -> &impl queue::Handler {
+        &self.queue
     }
 }

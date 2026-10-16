@@ -26,12 +26,19 @@ local setup, and `SCHEMA.md` for the data model.
 - **Mutations require `--enable-mutations` on the dev server.** `cargo run --bin poem` (or
   `poem-local`) starts read-only by default; pass `--enable-mutations` to allow writes. This is a
   deliberate guard against accidentally mutating whatever `DB_PREFIX` you're pointed at.
-- **No queue abstraction in `api/src/app.rs`.** seslogin has `HasQueues`/`queue.rs`/`sqs.rs`/
-  `mockqueue.rs` because its API *produces* to SQS (member sync, NITC export, healthchecks).
-  Toolbox's API never produces to SQS — the only queue in this system carries inbound mail,
-  and that queue is *consumed* by the inbound-mail Lambda (step 7), a separate binary with no
-  GraphQL surface. Don't add a queue trait to `app.rs`/`MyApp` unless the API itself starts
-  producing to a queue.
+- **Worker jobs: one queue, one worker (`api/src/queue.rs`, `bin/worker`).** The worker Lambda
+  (`toolbox-worker`, formerly the inbound-mail Lambda) does everything in the background. It
+  consumes one SQS queue (`toolbox-worker`) carrying two kinds of message: inbound mail (SNS
+  envelopes from SES's receipt rule) and **jobs** (`queue::Job`, JSON tagged by a `job` field, which
+  `Job::parse` tells apart from an envelope). It is also invoked directly by the SES events topic.
+  The API *produces* jobs (`sendBroadcast`), and so do jobs themselves (a broadcast batch queues the
+  next), through `app::HasQueue` — a fourth `MyApp` type parameter: `sqsqueue::Queue`
+  (`WORKER_QUEUE_URL`) in the Lambdas and `bin/poem`, `mockqueue::Queue` in tests, the CLI and
+  `bin/poem-local` (which drains it every few seconds and runs each job in-process, ignoring
+  delays). `worker::run_job` is the single entry point both use. A new job is a new `Job` variant
+  plus one arm in `run_job`; SQS delivers at least once, so every job must be safe to run twice.
+  Don't add a second queue or a scheduled "tick" for background work — a delayed job (≤ 15
+  minutes, `queue::MAX_DELAY_SECS`) that re-queues itself covers pacing at no idle cost.
 - **Outbound mail: which ticket updates email.** The build plan says "every ticket update that is
   not an internal note mails requesters + CCs" — read literally that would include assignment and
   requester/CC-list edits, which would mean a customer gets an email every time a ticket changes
@@ -110,15 +117,15 @@ local setup, and `SCHEMA.md` for the data model.
 
   Needs `APP_BASE_URL` (the web app's origin, for the "View ticket"/"Change your notification
   settings" links a notice carries) set in every environment that sends this mail — `api/src/staff_notify.rs`
-  defaults to `http://localhost:5173` otherwise. The inbound-mail Lambda also needs `MAIL_FROM` now
+  defaults to `http://localhost:5173` otherwise. The worker Lambda also needs `MAIL_FROM` now
   that it sends mail of its own (previously it only consumed the inbound queue) — without it, a
   staff notification sent from that Lambda falls back to `mail::FROM_FALLBACK`'s reserved `.test`
   domain and is refused by the provider.
 
 - **Bounces and complaints suppress an address (`api/src/suppression.rs`, issue #6).** The SES
   configuration set publishes `BOUNCE`/`COMPLAINT` events to the `toolbox-mail-feedback` SNS topic
-  (`infra/ses_feedback.tf`), which invokes the **inbound-mail Lambda directly** — the same function
-  that consumes the inbound SQS queue; `bin/inbound-mail` tells an SNS event from an SQS one by the
+  (`infra/ses_feedback.tf`), which invokes the **worker Lambda directly** — the same function
+  that consumes the worker SQS queue; `bin/worker` tells an SNS event from an SQS one by the
   records' event source. A permanent bounce or a complaint (not a transient bounce, not a `not-spam`
   complaint) upserts the lowercased address into `{prefix}_email_suppression` — first reason wins,
   replays are harmless. Every **instance-mail** send then checks its recipients first and leaves a
@@ -139,9 +146,9 @@ local setup, and `SCHEMA.md` for the data model.
   delete-suppressed-destination` command for SES's own list).
 
 - **Broadcasts (`sendBroadcast`, `api/src/broadcast.rs`): one announcement to a list, every reply
-  a new ticket.** An owner of a support instance emails up to 100 addresses
-  (`broadcast::MAX_BROADCAST_RECIPIENTS`, sent inline in the API Lambda, 5 at a time) from any local
-  part on one of the instance's inbound-address domains. Guard `InstanceOwner` — **not**
+  a new ticket.** An owner of a support instance emails up to 500 addresses
+  (`broadcast::MAX_BROADCAST_RECIPIENTS` — bounded by the 400 KB `broadcast` item that holds every
+  recipient's status) from any local part on one of the instance's inbound-address domains. Guard `InstanceOwner` — **not**
   superuser: it is customer mail whose replies become tickets, the ticket side of the superuser
   boundary. An invoicing/deleted/missing instance is `NOT_FOUND` (kind isolation).
   - **Each recipient gets their own copy** (`To:` that address only, no `Cc`), so a reply-all can't
@@ -157,17 +164,39 @@ local setup, and `SCHEMA.md` for the data model.
   - **Auto-responders are asked not to answer** (`Auto-Submitted: auto-generated`,
     `X-Auto-Response-Suppress: OOF, AutoReply`, `Precedence: bulk`); an auto-reply that answers
     anyway is dropped by `mailloop` when it's marked as one.
+  - **`sendBroadcast` queues; the worker sends, slowly, on purpose (`api/src/broadcast_send.rs`).**
+    The mutation validates, writes the row with every recipient `pending` and `next_batch_at` set,
+    and queues `Job::BroadcastBatch { seq: 0 }`. Each batch sends the next `broadcast::BATCH_SIZE`
+    (5) pending recipients, one at a time, then queues `seq + 1` with an SQS delay of
+    `BATCH_INTERVAL_SECS` (5 minutes) — 100 recipients take ~1h40m. Slow is the point: a steady
+    trickle protects the sending domain's reputation. The web mirrors both constants only to preview
+    the duration; `Broadcast.estimatedFinishAt` is the API's own answer.
+    - **At most once per recipient**, though SQS is at-least-once: each recipient is *claimed*
+      (`pending` → `sending`, conditionally — `claim_broadcast_recipient`) before its copy is built
+      and sent, so a duplicate or retried batch skips it. A crash between claim and result leaves it
+      `sending` for good and it is **never retried** (the mail may be out); the UI calls that
+      "Unknown (send interrupted)" once the broadcast has finished.
+    - **One chain:** a batch queues its successor *before* recording `send_seq = seq + 1`
+      (`set_broadcast_progress`, conditioned `send_seq <= seq`), so any failure leaves the job to be
+      retried from where it was; a job with `seq < send_seq` is a late duplicate and is dropped.
+      (A concurrent duplicate can still fork the chain — worst case double pace, never a double
+      send.) If a batch exhausts its SQS retries it lands in the worker DLQ (alarmed), the chain
+      stops, and the broadcast stays `inProgress` until the job is redriven.
+      `next_batch_at` is present exactly while more batches are queued — `Broadcast.inProgress`.
+    - A deleted (or no longer support) instance fails every remaining recipient and ends the
+      chain; a failure to queue the first batch fails them all and the mutation, with nothing sent.
   - **Suppressed addresses are skipped, not mailed.** `sendBroadcast` checks every recipient
     against `email_suppression` (`suppression::find_suppressed`, failing open like every other
     instance-mail send) and records a suppressed one as `send_status = suppressed` with the reason,
-    never sending it. A broadcast's own hard bounce or complaint lands in that list the usual way.
+    never sending it — and each batch checks its recipients again at send time, since it may run
+    hours later. A broadcast's own hard bounce or complaint lands in that list the usual way.
   - **Delivery tracking is one consumer of the shared SES event stream** (see "SES events" below).
     Each broadcast send carries SES message tags `broadcast_id` and `broadcast_recipient` (its
     index), echoed on every event, so `broadcast_events` updates `recipients[i]` by primary key —
-    no GSI, same reasoning as the reply tag. Send-time status (`send_status`, by the API) and delivery status (`delivery_status`, by
-    the Lambda) are separate keys; delivery status only moves forward
-    (`BroadcastDeliveryStatus::rank`). A row is written `pending` before anything is sent and each
-    recipient's result as soon as its send returns, so a timeout mid-send leaves an accurate record.
+    no GSI, same reasoning as the reply tag. Send-time status (`send_status`, by the batch) and
+    delivery status (`delivery_status`, by the SES events consumer) are separate keys; delivery
+    status only moves forward (`BroadcastDeliveryStatus::rank`). Each recipient's result is
+    recorded as soon as its send returns, so a timeout mid-batch leaves an accurate record.
   - **Saved senders (`addBroadcastSender`/`deleteBroadcastSender`, `Instance.broadcastSenders`)**
     are a pick-list of From name + address pairs (`SES Activity Updates <updates@…>`) stored as
     a JSON attribute on the instance row, same `InstanceOwner` guard and `NOT_FOUND`-for-invoicing
@@ -178,7 +207,7 @@ local setup, and `SCHEMA.md` for the data model.
 
 - **SES events: parsed once, many consumers (`api/src/ses_events.rs`).** The `toolbox-mail-feedback`
   event destination (`infra/ses_feedback.tf`) publishes `BOUNCE`, `COMPLAINT`, `DELIVERY`,
-  `DELIVERY_DELAY`, `REJECT`, `OPEN` and `CLICK` for every send. `bin/inbound-mail`'s SNS handler parses each
+  `DELIVERY_DELAY`, `REJECT`, `OPEN` and `CLICK` for every send. `bin/worker`'s SNS handler parses each
   message once into a `SesEvent` (typed per-type blocks, the message's tags, and
   `recipient_outcomes()` — one `DeliveryStatus` plus reason per affected recipient) and hands the
   same value to every consumer, each of which acts only on what concerns it:
