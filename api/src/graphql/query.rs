@@ -521,6 +521,41 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
             .await?;
         Ok(crate::broadcast::instance_mail_domains(&addresses))
     }
+
+    /// Saved From name + address pairs to pick from when drafting a
+    /// broadcast, in the order they were added (`addBroadcastSender`).
+    /// Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+    /// instance.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(self.rec.id.clone()))")]
+    async fn broadcast_senders(&self) -> Vec<BroadcastSender> {
+        if self.rec.kind != db::InstanceKind::Support {
+            return Vec::new();
+        }
+        self.rec
+            .broadcast_senders
+            .iter()
+            .cloned()
+            .map(BroadcastSender::from)
+            .collect()
+    }
+}
+
+/// A saved broadcast sender — see `db::BroadcastSender`.
+#[derive(SimpleObject, Clone, Debug, PartialEq, Eq)]
+pub struct BroadcastSender {
+    pub id: ID,
+    pub name: String,
+    pub address: String,
+}
+
+impl From<db::BroadcastSender> for BroadcastSender {
+    fn from(s: db::BroadcastSender) -> Self {
+        Self {
+            id: ID(s.id),
+            name: s.name,
+            address: s.address,
+        }
+    }
 }
 
 /// One member of an instance: the user, and their role in this instance

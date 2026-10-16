@@ -407,6 +407,7 @@ mod tests {
             gst_registered: false,
             currency: None,
             payment_terms_days: None,
+            broadcast_senders: Vec::new(),
         }
     }
 

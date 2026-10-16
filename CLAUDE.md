@@ -168,6 +168,12 @@ local setup, and `SCHEMA.md` for the data model.
     the Lambda) are separate keys; delivery status only moves forward
     (`BroadcastDeliveryStatus::rank`). A row is written `pending` before anything is sent and each
     recipient's result as soon as its send returns, so a timeout mid-send leaves an accurate record.
+  - **Saved senders (`addBroadcastSender`/`deleteBroadcastSender`, `Instance.broadcastSenders`)**
+    are a pick-list of From name + address pairs (`SES Activity Updates <updates@…>`) stored as
+    a JSON attribute on the instance row, same `InstanceOwner` guard and `NOT_FOUND`-for-invoicing
+    posture as `sendBroadcast`. A convenience only: the web form fills `fromAddress`/`fromName`
+    from the chosen sender, and `sendBroadcast` re-validates them as it always has — a sender is
+    checked on save by the same `broadcast::validate_from_address`, but never trusted at send time.
   - Not an MCP tool. If one is ever added, its description must say it sends customer email.
 
 - **SES events: parsed once, many consumers (`api/src/ses_events.rs`).** The `toolbox-mail-feedback`

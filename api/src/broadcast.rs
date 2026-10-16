@@ -40,6 +40,10 @@ pub const MAX_BROADCAST_RECIPIENTS: usize = 100;
 /// per-second sending rate.
 pub const SEND_CONCURRENCY: usize = 5;
 
+/// Most saved senders one instance may have — a short pick-list, stored as
+/// one JSON attribute on the instance row.
+pub const MAX_BROADCAST_SENDERS: usize = 20;
+
 const MAX_SUBJECT_CHARS: usize = 200;
 const MAX_BODY_CHARS: usize = 50_000;
 const MAX_FROM_NAME_CHARS: usize = 100;
@@ -120,29 +124,7 @@ pub fn validate(
     instance: &db::Instance,
     addresses: &[db::InboundAddress],
 ) -> Result<ValidBroadcast> {
-    // From: a plain address on one of the instance's own domains.
-    let from_address = crate::graphql::mutations::normalize_ticket_email(input.from_address)?;
-    let (local, domain) = from_address
-        .split_once('@')
-        .expect("normalize_ticket_email guarantees an '@'");
-    if local.contains('+') {
-        // A `+tag` could be shaped like a ticket reply tag, threading every
-        // reply onto that ticket instead of opening new ones.
-        bail!("the From address cannot contain '+'");
-    }
-    if local == "*" || !local.chars().all(is_plain_local_char) {
-        bail!("{from_address:?} is not a valid From address");
-    }
-    let domains = instance_mail_domains(addresses);
-    if !domains.iter().any(|d| d == domain) {
-        if domains.is_empty() {
-            bail!("this instance has no inbound address, so it has no domain to send from");
-        }
-        bail!(
-            "the From address must be on this instance's domain ({})",
-            domains.join(", ")
-        );
-    }
+    let from_address = validate_from_address(input.from_address, addresses)?;
     let reply_to = reply_to_address(addresses, &from_address)
         .ok_or_else(|| anyhow!("this instance has no inbound address for replies to go to"))?;
 
@@ -180,6 +162,65 @@ pub fn validate(
         body,
         recipients,
     })
+}
+
+/// Normalize a From address and check it's one a broadcast may be sent
+/// from: a plain local part (no `+`, no wildcard) on one of the instance's
+/// own inbound-address domains. Shared by [`validate`] and
+/// [`validate_sender`], so a saved sender can never hold an address
+/// `sendBroadcast` would refuse at the time it was saved.
+pub fn validate_from_address(raw: &str, addresses: &[db::InboundAddress]) -> Result<String> {
+    let from_address = crate::graphql::mutations::normalize_ticket_email(raw)?;
+    let (local, domain) = from_address
+        .split_once('@')
+        .expect("normalize_ticket_email guarantees an '@'");
+    if local.contains('+') {
+        // A `+tag` could be shaped like a ticket reply tag, threading every
+        // reply onto that ticket instead of opening new ones.
+        bail!("the From address cannot contain '+'");
+    }
+    if local == "*" || !local.chars().all(is_plain_local_char) {
+        bail!("{from_address:?} is not a valid From address");
+    }
+    let domains = instance_mail_domains(addresses);
+    if !domains.iter().any(|d| d == domain) {
+        if domains.is_empty() {
+            bail!("this instance has no inbound address, so it has no domain to send from");
+        }
+        bail!(
+            "the From address must be on this instance's domain ({})",
+            domains.join(", ")
+        );
+    }
+    Ok(from_address)
+}
+
+/// Validate a new saved sender (`addBroadcastSender`) against the
+/// instance's inbound addresses and the senders it already has, returning
+/// the normalized `(name, address)`. The name is required here — a sender
+/// is a name and an address — and an identical pair can't be saved twice.
+pub fn validate_sender(
+    name: &str,
+    address: &str,
+    addresses: &[db::InboundAddress],
+    existing: &[db::BroadcastSender],
+) -> Result<(String, String)> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        bail!("sender name cannot be empty");
+    }
+    check_single_line("sender name", &name, MAX_FROM_NAME_CHARS)?;
+    let address = validate_from_address(address, addresses)?;
+    if existing
+        .iter()
+        .any(|s| s.name == name && s.address == address)
+    {
+        bail!("{name} <{address}> is already a saved sender");
+    }
+    if existing.len() >= MAX_BROADCAST_SENDERS {
+        bail!("at most {MAX_BROADCAST_SENDERS} saved senders per instance");
+    }
+    Ok((name, address))
 }
 
 /// Normalize, dedupe (first-seen order), and cap the recipient list, and
@@ -319,6 +360,7 @@ mod tests {
             gst_registered: false,
             currency: None,
             payment_terms_days: None,
+            broadcast_senders: Vec::new(),
         }
     }
 
@@ -422,6 +464,69 @@ mod tests {
         i.from_name = Some("  The seslogin team ");
         let v = validate(i, &instance(), &exact_only()).unwrap();
         assert_eq!(v.from_name, "The seslogin team");
+    }
+
+    // ── saved senders ────────────────────────────────────────────────────
+
+    fn sender(name: &str, address: &str) -> db::BroadcastSender {
+        db::BroadcastSender {
+            id: "s1".to_string(),
+            name: name.to_string(),
+            address: address.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_sender_is_normalized_and_must_be_on_the_instance_domain() {
+        assert_eq!(
+            validate_sender(
+                "  SES Activity Updates ",
+                "Updates@SESLOGIN.test",
+                &exact_only(),
+                &[]
+            )
+            .unwrap(),
+            (
+                "SES Activity Updates".to_string(),
+                "updates@seslogin.test".to_string()
+            )
+        );
+        assert!(validate_sender("News", "news@example.org", &exact_only(), &[]).is_err());
+        assert!(validate_sender("News", "news+t1.x@seslogin.test", &exact_only(), &[]).is_err());
+        assert!(validate_sender("News", "*@seslogin.test", &exact_only(), &[]).is_err());
+    }
+
+    #[test]
+    fn a_sender_needs_a_single_line_name() {
+        assert!(validate_sender("  ", "news@seslogin.test", &exact_only(), &[]).is_err());
+        assert!(validate_sender("A\r\nBcc: x", "news@seslogin.test", &exact_only(), &[]).is_err());
+    }
+
+    #[test]
+    fn an_identical_sender_is_refused_but_another_name_on_the_same_address_is_not() {
+        let existing = vec![sender("Updates", "updates@seslogin.test")];
+        assert!(
+            validate_sender("Updates", "UPDATES@seslogin.test", &exact_only(), &existing).is_err()
+        );
+        assert!(
+            validate_sender(
+                "Product news",
+                "updates@seslogin.test",
+                &exact_only(),
+                &existing
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn saved_senders_are_capped() {
+        let existing: Vec<_> = (0..MAX_BROADCAST_SENDERS)
+            .map(|i| sender(&format!("S{i}"), "news@seslogin.test"))
+            .collect();
+        assert!(
+            validate_sender("One more", "news@seslogin.test", &exact_only(), &existing).is_err()
+        );
     }
 
     // ── subject / body ───────────────────────────────────────────────────

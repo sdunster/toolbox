@@ -51,3 +51,15 @@ export function recipientStatus(
       return { label: "Not sent", tone: "warn" };
   }
 }
+
+/** A saved broadcast sender (`Instance.broadcastSenders`). */
+export type BroadcastSender = {
+  readonly id: string;
+  readonly name: string;
+  readonly address: string;
+};
+
+/** `Name <address>`, as a mail client shows a From line. */
+export function formatSender(sender: { name: string; address: string }) {
+  return `${sender.name} <${sender.address}>`;
+}

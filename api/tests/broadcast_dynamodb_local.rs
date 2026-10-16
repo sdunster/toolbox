@@ -409,6 +409,174 @@ async fn a_from_address_off_the_instance_domain_is_refused_before_sending() {
     assert!(app.mail.sent_raw().is_empty());
 }
 
+const ADD_SENDER: &str = r#"
+    mutation($instanceId: ID!, $name: String!, $address: String!) {
+        addBroadcastSender(instanceId: $instanceId, name: $name, address: $address) {
+            broadcastSenders { id name address }
+        }
+    }
+"#;
+
+const DELETE_SENDER: &str = r#"
+    mutation($instanceId: ID!, $senderId: ID!) {
+        deleteBroadcastSender(instanceId: $instanceId, senderId: $senderId) {
+            broadcastSenders { id name address }
+        }
+    }
+"#;
+
+async fn add_sender(
+    schema: &TestSchema,
+    auth: AuthInfo,
+    instance_id: &str,
+    name: &str,
+    address: &str,
+) -> Response {
+    schema
+        .execute(
+            Request::new(ADD_SENDER)
+                .variables(Variables::from_json(json!({
+                    "instanceId": instance_id,
+                    "name": name,
+                    "address": address,
+                })))
+                .data(auth),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn saved_senders_are_added_listed_and_deleted_by_an_owner_only() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "snd", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+    let owner_auth = || user_auth(&owner, &instance.id, true);
+
+    let resp = add_sender(
+        &schema,
+        owner_auth(),
+        &instance.id,
+        " SES Activity Updates ",
+        &format!("Updates@{domain}"),
+    )
+    .await;
+    let list = expect_data(&resp, "addBroadcastSender.broadcastSenders");
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["name"], "SES Activity Updates");
+    assert_eq!(list[0]["address"], format!("updates@{domain}"));
+    let first_id = list[0]["id"].as_str().unwrap().to_string();
+
+    let resp = add_sender(
+        &schema,
+        owner_auth(),
+        &instance.id,
+        "Product news",
+        &format!("news@{domain}"),
+    )
+    .await;
+    let list = expect_data(&resp, "addBroadcastSender.broadcastSenders");
+    assert_eq!(list.as_array().unwrap().len(), 2, "appended in order");
+    assert_eq!(list[1]["name"], "Product news");
+
+    // Off-domain and duplicate senders are refused; nothing is stored.
+    let resp = add_sender(&schema, owner_auth(), &instance.id, "X", "x@example.org").await;
+    assert!(!resp.errors.is_empty());
+    let resp = add_sender(
+        &schema,
+        owner_auth(),
+        &instance.id,
+        "Product news",
+        &format!("news@{domain}"),
+    )
+    .await;
+    assert!(!resp.errors.is_empty());
+
+    // An agent can neither read nor change them.
+    let agent = db
+        .create_user(&unique_email("agent"), "Agent")
+        .await
+        .unwrap();
+    let resp = add_sender(
+        &schema,
+        user_auth(&agent.id, &instance.id, false),
+        &instance.id,
+        "Agent",
+        &format!("agent@{domain}"),
+    )
+    .await;
+    assert_eq!(expect_error_code(&resp), "UNAUTHENTICATED");
+
+    let resp = schema
+        .execute(
+            Request::new(DELETE_SENDER)
+                .variables(Variables::from_json(json!({
+                    "instanceId": instance.id,
+                    "senderId": first_id,
+                })))
+                .data(owner_auth()),
+        )
+        .await;
+    let list = expect_data(&resp, "deleteBroadcastSender.broadcastSenders");
+    assert_eq!(list.as_array().unwrap().len(), 1);
+    assert_eq!(list[0]["name"], "Product news");
+
+    // Deleting it again is NOT_FOUND.
+    let resp = schema
+        .execute(
+            Request::new(DELETE_SENDER)
+                .variables(Variables::from_json(json!({
+                    "instanceId": instance.id,
+                    "senderId": first_id,
+                })))
+                .data(owner_auth()),
+        )
+        .await;
+    assert_eq!(expect_error_code(&resp), "NOT_FOUND");
+
+    // The stored list survives a fresh read.
+    let stored = db
+        .get_instances(&[instance.id.as_str()])
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    assert_eq!(stored.broadcast_senders.len(), 1);
+    assert_eq!(
+        stored.broadcast_senders[0].address,
+        format!("news@{domain}")
+    );
+
+    // A write based on a stale read is refused, not merged.
+    assert!(
+        !db.set_broadcast_senders(&instance.id, &[], &[])
+            .await
+            .unwrap(),
+        "the list changed since this (empty) read"
+    );
+    assert!(
+        app.mail.sent_raw().is_empty(),
+        "saving a sender sends nothing"
+    );
+}
+
+#[tokio::test]
+async fn saved_senders_are_not_found_on_an_invoicing_instance() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (invoicing, owner, _) = setup_instance(&db, "sndi", db::InstanceKind::Invoicing).await;
+    let (_app, schema) = build_app_and_schema(db.clone());
+    let resp = add_sender(
+        &schema,
+        user_auth(&owner, &invoicing.id, true),
+        &invoicing.id,
+        "News",
+        "news@example.org",
+    )
+    .await;
+    assert_eq!(expect_error_code(&resp), "NOT_FOUND");
+}
+
 fn ses_event(
     event_type: &str,
     broadcast_id: &str,

@@ -22,7 +22,16 @@ beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
 afterAll(() => server.close());
 
-function renderForm(onSent = vi.fn(), domains = ["seslogin.test"]) {
+const SENDERS = [
+  { id: "s-1", name: "SES Activity Updates", address: "updates@seslogin.test" },
+  { id: "s-2", name: "Product news", address: "news@seslogin.test" },
+];
+
+function renderForm(
+  onSent = vi.fn(),
+  domains = ["seslogin.test"],
+  senders: typeof SENDERS = [],
+) {
   render(
     <RelayEnvironmentProvider
       environment={createUnauthenticatedGraphQLEnvironment()}
@@ -31,6 +40,7 @@ function renderForm(onSent = vi.fn(), domains = ["seslogin.test"]) {
         instanceId="inst-1"
         defaultFromName="seslogin Support"
         domains={domains}
+        senders={senders}
         onSent={onSent}
       />
     </RelayEnvironmentProvider>,
@@ -38,13 +48,15 @@ function renderForm(onSent = vi.fn(), domains = ["seslogin.test"]) {
   return onSent;
 }
 
-function fill() {
+function fill({ from = true } = {}) {
   fireEvent.change(screen.getByLabelText("Recipients"), {
     target: { value: "Alice@example.com\nbob@example.com, alice@example.com" },
   });
-  fireEvent.change(screen.getByLabelText("From address"), {
-    target: { value: "news" },
-  });
+  if (from) {
+    fireEvent.change(screen.getByLabelText("From address"), {
+      target: { value: "news" },
+    });
+  }
   fireEvent.change(screen.getByLabelText("Subject"), {
     target: { value: "New in seslogin" },
   });
@@ -145,6 +157,52 @@ describe("BroadcastForm", () => {
     fireEvent.click(screen.getByRole("button", { name: "Send now" }));
     await waitFor(() => expect(screen.getByRole("alert")).toBeTruthy());
     expect(screen.getByLabelText("Subject")).toBeTruthy();
+  });
+
+  it("sends as the first saved sender by default", async () => {
+    let variables: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.mutation("BroadcastFormMutation", ({ variables: v }) => {
+        variables = v;
+        return HttpResponse.json({
+          data: {
+            sendBroadcast: {
+              id: "b-1",
+              subject: "New in seslogin",
+              fromAddress: "updates@seslogin.test",
+              recipientCount: 2,
+              sentCount: 2,
+              recipients: [],
+            },
+          },
+        });
+      }),
+    );
+    renderForm(vi.fn(), ["seslogin.test"], SENDERS);
+    expect(screen.queryByLabelText("From address")).toBeNull();
+    fill({ from: false });
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(
+      screen.getByText("SES Activity Updates <updates@seslogin.test>"),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Send now" }));
+    await waitFor(() => expect(variables).toBeDefined());
+    expect(variables?.input).toMatchObject({
+      fromAddress: "updates@seslogin.test",
+      fromName: "SES Activity Updates",
+    });
+  });
+
+  it("can switch from a saved sender to typing an address", () => {
+    renderForm(vi.fn(), ["seslogin.test"], SENDERS);
+    fireEvent.change(screen.getByLabelText("Send as"), {
+      target: { value: "" },
+    });
+    fill();
+    fireEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(
+      screen.getByText("seslogin Support <news@seslogin.test>"),
+    ).toBeTruthy();
   });
 
   it("explains when the instance has no domain to send from", () => {

@@ -1118,6 +1118,41 @@ struct SubmittedTicket {
     subject_tag: String,
 }
 
+/// The support instance a broadcast mutation names — `NOT_FOUND` for an
+/// invoicing, deleted or missing one alike, per the kind-isolation rule.
+async fn broadcast_instance<A: App + HasDb>(app: &A, instance_id: &ID) -> Result<db::Instance> {
+    Ok(app
+        .db()
+        .get_instances(&[instance_id.as_str()])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .filter(|i| !i.deleted && i.kind == db::InstanceKind::Support)
+        .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?)
+}
+
+/// Write `senders` over the list `instance` was read with — `CONFLICT` if
+/// it changed in between — and return the instance as it now stands.
+async fn save_broadcast_senders<A: App + HasDb + Send + Sync>(
+    app: &A,
+    mut instance: db::Instance,
+    senders: Vec<db::BroadcastSender>,
+) -> Result<Instance<A>> {
+    if !app
+        .db()
+        .set_broadcast_senders(&instance.id, &instance.broadcast_senders, &senders)
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "Saved senders changed while you were editing them — reload and try again",
+        )
+        .into());
+    }
+    instance.broadcast_senders = senders;
+    Ok(Instance::new(instance))
+}
+
 #[Object]
 impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot<A> {
     /// Approve an OAuth authorization request: the user has seen the consent
@@ -1685,16 +1720,7 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
         use futures_util::StreamExt as _;
 
         let user_id = require_user_id(ctx)?;
-        let instance = self
-            .app
-            .db()
-            .get_instances(&[instance_id.as_str()])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .filter(|i| !i.deleted && i.kind == db::InstanceKind::Support)
-            .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
         let addresses = self
             .app
             .db()
@@ -1815,6 +1841,61 @@ impl<A: App + HasDb + HasMail + HasStorage + Send + Sync + 'static> MutationRoot
             "broadcast sent"
         );
         Ok(Broadcast::new(rec))
+    }
+
+    /// Save a From name + address to pick from when drafting a broadcast
+    /// (`Instance.broadcastSenders`), e.g. `SES Activity Updates
+    /// <updates@seslogin.com>`. Sends nothing. The address must pass the
+    /// same check `sendBroadcast` applies to a From address
+    /// (`broadcast::validate_sender`); `sendBroadcast` still re-checks it at
+    /// send time, so a sender whose domain is later removed is refused then
+    /// rather than trusted. Returns the instance, so a client's cached
+    /// `broadcastSenders` updates in place.
+    ///
+    /// Owner-only — not superuser — like `sendBroadcast`, the only thing a
+    /// sender is for. An invoicing, deleted or missing instance is
+    /// `NOT_FOUND`; a concurrent change to the list is `CONFLICT`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn add_broadcast_sender(
+        &self,
+        instance_id: ID,
+        name: String,
+        address: String,
+    ) -> Result<Instance<A>> {
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
+        let addresses = self
+            .app
+            .db()
+            .list_inbound_addresses_by_instance(&instance.id)
+            .await?;
+        let (name, address) =
+            broadcast::validate_sender(&name, &address, &addresses, &instance.broadcast_senders)?;
+        let mut senders = instance.broadcast_senders.clone();
+        senders.push(db::BroadcastSender {
+            id: crate::dynamodb::new_id(),
+            name,
+            address,
+        });
+        save_broadcast_senders(&*self.app, instance, senders).await
+    }
+
+    /// Remove a saved broadcast sender. Same guard and `NOT_FOUND`/`CONFLICT`
+    /// posture as `addBroadcastSender`; an unknown `senderId` is `NOT_FOUND`.
+    /// Past broadcasts are unaffected — each one stores the From it was
+    /// actually sent with.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn delete_broadcast_sender(&self, instance_id: ID, sender_id: ID) -> Result<Instance<A>> {
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
+        let senders: Vec<db::BroadcastSender> = instance
+            .broadcast_senders
+            .iter()
+            .filter(|s| s.id != sender_id.as_str())
+            .cloned()
+            .collect();
+        if senders.len() == instance.broadcast_senders.len() {
+            return Err(ApiError::not_found("Broadcast sender", sender_id.as_str()).into());
+        }
+        save_broadcast_senders(&*self.app, instance, senders).await
     }
 
     /// Add an inbound address to an instance. Owner-or-superuser — see

@@ -441,6 +441,24 @@ pub struct Instance {
     /// overrides it. Absent means [`DEFAULT_PAYMENT_TERMS_DAYS`] — see
     /// [`Instance::payment_terms_days_or_default`].
     pub payment_terms_days: Option<u32>,
+    /// Saved broadcast senders (support instances only) — see
+    /// [`BroadcastSender`]. Stored as one JSON string attribute
+    /// (`broadcast_senders`), absent when empty.
+    pub broadcast_senders: Vec<BroadcastSender>,
+}
+
+/// A saved From name + address an owner can pick when drafting a broadcast,
+/// e.g. `SES Activity Updates <updates@seslogin.com>`. A convenience only:
+/// `sendBroadcast` still takes the address and name it's given and
+/// validates them afresh (`broadcast::validate`), so a profile whose domain
+/// has since been removed from the instance is refused at send time, not
+/// trusted. `id` is a nanoid, unique within the instance — what
+/// `deleteBroadcastSender` names.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BroadcastSender {
+    pub id: String,
+    pub name: String,
+    pub address: String,
 }
 
 impl Instance {
@@ -2764,6 +2782,18 @@ pub trait Handler: Sync {
         instance_id: &str,
         limit: i32,
     ) -> impl Future<Output = Result<Vec<Broadcast>>> + Send;
+    /// Replace an instance's saved broadcast senders (JSON; `REMOVE`d when
+    /// empty), conditioned on the stored list still being `previous` — the
+    /// read-modify-write behind `addBroadcastSender`/`deleteBroadcastSender`,
+    /// so two owners editing at once can't silently drop each other's
+    /// change. `Ok(false)` when the instance is gone or the list changed
+    /// since it was read.
+    fn set_broadcast_senders(
+        &self,
+        instance_id: &str,
+        previous: &[BroadcastSender],
+        senders: &[BroadcastSender],
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     // ── message_delivery ──────────────────────────────────────────────────
     /// Upsert one recipient's delivery status for one ticket message,
@@ -3248,6 +3278,7 @@ mod tests {
             gst_registered: false,
             currency: None,
             payment_terms_days: None,
+            broadcast_senders: Vec::new(),
         };
         assert!(require_instance_kind(&instance, InstanceKind::Invoicing).is_ok());
         assert!(require_instance_kind(&instance, InstanceKind::Support).is_err());
@@ -3274,6 +3305,7 @@ mod tests {
             gst_registered: false,
             currency: None,
             payment_terms_days: None,
+            broadcast_senders: Vec::new(),
         };
         assert_eq!(instance.currency_or_default(), "AUD");
         instance.currency = Some("USD".to_string());

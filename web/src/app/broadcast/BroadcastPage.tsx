@@ -7,7 +7,12 @@ import LoadingIndicator from "../../components/LoadingIndicator";
 import { useSelectedInstance } from "../SelectedInstanceContext";
 import { BroadcastForm } from "./BroadcastForm";
 import { BroadcastHistory } from "./BroadcastHistory";
+import { BroadcastSendersSection } from "./BroadcastSendersSection";
 
+// `broadcastSenders { name address }` is read by `BroadcastForm` and
+// `BroadcastSendersSection`, reached through props rather than a fragment, so
+// the lint rule can't see it.
+/* eslint-disable relay/unused-fields */
 const broadcastPageQuery = graphql`
   query BroadcastPageQuery($slug: String!) @throwOnFieldError {
     instance(slug: $slug) {
@@ -15,12 +20,18 @@ const broadcastPageQuery = graphql`
       name
       fromName
       broadcastFromDomains
+      broadcastSenders {
+        id
+        name
+        address
+      }
       broadcasts(first: 25) {
         ...BroadcastHistory_broadcasts
       }
     }
   }
 `;
+/* eslint-enable relay/unused-fields */
 
 function Content({ slug }: { slug: string }) {
   // Bumped after a send so the history below picks the new broadcast up.
@@ -45,7 +56,13 @@ function Content({ slug }: { slug: string }) {
         instanceId={data.instance.id}
         defaultFromName={data.instance.fromName}
         domains={data.instance.broadcastFromDomains}
+        senders={data.instance.broadcastSenders}
         onSent={() => setFetchKey((k) => k + 1)}
+      />
+      <BroadcastSendersSection
+        instanceId={data.instance.id}
+        senders={data.instance.broadcastSenders}
+        domains={data.instance.broadcastFromDomains}
       />
       <BroadcastHistory broadcasts={data.instance.broadcasts} />
     </div>
