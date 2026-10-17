@@ -519,6 +519,28 @@ local setup, and `SCHEMA.md` for the data model.
   to the business, never into the inbound pipeline (`invoicing::send`). Sending *is* the
   mutation's whole effect, so a send failure fails it (like `replyToTicket`); success records
   `sent_at`/`sent_to`. The MCP tools say they send email.
+- **E-invoicing (`downloadInvoiceEinvoice`/`downloadCreditNoteEinvoice`, `api/src/invoicing/einvoice.rs`):
+  a finalized invoice or credit note as a Peppol PINT A-NZ e-invoice — UBL 2.1 XML, the format
+  Australia's Peppol e-invoicing framework exchanges.** Like the PDF, it is rendered from the frozen
+  `snapshot` and nothing else (`einvoice::render_xml`, pure and byte-for-byte deterministic), so
+  the two documents can't disagree; unlike the PDF it isn't cached on the row — it's rewritten
+  beside the PDF on each download. Toolbox produces the file; it is **not** a Peppol access point
+  and transmits nothing (delivering through one is the business's own provider's job).
+  - **Both parties are Australian, identified by ABN** (ICD `0151`) as Peppol endpoint and legal
+    registration — PINT A-NZ requires both ABNs. ABNs stay free text on the instance and project
+    (no write-time validation); `einvoice::problems` checks them (checksum included) and
+    `Invoice.einvoiceProblems` reports them, on a draft from its live preview so they can be fixed
+    *before* finalizing. A finalized invoice that lacked one can never have an e-invoice — its
+    snapshot is frozen — and the UI says so.
+  - **GST → tax categories under scheme `GST`**: a registered seller's lines are `S` (10%) or,
+    GST-free, `Z` (0%); an unregistered seller's are all `O`, with no rate. A buyer reference is
+    mandatory (the project's reference, else the document number); free-text payment details go
+    in the payment-terms note; a credit note is a UBL `CreditNote` (type 381) referencing its
+    invoice.
+  - **Validated against OpenPEPPOL's PINT A-NZ Schematron and the UBL 2.1 XSD** when this was
+    built (no CI step — the rules ship as XSLT 2.0, which needs Saxon). If you change the output,
+    re-run them: the XSLT is in Maven Central's `com.helger.phive.rules:phive-rules-peppol-pint`
+    jar (`external/schematron/pint-aunz/`), runnable with the `saxonche` PyPI package.
 - **Reports (`gstReport`, `receivables`, `invoicingExport`, `Project.financials`) are pure functions
   over rows read whole** (`invoicing::report`, `invoicing::csv`): every finalized invoice and credit
   note of the instance (`list_all_finalized_invoices`/`list_all_credit_notes`) and expenses by date

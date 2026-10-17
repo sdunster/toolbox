@@ -741,6 +741,24 @@ async fn document_pdf<A: App + HasStorage + Send + Sync>(
     Ok((new_key.to_string(), bytes))
 }
 
+/// A frozen document's e-invoice (`invoicing::einvoice::render_xml`), stored
+/// at `{prefix}/{filename}` and presigned for download. Rendered on every
+/// call rather than cached: it's cheap, and byte-for-byte deterministic, so
+/// overwriting the object never changes what an earlier link served.
+async fn document_einvoice_url<A: App + HasStorage + Send + Sync>(
+    app: &A,
+    snapshot: &invoicing::snapshot::InvoiceSnapshot,
+    prefix: &str,
+) -> Result<String> {
+    let xml = invoicing::einvoice::render_xml(snapshot).map_err(|e| anyhow!(e))?;
+    let filename = invoicing::einvoice::filename(snapshot);
+    let key = format!("{prefix}/{filename}");
+    app.storage()
+        .put_bytes(&key, xml.as_bytes(), "application/xml")
+        .await?;
+    app.storage().presign_get_download(&key, &filename).await
+}
+
 /// The credit-note counterpart of [`require_invoice_member`]: `NOT_FOUND`
 /// for missing and not-yours alike; superusers get no access.
 async fn require_credit_note_member<A: App + HasDb + Send + Sync>(
@@ -4784,6 +4802,27 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .await
     }
 
+    /// Download a finalized invoice as an Australian e-invoice: Peppol PINT
+    /// A-NZ UBL XML, rendered from the frozen `snapshot` alone
+    /// (`invoicing::einvoice`), as a presigned URL like `downloadInvoicePdf`'s
+    /// (`Invoice-{displayNumber}.xml`). `CONFLICT` on a draft; refused, with
+    /// every reason, when the invoice lacks what an e-invoice needs (see
+    /// `Invoice.einvoiceProblems`). A mutation for the same reason the PDF's
+    /// is: it writes the file it links to.
+    async fn download_invoice_einvoice(&self, ctx: &Context<'_>, invoice_id: ID) -> Result<String> {
+        let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        if invoice.status != db::InvoiceStatus::Finalized {
+            return Err(ApiError::conflict("Only a finalized invoice can be downloaded").into());
+        }
+        let snapshot = invoice_snapshot(&invoice)?;
+        document_einvoice_url(
+            &*self.app,
+            &snapshot,
+            &format!("invoices/{}/{}", invoice.instance_id, invoice.id),
+        )
+        .await
+    }
+
     /// **Irreversible.** Issue a credit note (an adjustment note, when the
     /// invoice was a tax invoice) against a finalized invoice: numbered from
     /// its own `CN-` sequence, frozen at once, and never editable or
@@ -4968,6 +5007,23 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .storage()
             .presign_get_download(&key, &filename)
             .await
+    }
+
+    /// `downloadInvoiceEinvoice` for a credit note: a UBL `CreditNote`
+    /// referencing the invoice it adjusts (`Credit-Note-CN-001.xml`).
+    async fn download_credit_note_einvoice(
+        &self,
+        ctx: &Context<'_>,
+        credit_note_id: ID,
+    ) -> Result<String> {
+        let note = require_credit_note_member(ctx, &*self.app, credit_note_id.as_str()).await?;
+        let snapshot = credit_note_snapshot(&note)?;
+        document_einvoice_url(
+            &*self.app,
+            &snapshot,
+            &format!("credit-notes/{}/{}", note.instance_id, note.id),
+        )
+        .await
     }
 
     /// **Sends email.** `sendInvoice` for a credit note: mails it with its

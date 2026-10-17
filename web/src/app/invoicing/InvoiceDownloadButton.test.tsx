@@ -110,6 +110,7 @@ function invoiceResponse(status: string) {
         sentAt: null,
         sentTo: [],
         creditNotes: [],
+        einvoiceProblems: [],
       },
     },
   };

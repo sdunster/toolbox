@@ -91,7 +91,7 @@ const INVOICE_SUMMARY_FIELDS: &str = "id status number displayNumber issueDate d
 const INVOICE_DETAIL_FIELDS: &str = "id status number displayNumber issueDate dueDate paidDate \
      overdue daysOverdue title reference subtotalCents gstCents totalCents paidCents \
      creditedCents balanceCents currency gstRegistered paymentDetails createdAt finalizedAt \
-     sentAt sentTo project { id name clientName clientEmail } \
+     sentAt sentTo einvoiceProblems project { id name clientName clientEmail } \
      billTo { name abn address } seller { name abn address phone email } \
      lines { date description quantity unitPriceCents amountCents gstFree } \
      items { id date description quantity unitPriceCents amountCents gstFree status } \
@@ -164,6 +164,11 @@ fn invoice_schema() -> Value {
             "currency": { "type": "string" },
             "createdAt": { "type": "integer" },
             "finalizedAt": { "type": ["integer", "null"] },
+            "einvoiceProblems": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Why it can't be issued as an e-invoice yet; empty when it can. Only get_invoice includes it.",
+            },
             "project": { "type": "object" },
         },
     })
@@ -616,6 +621,23 @@ pub fn catalogue() -> Vec<Value> {
             "annotations": { "title": "Get invoice PDF link", "readOnlyHint": true, "idempotentHint": true },
         }),
         json!({
+            "name": "get_invoice_einvoice_url",
+            "title": "Get invoice e-invoice link",
+            "description": "Get a time-limited download link for a FINALIZED invoice as an \
+                Australian e-invoice (Peppol PINT A-NZ UBL XML), rendered from exactly what was \
+                frozen at finalization. Refused on a draft, and refused with the reasons when \
+                the invoice lacks what an e-invoice needs (both ABNs, a business name) — \
+                get_invoice's `einvoiceProblems` lists them in advance. Sends nothing anywhere. \
+                The link is a presigned URL: hand it to the user, don't try to fetch it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "invoiceId": { "type": "string" } },
+                "required": ["invoiceId"],
+            },
+            "outputSchema": wrap("url", json!({ "type": "string" })),
+            "annotations": { "title": "Get invoice e-invoice link", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
             "name": "record_invoice_payment",
             "title": "Record invoice payment",
             "description": "Record money received against a FINALIZED invoice: `amountCents` \
@@ -737,6 +759,20 @@ pub fn catalogue() -> Vec<Value> {
             },
             "outputSchema": wrap("url", json!({ "type": "string" })),
             "annotations": { "title": "Get credit note PDF link", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "get_credit_note_einvoice_url",
+            "title": "Get credit note e-invoice link",
+            "description": "Get a time-limited download link for a credit note as an Australian \
+                e-invoice (Peppol PINT A-NZ UBL XML). Sends nothing anywhere. Hand the link to \
+                the user; don't fetch it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "creditNoteId": { "type": "string" } },
+                "required": ["creditNoteId"],
+            },
+            "outputSchema": wrap("url", json!({ "type": "string" })),
+            "annotations": { "title": "Get credit note e-invoice link", "readOnlyHint": true, "idempotentHint": true },
         }),
         json!({
             "name": "send_credit_note",
@@ -1102,6 +1138,20 @@ where
                 "url",
             )
         }
+        "get_invoice_einvoice_url" => {
+            let Some(id) = string_arg(arguments, "invoiceId") else {
+                return Some(missing_argument("invoiceId"));
+            };
+            rename(
+                ctx.run(
+                    "mutation McpEinvoice($id: ID!) { downloadInvoiceEinvoice(invoiceId: $id) }",
+                    json!({ "id": id }),
+                )
+                .await,
+                "downloadInvoiceEinvoice",
+                "url",
+            )
+        }
         "record_invoice_payment" => {
             let (Some(id), Some(date), Some(amount)) = (
                 string_arg(arguments, "invoiceId"),
@@ -1227,6 +1277,20 @@ where
                 )
                 .await,
                 "downloadCreditNotePdf",
+                "url",
+            )
+        }
+        "get_credit_note_einvoice_url" => {
+            let Some(id) = string_arg(arguments, "creditNoteId") else {
+                return Some(missing_argument("creditNoteId"));
+            };
+            rename(
+                ctx.run(
+                    "mutation McpCreditEinvoice($id: ID!) { downloadCreditNoteEinvoice(creditNoteId: $id) }",
+                    json!({ "id": id }),
+                )
+                .await,
+                "downloadCreditNoteEinvoice",
                 "url",
             )
         }
