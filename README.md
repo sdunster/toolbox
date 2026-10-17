@@ -21,6 +21,8 @@ be emailed to the client, paid off in part or in full, and corrected only by a c
   alongside support, isolated from it but sharing the same login and instance switcher
 - Finalized invoices download as a PDF, rendered server-side and cached in S3 behind a presigned,
   filename-forcing download link, and can be emailed to the client with the PDF attached
+- Australian e-invoicing: finalized invoices and credit notes download as Peppol PINT A-NZ (UBL)
+  e-invoices, with each draft flagging what it's missing (ABNs, business name) before it's frozen
 - Due dates from payment terms, partial payments, overdue tracking, and credit (adjustment) notes
 - GST/BAS figures (cash or accrual), aged receivables, per-project profit, and CSV exports for an
   accountant; expenses can carry a receipt and be re-billed to a client

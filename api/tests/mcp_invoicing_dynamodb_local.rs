@@ -556,6 +556,8 @@ async fn invoicing_tools_are_listed_and_finalize_warns() {
         "finalize_invoice",
         "set_invoice_paid",
         "get_invoice_pdf_url",
+        "get_invoice_einvoice_url",
+        "get_credit_note_einvoice_url",
         "list_expenses",
         "create_expense",
         "update_expense",

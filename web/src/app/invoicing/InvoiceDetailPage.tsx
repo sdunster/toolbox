@@ -8,6 +8,7 @@ import LoadingIndicator from "../../components/LoadingIndicator";
 import { ButtonLink } from "../../components/ui/Button";
 import { RequireInvoicingInstance } from "./RequireInvoicingInstance";
 import { InvoicePreview } from "./InvoicePreview";
+import { InvoiceEinvoice } from "./InvoiceEinvoice";
 import { InvoiceDraftPanel } from "./InvoiceDraftPanel";
 import { InvoicePaidControl } from "./InvoicePaidControl";
 import { InvoiceSendPanel } from "./InvoiceSendPanel";
@@ -27,6 +28,7 @@ const invoiceDetailPageQuery = graphql`
         }
       }
       ...InvoicePreview_invoice
+      ...InvoiceEinvoice_invoice
       ...InvoiceDraftPanel_invoice
       ...InvoicePaidControl_invoice
       ...InvoiceSendPanel_invoice
@@ -84,14 +86,18 @@ function Content({ id, isOwner }: { id: string; isOwner: boolean }) {
       <InvoicePreview invoice={invoice} />
 
       {invoice.status === "DRAFT" ? (
-        <InvoiceDraftPanel
-          invoice={invoice}
-          instanceId={invoice.project.instance.id}
-          isOwner={isOwner}
-        />
+        <>
+          <InvoiceEinvoice invoice={invoice} />
+          <InvoiceDraftPanel
+            invoice={invoice}
+            instanceId={invoice.project.instance.id}
+            isOwner={isOwner}
+          />
+        </>
       ) : (
         <>
           <InvoicePaidControl invoice={invoice} />
+          <InvoiceEinvoice invoice={invoice} />
           <InvoiceSendPanel invoice={invoice} />
           <InvoiceCreditNotes invoice={invoice} />
         </>
@@ -105,7 +111,8 @@ function Content({ id, isOwner }: { id: string; isOwner: boolean }) {
  * status-appropriate actions: a draft gets item management, delete and
  * finalize (`InvoiceDraftPanel`); a finalized invoice is read-only, and gets
  * its payments (`InvoicePaidControl`), emailing (`InvoiceSendPanel`) and
- * credit notes (`InvoiceCreditNotes`) instead.
+ * credit notes (`InvoiceCreditNotes`) instead. Both get `InvoiceEinvoice`:
+ * a draft's e-invoice readiness, a finalized invoice's e-invoice download.
  * `invoice(id)` is `null` for a missing invoice and for one the caller
  * can't reach alike (see its doc comment), so both show the same "not
  * found" panel. `RequireInvoicingInstance` gates on the *switcher's*

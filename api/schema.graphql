@@ -806,6 +806,13 @@ type Invoice {
 	currency: String!
 	gstRegistered: Boolean!
 	paymentDetails: String
+	"""
+	Why this invoice can't be issued as an Australian e-invoice (Peppol
+	PINT A-NZ) — empty when it can. On a draft these can still be fixed
+	in the project and invoicing settings; a finalized invoice's are
+	frozen with it (`invoicing::einvoice::problems`).
+	"""
+	einvoiceProblems: [String!]!
 	createdAt: Int!
 	finalizedAt: Int
 }
@@ -1725,6 +1732,16 @@ type MutationRoot {
 	"""
 	downloadInvoicePdf(invoiceId: ID!): String!
 	"""
+	Download a finalized invoice as an Australian e-invoice: Peppol PINT
+	A-NZ UBL XML, rendered from the frozen `snapshot` alone
+	(`invoicing::einvoice`), as a presigned URL like `downloadInvoicePdf`'s
+	(`Invoice-{displayNumber}.xml`). `CONFLICT` on a draft; refused, with
+	every reason, when the invoice lacks what an e-invoice needs (see
+	`Invoice.einvoiceProblems`). A mutation for the same reason the PDF's
+	is: it writes the file it links to.
+	"""
+	downloadInvoiceEinvoice(invoiceId: ID!): String!
+	"""
 	**Irreversible.** Issue a credit note (an adjustment note, when the
 	invoice was a tax invoice) against a finalized invoice: numbered from
 	its own `CN-` sequence, frozen at once, and never editable or
@@ -1744,6 +1761,11 @@ type MutationRoot {
 	from the frozen snapshot on first call, cached after.
 	"""
 	downloadCreditNotePdf(creditNoteId: ID!): String!
+	"""
+	`downloadInvoiceEinvoice` for a credit note: a UBL `CreditNote`
+	referencing the invoice it adjusts (`Credit-Note-CN-001.xml`).
+	"""
+	downloadCreditNoteEinvoice(creditNoteId: ID!): String!
 	"""
 	**Sends email.** `sendInvoice` for a credit note: mails it with its
 	PDF to `input.to` (default: the project's client email) and `cc`.
