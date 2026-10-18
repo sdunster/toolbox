@@ -3,6 +3,7 @@ pub mod auth;
 pub mod base_url;
 pub mod broadcast;
 pub mod broadcast_events;
+pub mod broadcast_html;
 pub mod broadcast_send;
 pub mod clock;
 pub mod db;

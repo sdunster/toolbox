@@ -789,7 +789,11 @@ One announcement email sent from a support instance to a list of addresses, one 
 see CLAUDE.md's "Broadcasts" entry. Written by `sendBroadcast` (`Put`, every recipient `pending`),
 then by the worker Lambda: each paced batch (`broadcast_send`) claims, sends and records its
 recipients one `UpdateItem` at a time and records its progress, and SES delivery events arrive
-through `broadcast_events`. Never deleted.
+through `broadcast_events`. A **draft** (`saveBroadcastDraft`) is a row with `status = draft`:
+replaced whole by each save (`Put` conditioned on `#status = :draft`), deletable
+(`deleteBroadcastDraft`, same condition), and turned into a sent broadcast exactly once by
+`sendBroadcastDraft` (`start_broadcast_draft`: `REMOVE #status`, final `recipients`,
+`created_at`/`next_batch_at` = now, same condition). A sent broadcast is never deleted.
 
 | Attribute     | Type | Role                   |
 | ------------- | ---- | ---------------------- |
@@ -809,7 +813,20 @@ through `broadcast_events`. Never deleted.
   inbound-address domains) and where replies go (an address that routes back to the instance, never
   carrying a `+t…` reply tag).
 - `from_name` (S) — optional; omitted when blank.
-- `subject`, `body_text`, `created_by_user_id` (S), `created_at` (N).
+- `subject`, `created_by_user_id` (S), `created_at` (N) — for a sent broadcast, when it was queued
+  (a draft's is when it was started, and moves to the send time when it's sent).
+- `body_text` (S) — the plain-text body. Required for a plain-text broadcast; on an HTML one, the
+  owner's own plain-text alternative, **absent** when they wrote none (one is then derived from the
+  HTML at send time, `broadcast_html::html_to_text`). Absent reads as empty.
+- `body_html` (S) — an HTML broadcast's body, already processed by `broadcast_html::process`
+  (sanitized; uploaded images rewritten to their `https://{web}/email-assets/…` URLs). Absent on a
+  plain-text broadcast. At most 100 KB (`broadcast_html::MAX_HTML_BYTES`, `body_text` included) so
+  the row stays inside DynamoDB's 400 KB limit next to up to 500 recipient maps.
+- `status` (S) — `draft`, or **absent** once sent (and on every row from before drafts). A reserved
+  word: alias it (`#status`).
+- `last_test_sent_at` (N) — when `sendBroadcastTest` last mailed a test copy of the draft; absent if
+  never, and dropped by every save (the `Put` doesn't carry it), since that test no longer shows the
+  current content.
 - `send_seq` (N) — the `seq` of the next `BroadcastBatch` job expected; a batch advances it
   (`set_broadcast_progress`, conditioned `send_seq <= seq`) and a job below it is a duplicate.
   Absent on rows from before background sending (read as 0).

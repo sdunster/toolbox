@@ -826,6 +826,60 @@ fn broadcast_recipient_to_av(r: &db::BroadcastRecipient) -> AttributeValue {
     AttributeValue::M(m)
 }
 
+/// `broadcast.status` for a draft — the attribute is absent otherwise.
+const BROADCAST_DRAFT: &str = "draft";
+
+/// A whole `broadcast` row as a DynamoDB item, every `None`/empty optional
+/// omitted — what `create_broadcast` and `update_broadcast_draft` `Put`.
+fn broadcast_item(b: &db::Broadcast) -> HashMap<String, AttributeValue> {
+    let s = |v: &str| AttributeValue::S(v.to_string());
+    let mut item: HashMap<String, AttributeValue> = HashMap::from([
+        ("id".to_string(), s(&b.id)),
+        ("instance_id".to_string(), s(&b.instance_id)),
+        ("created_by_user_id".to_string(), s(&b.created_by_user_id)),
+        (
+            "created_at".to_string(),
+            AttributeValue::N(b.created_at.to_string()),
+        ),
+        ("from_address".to_string(), s(&b.from_address)),
+        ("reply_to".to_string(), s(&b.reply_to)),
+        ("subject".to_string(), s(&b.subject)),
+        (
+            "recipients".to_string(),
+            AttributeValue::L(b.recipients.iter().map(broadcast_recipient_to_av).collect()),
+        ),
+        (
+            "send_seq".to_string(),
+            AttributeValue::N(b.send_seq.to_string()),
+        ),
+    ]);
+    if !b.from_name.is_empty() {
+        item.insert("from_name".to_string(), s(&b.from_name));
+    }
+    if !b.body_text.is_empty() {
+        item.insert("body_text".to_string(), s(&b.body_text));
+    }
+    if let Some(html) = &b.body_html {
+        item.insert("body_html".to_string(), s(html));
+    }
+    if b.draft {
+        item.insert("status".to_string(), s(BROADCAST_DRAFT));
+    }
+    if let Some(at) = b.last_test_sent_at {
+        item.insert(
+            "last_test_sent_at".to_string(),
+            AttributeValue::N(at.to_string()),
+        );
+    }
+    if let Some(at) = b.next_batch_at {
+        item.insert(
+            "next_batch_at".to_string(),
+            AttributeValue::N(at.to_string()),
+        );
+    }
+    item
+}
+
 impl TryInto<db::Broadcast> for Item {
     type Error = HydrationError;
     fn try_into(self) -> Result<db::Broadcast, Self::Error> {
@@ -889,7 +943,12 @@ impl TryInto<db::Broadcast> for Item {
             from_name: self.string_field("from_name")?.unwrap_or_default(),
             reply_to: req_s("reply_to")?,
             subject: req_s("subject")?,
-            body_text: req_s("body_text")?,
+            // Absent on an HTML broadcast whose owner wrote no plain-text
+            // alternative.
+            body_text: self.string_field("body_text")?.unwrap_or_default(),
+            body_html: self.string_field("body_html")?,
+            draft: self.string_field("status")?.as_deref() == Some(BROADCAST_DRAFT),
+            last_test_sent_at: self.i64_field("last_test_sent_at")?.map(|t| t as u64),
             recipients,
             send_seq: self.i64_field("send_seq")?.unwrap_or(0) as u64,
             next_batch_at: self.i64_field("next_batch_at")?.map(|t| t as u64),
@@ -4782,42 +4841,11 @@ impl db::Handler for Handler {
 
     async fn create_broadcast(&self, b: &db::Broadcast) -> db::Result<()> {
         self.ensure_writable()?;
-        let s = |v: &str| AttributeValue::S(v.to_string());
-        let mut item: HashMap<String, AttributeValue> = HashMap::from([
-            ("id".to_string(), s(&b.id)),
-            ("instance_id".to_string(), s(&b.instance_id)),
-            ("created_by_user_id".to_string(), s(&b.created_by_user_id)),
-            (
-                "created_at".to_string(),
-                AttributeValue::N(b.created_at.to_string()),
-            ),
-            ("from_address".to_string(), s(&b.from_address)),
-            ("reply_to".to_string(), s(&b.reply_to)),
-            ("subject".to_string(), s(&b.subject)),
-            ("body_text".to_string(), s(&b.body_text)),
-            (
-                "recipients".to_string(),
-                AttributeValue::L(b.recipients.iter().map(broadcast_recipient_to_av).collect()),
-            ),
-            (
-                "send_seq".to_string(),
-                AttributeValue::N(b.send_seq.to_string()),
-            ),
-        ]);
-        if !b.from_name.is_empty() {
-            item.insert("from_name".to_string(), s(&b.from_name));
-        }
-        if let Some(at) = b.next_batch_at {
-            item.insert(
-                "next_batch_at".to_string(),
-                AttributeValue::N(at.to_string()),
-            );
-        }
         let resp = self
             .client
             .put_item()
             .table_name(self.table_name("broadcast"))
-            .set_item(Some(item))
+            .set_item(Some(broadcast_item(b)))
             .condition_expression("attribute_not_exists(id)")
             .return_consumed_capacity(ReturnConsumedCapacity::Total)
             .send()
@@ -4825,6 +4853,117 @@ impl db::Handler for Handler {
             .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
         record_capacity("create_broadcast", resp.consumed_capacity(), CapKind::Write);
         Ok(())
+    }
+
+    async fn update_broadcast_draft(&self, b: &db::Broadcast) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .put_item()
+            .table_name(self.table_name("broadcast"))
+            .set_item(Some(broadcast_item(b)))
+            .condition_expression("#status = :draft")
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":draft", AttributeValue::S(BROADCAST_DRAFT.to_string()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                record_capacity(
+                    "update_broadcast_draft",
+                    r.consumed_capacity(),
+                    CapKind::Write,
+                );
+                Ok(true)
+            }
+            Err(SdkError::ServiceError(ref se))
+                if se.err().is_conditional_check_failed_exception() =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
+        }
+    }
+
+    async fn set_broadcast_test_sent(&self, id: &str, at: u64) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .update_expression("SET last_test_sent_at = :at")
+            .condition_expression("#status = :draft")
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":draft", AttributeValue::S(BROADCAST_DRAFT.to_string()))
+            .expression_attribute_values(":at", AttributeValue::N(at.to_string()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_broadcast_test_sent", resp)
+    }
+
+    async fn start_broadcast_draft(
+        &self,
+        id: &str,
+        recipients: &[db::BroadcastRecipient],
+        now: u64,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .update_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .update_expression(
+                "SET recipients = :r, created_at = :now, next_batch_at = :now, send_seq = :zero \
+                 REMOVE #status",
+            )
+            .condition_expression("#status = :draft")
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":draft", AttributeValue::S(BROADCAST_DRAFT.to_string()))
+            .expression_attribute_values(
+                ":r",
+                AttributeValue::L(recipients.iter().map(broadcast_recipient_to_av).collect()),
+            )
+            .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
+            .expression_attribute_values(":zero", AttributeValue::N("0".to_string()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("start_broadcast_draft", resp)
+    }
+
+    async fn delete_broadcast_draft(&self, id: &str) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let resp = self
+            .client
+            .delete_item()
+            .table_name(self.table_name("broadcast"))
+            .key("id", AttributeValue::S(id.to_string()))
+            .condition_expression("#status = :draft")
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":draft", AttributeValue::S(BROADCAST_DRAFT.to_string()))
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                record_capacity(
+                    "delete_broadcast_draft",
+                    r.consumed_capacity(),
+                    CapKind::Write,
+                );
+                Ok(true)
+            }
+            Err(SdkError::ServiceError(ref se))
+                if se.err().is_conditional_check_failed_exception() =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
+        }
     }
 
     async fn claim_broadcast_recipient(&self, id: &str, index: usize) -> db::Result<bool> {

@@ -15,6 +15,10 @@ use crate::storage::{self, PRESIGN_EXPIRY};
 pub struct Storage {
     client: Client,
     bucket: String,
+    /// `EMAIL_ASSETS_BUCKET` — the public bucket HTML broadcast images go
+    /// to. Optional: only the API Lambda uploads to it, so a binary without
+    /// it (the worker) just can't presign there.
+    assets_bucket: Option<String>,
 }
 
 impl Storage {
@@ -25,9 +29,13 @@ impl Storage {
         let bucket = std::env::var("MAIL_BUCKET")
             .context("MAIL_BUCKET must be set for the S3-backed storage handler")?;
         let config = crate::aws_config_loader().load().await;
+        let assets_bucket = std::env::var("EMAIL_ASSETS_BUCKET")
+            .ok()
+            .filter(|b| !b.trim().is_empty());
         Ok(Self {
             client: Client::new(&config),
             bucket,
+            assets_bucket,
         })
     }
 }
@@ -100,6 +108,33 @@ impl storage::Handler for Storage {
             .presigned(presign_config)
             .await
             .with_context(|| format!("presigning PUT for {key}"))?;
+        Ok(req.uri().to_string())
+    }
+
+    async fn presign_put_public_asset(
+        &self,
+        key: &str,
+        content_type: &str,
+        content_length: u64,
+    ) -> Result<String> {
+        let bucket = self
+            .assets_bucket
+            .as_deref()
+            .context("EMAIL_ASSETS_BUCKET must be set to upload broadcast images")?;
+        let presign_config =
+            PresigningConfig::expires_in(PRESIGN_EXPIRY).map_err(|e| anyhow!("{e}"))?;
+        // `Content-Length` is signed, so the upload must be exactly the
+        // size that was checked.
+        let req = self
+            .client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .content_type(content_type)
+            .content_length(i64::try_from(content_length).context("asset too large")?)
+            .presigned(presign_config)
+            .await
+            .with_context(|| format!("presigning asset PUT for {key}"))?;
         Ok(req.uri().to_string())
     }
 

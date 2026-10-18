@@ -67,5 +67,6 @@ dotenvy = "0.15.7"
 serde = { version = "1.0", features = ["derive"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "charset", "query", "form"] }
 nanoid = "0.5.0"
+lol_html = "3.0.1"
 printpdf = { version = "0.7", default-features = false }
 owned_ttf_parser = "0.19"

@@ -351,6 +351,34 @@ original mail client, and that replying to *that* lands back on the same ticket.
 alarm (`monitoring.tf`) is `OK`, and that a deliberately malformed message lands in the DLQ rather
 than looping.
 
+## 10. Writing an HTML broadcast
+
+An HTML broadcast is designed outside Toolbox and brought in on the Broadcast page's **HTML
+email** tab (see CLAUDE.md's "Broadcasts" entry for the rules behind it):
+
+1. **Make the email.** Any email builder that exports HTML works, as does MJML or asking Claude.
+   Email HTML is not web HTML, so ask for: a table-based layout about 600 px wide, all CSS inline
+   (a `<style>` block is fine for extras, but not relied on), web-safe fonts, no JavaScript, no
+   forms, and images referenced by **relative** paths (`images/logo.png`) — or absolute `https://`
+   URLs you already host. For example: *"Write an HTML email announcing X for a mailing list.
+   Table-based, 600px, inline CSS, works in Gmail and Outlook. Put images in `images/` and give me
+   `index.html` plus the images as a zip."*
+2. **Bring it in.** Paste the HTML, or upload the `.zip` (`index.html` plus its images — unpacked
+   in the browser, and every image the HTML uses is uploaded for you). Saving lists any image still
+   missing; upload each one next to its name. Toolbox hosts them for good at
+   `https://{web_domain}/email-assets/…` and rewrites the HTML to point there.
+3. **Check it.** The preview is a browser rendering; **Send test** mails a `[TEST]` copy to you
+   (or up to five addresses), built exactly like the real one. Look at it in Gmail/Outlook/phone.
+4. **Send it.** Add recipients (any time before this), **Review & send**. From here it is an
+   ordinary broadcast: paced batches, one copy each, every reply a new ticket.
+
+No signature is added to an HTML broadcast, and a plain-text version is made from the HTML unless
+you write your own. Keep it under ~90 KB: Gmail clips longer messages.
+
+Locally (`make dev-local`), image uploads don't work — mock storage hands back `file://` URLs the
+browser can't PUT to — so test the flow with absolute image URLs, or against a deployed
+environment.
+
 ## Where to go next
 
 - [SCHEMA.md](SCHEMA.md) — the data model.

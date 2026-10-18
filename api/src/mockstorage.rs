@@ -104,6 +104,18 @@ impl storage::Handler for Storage {
         Ok(format!("file://{}", path.display()))
     }
 
+    /// The local stand-in for the public bucket is the same directory —
+    /// `email-assets/…` keys don't collide with the mail bucket's.
+    async fn presign_put_public_asset(
+        &self,
+        key: &str,
+        _content_type: &str,
+        _content_length: u64,
+    ) -> Result<String> {
+        let path = self.path_for(key)?;
+        Ok(format!("file://{}", path.display()))
+    }
+
     async fn presign_get(&self, key: &str) -> Result<String> {
         let path = self.path_for(key)?;
         Ok(format!("file://{}", path.display()))

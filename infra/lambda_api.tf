@@ -18,6 +18,9 @@ resource "aws_lambda_function" "api" {
         # so replies thread back to the right tenant.
         MAIL_FROM   = "no-reply@${var.web_domain}"
         MAIL_BUCKET = aws_s3_bucket.mail.id
+        # api/src/s3storage.rs: the public bucket createBroadcastAssetUpload
+        # presigns image uploads into, served at APP_BASE_URL/email-assets/*.
+        EMAIL_ASSETS_BUCKET = aws_s3_bucket.email_assets.id
         # api/src/app.rs: WebAuthn relying-party id/origin. Both default to
         # localhost values meant only for `make dev`, so both must be set
         # explicitly here.

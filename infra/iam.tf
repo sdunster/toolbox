@@ -98,6 +98,22 @@ resource "aws_iam_role_policy" "api_lambda_s3_mail" {
   })
 }
 
+# createBroadcastAssetUpload presigns PUTs into the public email-assets
+# bucket (s3_email_assets.tf). Write only: reads go through CloudFront.
+resource "aws_iam_role_policy" "api_lambda_s3_email_assets" {
+  name = "s3-email-assets"
+  role = aws_iam_role.api_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:PutObject"]
+      Resource = "${aws_s3_bucket.email_assets.arn}/email-assets/*"
+    }]
+  })
+}
+
 # sendBroadcast queues a broadcast's first batch for the worker
 # (api/src/broadcast_send.rs). Send only — the worker consumes.
 resource "aws_iam_role_policy" "api_lambda_sqs_send" {

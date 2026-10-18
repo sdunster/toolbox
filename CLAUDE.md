@@ -206,6 +206,35 @@ local setup, and `SCHEMA.md` for the data model.
     posture as `sendBroadcast`. A convenience only: the web form fills `fromAddress`/`fromName`
     from the chosen sender, and `sendBroadcast` re-validates them as it always has — a sender is
     checked on save by the same `broadcast::validate_from_address`, but never trusted at send time.
+  - **HTML broadcasts go through a draft (`saveBroadcastDraft` → `sendBroadcastTest` →
+    `sendBroadcastDraft`, `api/src/broadcast_html.rs`).** The owner designs the email elsewhere
+    (an email builder, MJML, or Claude), pastes the HTML or uploads an export `.zip` (unpacked in
+    the browser), saves it as a draft (`status = draft`, nothing queued), mails themselves a
+    `[TEST]` copy — built by the same `build_broadcast_message`, sent untagged to the given
+    addresses only, never recorded as a recipient — and then sends the draft for real, which is
+    exactly the paced batch flow above. Turning a draft into a sent broadcast is one conditional
+    write (`#status = :draft`), so a double click can't send twice; a sent one can't be edited or
+    deleted. Saving clears `last_test_sent_at`, since the test no longer matches.
+    - **Images are hosted by Toolbox, in a separate public bucket** (`EMAIL_ASSETS_BUCKET`,
+      `infra/s3_email_assets.tf`), served by the web CloudFront distribution at
+      `https://{web_domain}/email-assets/{instance_id}/{id}/{file}` — public by design, because
+      every recipient's mail client fetches them, and **write-once, never deleted**, so mail sent
+      long ago still renders. Never put anything private there; the mail bucket stays private.
+      `createBroadcastAssetUpload` presigns a PUT (PNG/JPEG/GIF/WebP only — no SVG, which could
+      run script on our origin — at most 5 MB, the size signed in). The HTML's relative references
+      (`images/logo.png`) are rewritten to those URLs by `saveBroadcastDraft`'s `assetUrls`; any
+      still unmatched is a `missingAssets` entry, and a draft with one can't be tested or sent.
+      `data:` and `cid:` images are refused (Gmail/Outlook strip `data:`; we attach no `cid:`
+      parts); absolute `https://` URLs pass through untouched.
+    - **The HTML is sanitized on save** (`broadcast_html::process`, `lol_html`): scripts, frames,
+      forms, `<base>`, meta refresh, `on*` handlers and `javascript:` URLs are stripped. The stored
+      HTML is the processed result, and processing is idempotent. **The web app previews it only
+      in a `sandbox=""` `<iframe>`** (no scripts, no same-origin) — never render
+      `Broadcast.html` into the app's own DOM.
+    - **No instance signature on an HTML broadcast**, in either part: the design is sent as
+      authored. The `text/plain` part is the owner's own, or derived (`html_to_text`).
+    - The HTML lives on the `broadcast` row (`body_html`, ≤ 100 KB — past ~102 KB Gmail clips the
+      message anyway), not in S3, so the worker and GraphQL read it with the row.
   - Not an MCP tool. If one is ever added, its description must say it sends customer email.
 
 - **SES events: parsed once, many consumers (`api/src/ses_events.rs`).** The `toolbox-mail-feedback`

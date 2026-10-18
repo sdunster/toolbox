@@ -1104,3 +1104,310 @@ async fn a_broadcast_that_cannot_be_queued_fails_and_sends_nothing() {
             .all(|r| r.send_status == db::BroadcastSendStatus::Failed)
     );
 }
+
+// ── drafts, test sends and HTML ──────────────────────────────────────────
+
+const SAVE_DRAFT: &str = r#"
+    mutation($instanceId: ID!, $input: SaveBroadcastDraftInput!) {
+        saveBroadcastDraft(instanceId: $instanceId, input: $input) {
+            id isDraft subject body html missingAssets lastTestSentAt inProgress
+            recipients { email sendStatus }
+        }
+    }
+"#;
+
+const SEND_TEST: &str = r#"
+    mutation($instanceId: ID!, $broadcastId: ID!, $to: [String!]!) {
+        sendBroadcastTest(instanceId: $instanceId, broadcastId: $broadcastId, to: $to) {
+            id isDraft lastTestSentAt
+        }
+    }
+"#;
+
+const SEND_DRAFT: &str = r#"
+    mutation($instanceId: ID!, $broadcastId: ID!) {
+        sendBroadcastDraft(instanceId: $instanceId, broadcastId: $broadcastId) {
+            id isDraft inProgress pendingCount recipientCount
+        }
+    }
+"#;
+
+const DELETE_DRAFT: &str = r#"
+    mutation($instanceId: ID!, $broadcastId: ID!) {
+        deleteBroadcastDraft(instanceId: $instanceId, broadcastId: $broadcastId)
+    }
+"#;
+
+const ASSET_UPLOAD: &str = r#"
+    mutation($instanceId: ID!, $filename: String!, $contentType: String!, $size: Int!) {
+        createBroadcastAssetUpload(
+            instanceId: $instanceId, filename: $filename, contentType: $contentType, size: $size
+        ) { uploadUrl url }
+    }
+"#;
+
+const DRAFT_HTML: &str = r#"<!DOCTYPE html><html><head><style>h1{color:#c00}</style></head>
+<body><h1>Big news</h1><p>We shipped it.</p><img src="images/logo.png" alt="Logo">
+<script>alert(1)</script></body></html>"#;
+
+async fn run(
+    schema: &TestSchema,
+    auth: &AuthInfo,
+    query: &str,
+    vars: serde_json::Value,
+) -> Response {
+    schema
+        .execute(
+            Request::new(query)
+                .variables(Variables::from_json(vars))
+                .data(auth.clone()),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn an_html_draft_is_built_up_test_sent_and_then_sent_for_real() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) = setup_instance(&db, "draft", db::InstanceKind::Support).await;
+    let (app, schema) = build_app_and_schema(db.clone());
+    let auth = user_auth(&owner, &instance.id, true);
+    let recipients = vec![unique_email("alice"), unique_email("bob")];
+    let draft_input = |id: Option<&str>, assets: serde_json::Value| {
+        json!({
+            "instanceId": instance.id,
+            "input": {
+                "id": id,
+                "fromAddress": format!("news@{domain}"),
+                "subject": "Big news",
+                "html": DRAFT_HTML,
+                "assetUrls": assets,
+                "recipients": recipients,
+            },
+        })
+    };
+
+    // Saved with its image not yet uploaded: reported, not refused.
+    let resp = run(&schema, &auth, SAVE_DRAFT, draft_input(None, json!([]))).await;
+    let d = expect_data(&resp, "saveBroadcastDraft");
+    let id = d["id"].as_str().unwrap().to_string();
+    assert_eq!(d["isDraft"], true);
+    assert_eq!(d["inProgress"], false);
+    assert_eq!(d["missingAssets"], json!(["images/logo.png"]));
+    assert!(!d["html"].as_str().unwrap().contains("<script"), "{d}");
+    assert!(app.queue.drain().is_empty(), "a draft queues nothing");
+
+    // A test send needs every image.
+    let me = unique_email("owner-test");
+    let test_vars = json!({ "instanceId": instance.id, "broadcastId": id, "to": [me] });
+    let resp = run(&schema, &auth, SEND_TEST, test_vars.clone()).await;
+    assert!(
+        format!("{:?}", resp.errors).contains("images/logo.png"),
+        "{resp:?}"
+    );
+
+    // Upload it, then save with its URL.
+    let resp = run(
+        &schema,
+        &auth,
+        ASSET_UPLOAD,
+        json!({ "instanceId": instance.id, "filename": "images/logo.png",
+                "contentType": "image/png", "size": 1234 }),
+    )
+    .await;
+    let up = expect_data(&resp, "createBroadcastAssetUpload");
+    let url = up["url"].as_str().unwrap().to_string();
+    assert!(
+        url.contains(&format!("/email-assets/{}/", instance.id)) && url.ends_with("/logo.png"),
+        "{url}"
+    );
+    let resp = run(
+        &schema,
+        &auth,
+        SAVE_DRAFT,
+        draft_input(
+            Some(&id),
+            json!([{ "path": "images/logo.png", "url": url }]),
+        ),
+    )
+    .await;
+    let d = expect_data(&resp, "saveBroadcastDraft");
+    assert_eq!(d["id"], id.as_str(), "the same draft, updated");
+    assert_eq!(d["missingAssets"], json!([]));
+    assert!(d["html"].as_str().unwrap().contains(&url), "{d}");
+
+    // The test goes to `to` only: untagged, [TEST] subject, nothing queued.
+    let resp = run(&schema, &auth, SEND_TEST, test_vars).await;
+    let t = expect_data(&resp, "sendBroadcastTest");
+    assert!(t["lastTestSentAt"].is_i64(), "{t}");
+    let sent = app.mail.sent_raw();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].to, vec![me.clone()]);
+    assert!(sent[0].tags.is_empty(), "a test is not tracked");
+    let raw = String::from_utf8_lossy(&sent[0].raw);
+    assert!(raw.contains("Subject: [TEST] Big news"), "{raw}");
+    assert!(app.queue.drain().is_empty(), "a test queues nothing");
+    let stored = db.get_broadcast_consistent(&id).await.unwrap().unwrap();
+    assert!(stored.draft);
+    assert!(
+        stored
+            .recipients
+            .iter()
+            .all(|r| r.send_status == db::BroadcastSendStatus::Pending),
+        "the test address is never a recipient"
+    );
+    app.mail.clear();
+
+    // Send it for real: the usual paced batches, HTML and all.
+    let send_vars = json!({ "instanceId": instance.id, "broadcastId": id });
+    let resp = run(&schema, &auth, SEND_DRAFT, send_vars.clone()).await;
+    let b = expect_data(&resp, "sendBroadcastDraft");
+    assert_eq!(b["isDraft"], false);
+    assert_eq!(b["inProgress"], true);
+    assert_eq!(b["pendingCount"], 2);
+    run_queued_jobs(&app).await;
+    let sent = app.mail.sent_raw();
+    assert_eq!(sent.len(), 2);
+    for msg in &sent {
+        let parsed = mail_parser::MessageParser::new().parse(&msg.raw).unwrap();
+        assert_eq!(parsed.subject(), Some("Big news"));
+        let html = parsed.body_html(0).unwrap();
+        assert!(html.contains(&url), "{html}");
+        assert!(
+            !html.contains("Thanks,"),
+            "no signature on an HTML broadcast"
+        );
+        assert_eq!(msg.tags.len(), 2, "tracked like any broadcast copy");
+    }
+
+    // Sent once only, and no longer editable or deletable.
+    let resp = run(&schema, &auth, SEND_DRAFT, send_vars.clone()).await;
+    assert_eq!(expect_error_code(&resp), "CONFLICT");
+    let resp = run(
+        &schema,
+        &auth,
+        SAVE_DRAFT,
+        draft_input(Some(&id), json!([])),
+    )
+    .await;
+    assert_eq!(expect_error_code(&resp), "CONFLICT");
+    let resp = run(&schema, &auth, DELETE_DRAFT, send_vars).await;
+    assert_eq!(expect_error_code(&resp), "CONFLICT");
+}
+
+#[tokio::test]
+async fn saving_a_draft_again_clears_its_test_and_a_draft_can_be_deleted() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) =
+        setup_instance(&db, "draftdel", db::InstanceKind::Support).await;
+    let (_app, schema) = build_app_and_schema(db.clone());
+    let auth = user_auth(&owner, &instance.id, true);
+    let save = |id: Option<String>| {
+        json!({
+            "instanceId": instance.id,
+            "input": {
+                "id": id,
+                "fromAddress": format!("news@{domain}"),
+                "subject": "Plain draft",
+                "body": "Hello",
+            },
+        })
+    };
+    let resp = run(&schema, &auth, SAVE_DRAFT, save(None)).await;
+    let id = expect_data(&resp, "saveBroadcastDraft.id")
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = run(
+        &schema,
+        &auth,
+        SEND_TEST,
+        json!({ "instanceId": instance.id, "broadcastId": id, "to": [unique_email("me")] }),
+    )
+    .await;
+    assert!(expect_data(&resp, "sendBroadcastTest.lastTestSentAt").is_i64());
+
+    let resp = run(&schema, &auth, SAVE_DRAFT, save(Some(id.clone()))).await;
+    assert_eq!(
+        expect_data(&resp, "saveBroadcastDraft.lastTestSentAt"),
+        serde_json::Value::Null
+    );
+
+    // A draft with no recipients can't be sent.
+    let vars = json!({ "instanceId": instance.id, "broadcastId": id });
+    let resp = run(&schema, &auth, SEND_DRAFT, vars.clone()).await;
+    assert!(
+        format!("{:?}", resp.errors).contains("at least one recipient"),
+        "{resp:?}"
+    );
+
+    let resp = run(&schema, &auth, DELETE_DRAFT, vars.clone()).await;
+    assert_eq!(expect_data(&resp, "deleteBroadcastDraft"), id.as_str());
+    assert!(db.get_broadcast_consistent(&id).await.unwrap().is_none());
+    let resp = run(&schema, &auth, DELETE_DRAFT, vars).await;
+    assert_eq!(expect_error_code(&resp), "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn another_instances_owner_cannot_touch_a_draft() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, domain) =
+        setup_instance(&db, "draftiso", db::InstanceKind::Support).await;
+    let (other, other_owner, _) = setup_instance(&db, "draftiso2", db::InstanceKind::Support).await;
+    let (_app, schema) = build_app_and_schema(db.clone());
+    let resp = run(
+        &schema,
+        &user_auth(&owner, &instance.id, true),
+        SAVE_DRAFT,
+        json!({
+            "instanceId": instance.id,
+            "input": { "fromAddress": format!("news@{domain}"), "subject": "S", "body": "B" },
+        }),
+    )
+    .await;
+    let id = expect_data(&resp, "saveBroadcastDraft.id")
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Through their own instance id (which their guard passes): not found.
+    let auth = user_auth(&other_owner, &other.id, true);
+    let vars = json!({ "instanceId": other.id, "broadcastId": id });
+    for query in [SEND_DRAFT, DELETE_DRAFT] {
+        let resp = run(&schema, &auth, query, vars.clone()).await;
+        assert_eq!(expect_error_code(&resp), "NOT_FOUND");
+    }
+    let resp = run(
+        &schema,
+        &auth,
+        SEND_TEST,
+        json!({ "instanceId": other.id, "broadcastId": id, "to": ["x@example.com"] }),
+    )
+    .await;
+    assert_eq!(expect_error_code(&resp), "NOT_FOUND");
+}
+
+#[tokio::test]
+async fn asset_uploads_take_only_small_raster_images() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance, owner, _) = setup_instance(&db, "asset", db::InstanceKind::Support).await;
+    let (_app, schema) = build_app_and_schema(db.clone());
+    let auth = user_auth(&owner, &instance.id, true);
+    for (ct, size) in [
+        ("image/svg+xml", 100),
+        ("text/html", 100),
+        ("image/png", 6_000_000),
+    ] {
+        let resp = run(
+            &schema,
+            &auth,
+            ASSET_UPLOAD,
+            json!({ "instanceId": instance.id, "filename": "a", "contentType": ct, "size": size }),
+        )
+        .await;
+        assert!(!resp.errors.is_empty(), "{ct} {size} should be refused");
+    }
+}
