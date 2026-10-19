@@ -36,8 +36,8 @@ use super::query::{
     ApiTokenInfo, BillableItem, BillableItemInput, Broadcast, CreateProjectInput, CreatedApiToken,
     Expense, ExpenseInput, InboundAddressInfo, Instance, InstanceKindType, Invoice,
     InvoicingSettingsInput, MembershipInfo, MembershipRoleType, NotificationSettingsInput,
-    PasskeyInfo, Project, SendBroadcastInput, Ticket, TicketMessage, TicketStatusType,
-    UpdateProjectInput, User,
+    PasskeyInfo, Project, SaveBroadcastDraftInput, SendBroadcastInput, Ticket, TicketMessage,
+    TicketStatusType, UpdateProjectInput, User,
 };
 
 /// One code per address per this many seconds — cheap anti-spam for
@@ -1154,6 +1154,125 @@ async fn save_broadcast_senders<A: App + HasDb + Send + Sync>(
     Ok(Instance::new(instance))
 }
 
+/// Most test addresses one `sendBroadcastTest` may mail.
+const MAX_BROADCAST_TEST_RECIPIENTS: usize = 5;
+
+/// Image types an HTML broadcast may host (`createBroadcastAssetUpload`).
+/// No SVG: most mail clients refuse it, and served from the web app's own
+/// origin it could run script.
+const BROADCAST_ASSET_TYPES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// Largest image `createBroadcastAssetUpload` will presign.
+const MAX_BROADCAST_ASSET_BYTES: i64 = 5 * 1024 * 1024;
+
+/// `createBroadcastAssetUpload`'s result: PUT the file's bytes to
+/// `uploadUrl` (with the same `Content-Type`, and exactly the declared
+/// size), then reference it as `url` — its permanent public address.
+#[derive(SimpleObject)]
+struct BroadcastAssetUpload {
+    upload_url: String,
+    url: String,
+}
+
+/// A draft broadcast of `instance` — `NOT_FOUND` for a missing one or
+/// another instance's, `CONFLICT` once it has been sent.
+async fn broadcast_draft<A: HasDb + Sync>(
+    app: &A,
+    instance: &db::Instance,
+    broadcast_id: &ID,
+) -> Result<db::Broadcast> {
+    let rec = app
+        .db()
+        .get_broadcast_consistent(broadcast_id.as_str())
+        .await?
+        .filter(|b| b.instance_id == instance.id)
+        .ok_or_else(|| ApiError::not_found("Broadcast", broadcast_id.as_str()))?;
+    if !rec.draft {
+        return Err(ApiError::conflict("This broadcast has already been sent").into());
+    }
+    Ok(rec)
+}
+
+/// Re-validate a stored draft for `purpose`, against the instance as it is
+/// now (its domains may have changed since the draft was saved).
+fn validate_draft(
+    rec: &db::Broadcast,
+    purpose: broadcast::Purpose,
+    instance: &db::Instance,
+    addresses: &[db::InboundAddress],
+) -> Result<broadcast::ValidBroadcast> {
+    let recipients: Vec<String> = rec.recipients.iter().map(|r| r.email.clone()).collect();
+    let no_assets = std::collections::HashMap::new();
+    broadcast::validate(
+        broadcast::BroadcastInput {
+            from_address: &rec.from_address,
+            from_name: Some(&rec.from_name),
+            subject: &rec.subject,
+            body: &rec.body_text,
+            html: rec.body_html.as_deref(),
+            asset_urls: &no_assets,
+            recipients: &recipients,
+        },
+        purpose,
+        instance,
+        addresses,
+    )
+}
+
+/// Every recipient `pending`, except an address on the suppression list (a
+/// past hard bounce or complaint), recorded `suppressed` and never sent —
+/// like every other instance-mail send skips them. Fails open — see
+/// `crate::suppression`. Each batch checks again before it sends.
+async fn broadcast_recipients<A: HasDb + Sync>(
+    app: &A,
+    emails: &[String],
+    context: &str,
+) -> Vec<db::BroadcastRecipient> {
+    let suppressed: std::collections::HashMap<String, String> =
+        suppression::find_suppressed(app, emails, context)
+            .await
+            .into_iter()
+            .map(|s| (s.email.clone(), suppression::describe(&s)))
+            .collect();
+    emails
+        .iter()
+        .map(|email| match suppressed.get(email) {
+            Some(why) => db::BroadcastRecipient {
+                send_status: db::BroadcastSendStatus::Suppressed,
+                error: Some(why.clone()),
+                ..db::BroadcastRecipient::pending(email)
+            },
+            None => db::BroadcastRecipient::pending(email),
+        })
+        .collect()
+}
+
+/// Queue a written broadcast's first batch. If that fails, every pending
+/// recipient is recorded `failed` and the broadcast finished, and the
+/// mutation fails — nothing has been sent.
+async fn queue_broadcast<A: HasDb + HasQueue + Sync>(app: &A, rec: &db::Broadcast) -> Result<()> {
+    if let Err(e) = broadcast_send::start(app, &rec.id).await {
+        warn!(broadcast_id = rec.id, "could not queue broadcast: {e:#}");
+        broadcast_send::fail_pending(app, rec, "the broadcast could not be queued").await;
+        if let Err(e) = app.db().set_broadcast_progress(&rec.id, 0, None).await {
+            warn!(
+                broadcast_id = rec.id,
+                "could not finish failed broadcast: {e:#}"
+            );
+        }
+        return Err(anyhow!(
+            "the broadcast could not be queued for sending; nothing was sent"
+        ));
+    }
+    info!(
+        broadcast_id = rec.id,
+        instance_id = rec.instance_id,
+        recipients = rec.recipients.len(),
+        "broadcast queued"
+    );
+    Ok(())
+}
+
 #[Object]
 impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> MutationRoot<A> {
     /// Approve an OAuth authorization request: the user has seen the consent
@@ -1726,14 +1845,18 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .db()
             .list_inbound_addresses_by_instance(&instance.id)
             .await?;
+        let no_assets = std::collections::HashMap::new();
         let valid = broadcast::validate(
             broadcast::BroadcastInput {
                 from_address: &input.from_address,
                 from_name: input.from_name.as_deref(),
                 subject: &input.subject,
                 body: &input.body,
+                html: None,
+                asset_urls: &no_assets,
                 recipients: &input.recipients,
             },
+            broadcast::Purpose::Send,
             &instance,
             &addresses,
         )?;
@@ -1741,17 +1864,6 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         // anything is queued, rather than failing every batch later. (Copies
         // differ only in their `To:` address.)
         broadcast::build_broadcast_message(&valid, &instance.signature, &valid.recipients[0])?;
-
-        // Addresses on the suppression list (a past hard bounce or
-        // complaint) are recorded as SUPPRESSED and never sent, like every
-        // other instance-mail send skips them. Fails open — see
-        // `crate::suppression`. Each batch checks again before it sends.
-        let suppressed: std::collections::HashMap<String, String> =
-            suppression::find_suppressed(&*self.app, &valid.recipients, "sendBroadcast")
-                .await
-                .into_iter()
-                .map(|s| (s.email.clone(), suppression::describe(&s)))
-                .collect();
 
         let now = crate::clock::now_sec();
         let rec = db::Broadcast {
@@ -1764,44 +1876,262 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             reply_to: valid.reply_to.clone(),
             subject: valid.subject.clone(),
             body_text: valid.body.clone(),
-            recipients: valid
-                .recipients
-                .iter()
-                .map(|email| match suppressed.get(email) {
-                    Some(why) => db::BroadcastRecipient {
-                        send_status: db::BroadcastSendStatus::Suppressed,
-                        error: Some(why.clone()),
-                        ..db::BroadcastRecipient::pending(email)
-                    },
-                    None => db::BroadcastRecipient::pending(email),
-                })
-                .collect(),
+            body_html: None,
+            draft: false,
+            last_test_sent_at: None,
+            recipients: broadcast_recipients(&*self.app, &valid.recipients, "sendBroadcast").await,
             send_seq: 0,
             next_batch_at: Some(now),
         };
         self.app.db().create_broadcast(&rec).await?;
+        queue_broadcast(&*self.app, &rec).await?;
+        Ok(Broadcast::new(rec))
+    }
 
-        if let Err(e) = broadcast_send::start(&*self.app, &rec.id).await {
-            warn!(broadcast_id = rec.id, "could not queue broadcast: {e:#}");
-            broadcast_send::fail_pending(&*self.app, &rec, "the broadcast could not be queued")
-                .await;
-            if let Err(e) = self.app.db().set_broadcast_progress(&rec.id, 0, None).await {
-                warn!(
-                    broadcast_id = rec.id,
-                    "could not finish failed broadcast: {e:#}"
-                );
+    /// Save a broadcast draft — create one (`input.id` absent) or replace
+    /// one's content. **Sends nothing.** A draft is how an HTML broadcast is
+    /// built up: paste or upload the HTML, upload each image it reports
+    /// missing (`createBroadcastAssetUpload`, then save again with
+    /// `assetUrls`), send yourself a test (`sendBroadcastTest`), and only
+    /// then send it (`sendBroadcastDraft`). See CLAUDE.md's "Broadcasts".
+    ///
+    /// Validated like `sendBroadcast` (`broadcast::validate` with
+    /// `Purpose::Draft`), except the recipient list may be empty and images
+    /// may be missing — `Broadcast.missingAssets` lists them. Saving clears
+    /// `lastTestSentAt`: that test no longer shows what would go out. Same
+    /// owner-only guard and `NOT_FOUND` posture as `sendBroadcast`; a draft
+    /// sent in the meantime is `CONFLICT`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn save_broadcast_draft(
+        &self,
+        ctx: &Context<'_>,
+        instance_id: ID,
+        input: SaveBroadcastDraftInput,
+    ) -> Result<Broadcast<A>> {
+        let user_id = require_user_id(ctx)?;
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
+        let addresses = self
+            .app
+            .db()
+            .list_inbound_addresses_by_instance(&instance.id)
+            .await?;
+        let asset_urls: std::collections::HashMap<String, String> = input
+            .asset_urls
+            .iter()
+            .map(|a| (a.path.clone(), a.url.clone()))
+            .collect();
+        let valid = broadcast::validate(
+            broadcast::BroadcastInput {
+                from_address: &input.from_address,
+                from_name: input.from_name.as_deref(),
+                subject: &input.subject,
+                body: &input.body,
+                html: input.html.as_deref(),
+                asset_urls: &asset_urls,
+                recipients: &input.recipients,
+            },
+            broadcast::Purpose::Draft,
+            &instance,
+            &addresses,
+        )?;
+        let existing = match &input.id {
+            Some(id) => Some(broadcast_draft(&*self.app, &instance, id).await?),
+            None => None,
+        };
+        let rec = db::Broadcast {
+            id: existing
+                .as_ref()
+                .map_or_else(crate::dynamodb::new_id, |b| b.id.clone()),
+            instance_id: instance.id.clone(),
+            created_by_user_id: existing
+                .as_ref()
+                .map_or(user_id, |b| b.created_by_user_id.clone()),
+            created_at: existing
+                .as_ref()
+                .map_or_else(crate::clock::now_sec, |b| b.created_at),
+            from_address: valid.from_address,
+            from_name: valid.from_name,
+            reply_to: valid.reply_to,
+            subject: valid.subject,
+            body_text: valid.body,
+            body_html: valid.html,
+            draft: true,
+            last_test_sent_at: None,
+            recipients: valid
+                .recipients
+                .iter()
+                .map(db::BroadcastRecipient::pending)
+                .collect(),
+            send_seq: 0,
+            next_batch_at: None,
+        };
+        if existing.is_some() {
+            if !self.app.db().update_broadcast_draft(&rec).await? {
+                return Err(ApiError::conflict(
+                    "This draft was sent or deleted while you were editing it",
+                )
+                .into());
             }
+        } else {
+            self.app.db().create_broadcast(&rec).await?;
+        }
+        Ok(Broadcast::new(rec))
+    }
+
+    /// Send a test copy of a saved draft to `to` (at most 5 addresses, the
+    /// owner's own, typically) — built exactly as the real copies will be,
+    /// subject prefixed `[TEST]`. **Sends email**, but only to `to`: never
+    /// to the draft's recipients, never recorded as one of them, and not
+    /// tagged for delivery tracking. A draft with missing images is refused,
+    /// and so is a suppressed test address (`CONFLICT`, naming it — pick
+    /// another). Sending is this mutation's whole effect, so a send failure
+    /// fails it. Records `lastTestSentAt`. Same guard and posture as
+    /// `saveBroadcastDraft`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn send_broadcast_test(
+        &self,
+        instance_id: ID,
+        broadcast_id: ID,
+        to: Vec<String>,
+    ) -> Result<Broadcast<A>> {
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
+        let mut rec = broadcast_draft(&*self.app, &instance, &broadcast_id).await?;
+        let addresses = self
+            .app
+            .db()
+            .list_inbound_addresses_by_instance(&instance.id)
+            .await?;
+        let valid = validate_draft(&rec, broadcast::Purpose::Test, &instance, &addresses)?;
+        let to = broadcast::normalize_recipients(&to, &addresses)?;
+        if to.len() > MAX_BROADCAST_TEST_RECIPIENTS {
             return Err(anyhow!(
-                "the broadcast could not be queued for sending; nothing was sent"
+                "at most {MAX_BROADCAST_TEST_RECIPIENTS} test addresses"
             ));
+        }
+        refuse_suppressed_recipients(&*self.app, &to, &[], "sendBroadcastTest").await?;
+        for address in &to {
+            let msg = broadcast::build_test_message(&valid, &instance.signature, address)?;
+            self.app
+                .mail()
+                .send_raw(&msg.raw, &msg.to, &msg.cc)
+                .await
+                .with_context(|| format!("sending the test to {address}"))?;
+        }
+        let now = crate::clock::now_sec();
+        if self.app.db().set_broadcast_test_sent(&rec.id, now).await? {
+            rec.last_test_sent_at = Some(now);
         }
         info!(
             broadcast_id = rec.id,
             instance_id = rec.instance_id,
-            recipients = rec.recipients.len(),
-            "broadcast queued"
+            test_recipients = to.len(),
+            "broadcast test sent"
         );
         Ok(Broadcast::new(rec))
+    }
+
+    /// Send a saved draft for real: the same as `sendBroadcast` from here
+    /// on (one copy per recipient, queued and sent in paced batches, a
+    /// reply opens a new ticket). **Sends customer email that cannot be
+    /// unsent.** Re-validated in full first (`Purpose::Send`: at least one
+    /// recipient, no missing image). The draft turns into the sent
+    /// broadcast in one conditional write, so a second call — a double
+    /// click — is `CONFLICT`, never a second send. Same guard and posture as
+    /// `saveBroadcastDraft`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn send_broadcast_draft(
+        &self,
+        instance_id: ID,
+        broadcast_id: ID,
+    ) -> Result<Broadcast<A>> {
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
+        let mut rec = broadcast_draft(&*self.app, &instance, &broadcast_id).await?;
+        let addresses = self
+            .app
+            .db()
+            .list_inbound_addresses_by_instance(&instance.id)
+            .await?;
+        let valid = validate_draft(&rec, broadcast::Purpose::Send, &instance, &addresses)?;
+        // As in `sendBroadcast`: fail on a MIME error now, not in every batch.
+        broadcast::build_broadcast_message(&valid, &instance.signature, &valid.recipients[0])?;
+
+        let recipients =
+            broadcast_recipients(&*self.app, &valid.recipients, "sendBroadcastDraft").await;
+        let now = crate::clock::now_sec();
+        if !self
+            .app
+            .db()
+            .start_broadcast_draft(&rec.id, &recipients, now)
+            .await?
+        {
+            return Err(ApiError::conflict("This broadcast has already been sent").into());
+        }
+        rec.draft = false;
+        rec.recipients = recipients;
+        rec.created_at = now;
+        rec.send_seq = 0;
+        rec.next_batch_at = Some(now);
+        queue_broadcast(&*self.app, &rec).await?;
+        Ok(Broadcast::new(rec))
+    }
+
+    /// Delete a draft broadcast. A sent broadcast is a record and can't be
+    /// deleted (`CONFLICT`). Same guard and posture as `saveBroadcastDraft`.
+    /// Its uploaded images stay where they are — they're write-once.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn delete_broadcast_draft(&self, instance_id: ID, broadcast_id: ID) -> Result<ID> {
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
+        let rec = broadcast_draft(&*self.app, &instance, &broadcast_id).await?;
+        if !self.app.db().delete_broadcast_draft(&rec.id).await? {
+            return Err(ApiError::conflict("This broadcast has already been sent").into());
+        }
+        Ok(ID(rec.id))
+    }
+
+    /// Presign an upload of one image an HTML broadcast shows. The file goes
+    /// to the **public** email-assets bucket under
+    /// `email-assets/{instance_id}/{random}/{filename}` and is served from the
+    /// web app's own origin at `url` — permanently: assets are write-once and
+    /// never deleted, so mail already sent keeps rendering. PNG, JPEG, GIF or
+    /// WebP, at most 5 MB (`size` is signed into the upload, which must match
+    /// it). Same owner-only guard and `NOT_FOUND` posture as `sendBroadcast`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
+    async fn create_broadcast_asset_upload(
+        &self,
+        instance_id: ID,
+        filename: String,
+        content_type: String,
+        size: i64,
+    ) -> Result<BroadcastAssetUpload> {
+        let instance = broadcast_instance(&*self.app, &instance_id).await?;
+        let content_type = content_type.trim().to_ascii_lowercase();
+        if !BROADCAST_ASSET_TYPES.contains(&content_type.as_str()) {
+            return Err(anyhow!(
+                "{filename}: only PNG, JPEG, GIF and WebP images can be used in a broadcast"
+            ));
+        }
+        if !(1..=MAX_BROADCAST_ASSET_BYTES).contains(&size) {
+            return Err(anyhow!(
+                "{filename}: an image must be at most {} MB",
+                MAX_BROADCAST_ASSET_BYTES / (1024 * 1024)
+            ));
+        }
+        let name = filename.rsplit(['/', '\\']).next().unwrap_or(&filename);
+        let key = format!(
+            "email-assets/{}/{}/{}",
+            instance.id,
+            crate::dynamodb::new_id(),
+            crate::storage::sanitize_download_filename(name)
+        );
+        let upload_url = self
+            .app
+            .storage()
+            .presign_put_public_asset(&key, &content_type, size as u64)
+            .await?;
+        Ok(BroadcastAssetUpload {
+            upload_url,
+            url: format!("{}/{key}", staff_notify::app_base_url()),
+        })
     }
 
     /// Save a From name + address to pick from when drafting a broadcast

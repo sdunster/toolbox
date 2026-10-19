@@ -85,6 +85,11 @@ pub async fn run_batch<A: HasDb + HasMail + HasQueue + Sync>(
         warn!(broadcast_id, seq, "broadcast batch for a missing broadcast");
         return Ok(BatchOutcome::Missing);
     };
+    if rec.draft {
+        // Nothing queues a draft's batches; a job naming one is a bug.
+        warn!(broadcast_id, seq, "broadcast batch for a draft; dropping");
+        return Ok(BatchOutcome::Missing);
+    }
     if rec.send_seq > seq {
         info!(
             broadcast_id,

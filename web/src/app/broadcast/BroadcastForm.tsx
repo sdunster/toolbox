@@ -8,6 +8,8 @@ import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
 import { inputBase } from "../../components/ui/inputStyles";
+import { SenderFields } from "./SenderFields";
+import { initialSenderChoice, resolveSender } from "./senderChoice";
 import {
   BROADCAST_BATCH_INTERVAL_SECS,
   BROADCAST_BATCH_SIZE,
@@ -23,9 +25,6 @@ import {
 import { relayMutationErrorMessage } from "../../lib/relayMutationError";
 
 type SentBroadcast = BroadcastFormMutation$data["sendBroadcast"];
-
-/** The "Send as" option for typing an address instead of a saved sender. */
-const CUSTOM_SENDER = "";
 
 /**
  * Compose and send a broadcast (`sendBroadcast`). Sending is irreversible,
@@ -50,11 +49,10 @@ export function BroadcastForm({
   onSent: () => void;
 }) {
   const id = useId();
-  const [senderId, setSenderId] = useState(senders[0]?.id ?? CUSTOM_SENDER);
+  const [senderChoice, setSenderChoice] = useState(() =>
+    initialSenderChoice(senders, domains),
+  );
   const [recipientsText, setRecipientsText] = useState("");
-  const [localPart, setLocalPart] = useState("");
-  const [domain, setDomain] = useState(domains[0] ?? "");
-  const [fromName, setFromName] = useState("");
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("");
   const [reviewing, setReviewing] = useState(false);
@@ -88,18 +86,17 @@ export function BroadcastForm({
     [recipientsText],
   );
   const invalid = invalidRecipients(recipients);
-  // A sender removed since it was picked falls back to typing one.
-  const sender = senders.find((s) => s.id === senderId);
-  const fromAddress = sender
-    ? sender.address
-    : `${localPart.trim().toLowerCase()}@${domain}`;
-  const effectiveFromName = sender ? sender.name : fromName.trim();
+  const {
+    fromAddress,
+    fromName: effectiveFromName,
+    complete: senderComplete,
+  } = resolveSender(senderChoice, senders);
   const tooMany = recipients.length > MAX_BROADCAST_RECIPIENTS;
   const canReview =
     recipients.length > 0 &&
     !tooMany &&
     invalid.length === 0 &&
-    (sender !== undefined || (localPart.trim() !== "" && domain !== "")) &&
+    senderComplete &&
     subject.trim() !== "" &&
     body.trim() !== "";
 
@@ -224,63 +221,14 @@ export function BroadcastForm({
           </p>
         </FormField>
 
-        {senders.length > 0 && (
-          <FormField label="Send as" htmlFor={`${id}-sender`}>
-            <select
-              id={`${id}-sender`}
-              className={inputBase}
-              value={sender ? senderId : CUSTOM_SENDER}
-              onChange={(e) => setSenderId(e.target.value)}
-            >
-              {senders.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {formatSender(s)}
-                </option>
-              ))}
-              <option value={CUSTOM_SENDER}>Another address…</option>
-            </select>
-          </FormField>
-        )}
-
-        {!sender && (
-          <div className="grid gap-4 sm:grid-cols-2">
-            <FormField label="From address" htmlFor={`${id}-from`}>
-              <div className="flex items-center gap-1">
-                <TextInput
-                  id={`${id}-from`}
-                  placeholder="news"
-                  value={localPart}
-                  onChange={(e) => setLocalPart(e.target.value)}
-                />
-                <span className="text-sm text-ink-muted">@</span>
-                {domains.length === 1 ? (
-                  <span className="text-sm text-ink">{domain}</span>
-                ) : (
-                  <select
-                    aria-label="From domain"
-                    className={inputBase}
-                    value={domain}
-                    onChange={(e) => setDomain(e.target.value)}
-                  >
-                    {domains.map((d) => (
-                      <option key={d} value={d}>
-                        {d}
-                      </option>
-                    ))}
-                  </select>
-                )}
-              </div>
-            </FormField>
-            <FormField label="From name" htmlFor={`${id}-from-name`}>
-              <TextInput
-                id={`${id}-from-name`}
-                placeholder={defaultFromName}
-                value={fromName}
-                onChange={(e) => setFromName(e.target.value)}
-              />
-            </FormField>
-          </div>
-        )}
+        <SenderFields
+          id={id}
+          choice={senderChoice}
+          onChange={setSenderChoice}
+          senders={senders}
+          domains={domains}
+          defaultFromName={defaultFromName}
+        />
 
         <FormField label="Subject" htmlFor={`${id}-subject`}>
           <TextInput

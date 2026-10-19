@@ -183,7 +183,33 @@ type Broadcast {
 	fromName: String!
 	replyTo: String!
 	subject: String!
+	"""
+	The plain-text body — for an HTML broadcast, its own plain-text
+	version, empty when it uses one derived from the HTML.
+	"""
 	body: String!
+	"""
+	An HTML broadcast's body as it is (or will be) sent: sanitized, with
+	every uploaded image at its hosted URL (`broadcast_html::process`).
+	`null` for a plain-text broadcast. Render it only somewhere it can't
+	run as the viewer — the web app uses a sandboxed `<iframe>`.
+	"""
+	html: String
+	"""
+	Relative images in `html` with no uploaded file yet. A draft with any
+	can't be test-sent or sent.
+	"""
+	missingAssets: [String!]!
+	"""
+	Saved but not sent (`saveBroadcastDraft`) — nothing is queued until
+	`sendBroadcastDraft`.
+	"""
+	isDraft: Boolean!
+	"""
+	When a test copy of this version of the draft was last sent
+	(`sendBroadcastTest`); `null` if never, or if it was edited since.
+	"""
+	lastTestSentAt: Int
 	createdAt: Int!
 	recipients: [BroadcastRecipient!]!
 	recipientCount: Int!
@@ -228,6 +254,25 @@ type Broadcast {
 	Dataloaded — see [`TicketMessage::author`]'s doc comment.
 	"""
 	createdBy: User
+}
+
+"""
+`createBroadcastAssetUpload`'s result: PUT the file's bytes to
+`uploadUrl` (with the same `Content-Type`, and exactly the declared
+size), then reference it as `url` — its permanent public address.
+"""
+type BroadcastAssetUpload {
+	uploadUrl: String!
+	url: String!
+}
+
+"""
+One relative image path in a draft's HTML (`images/logo.png`) and the
+public URL its file was uploaded to.
+"""
+input BroadcastAssetUrlInput {
+	path: String!
+	url: String!
 }
 
 """
@@ -695,6 +740,12 @@ type Instance {
 	"""
 	broadcasts(first: Int! = 25): [Broadcast!]!
 	"""
+	One of this instance's broadcasts (a draft, typically, to edit it),
+	or `null` if there's no such broadcast here. Owner-only, like
+	[`Self::broadcasts`].
+	"""
+	broadcast(id: ID!): Broadcast
+	"""
 	The domains a broadcast from this instance may be sent from — the
 	domains of its inbound addresses (`broadcast::instance_mail_domains`).
 	Owner-only, like [`Self::broadcasts`]; empty for an invoicing
@@ -1098,6 +1149,61 @@ type MutationRoot {
 	and the mutation fails — nothing has been sent.
 	"""
 	sendBroadcast(instanceId: ID!, input: SendBroadcastInput!): Broadcast!
+	"""
+	Save a broadcast draft — create one (`input.id` absent) or replace
+	one's content. **Sends nothing.** A draft is how an HTML broadcast is
+	built up: paste or upload the HTML, upload each image it reports
+	missing (`createBroadcastAssetUpload`, then save again with
+	`assetUrls`), send yourself a test (`sendBroadcastTest`), and only
+	then send it (`sendBroadcastDraft`). See CLAUDE.md's "Broadcasts".
+	
+	Validated like `sendBroadcast` (`broadcast::validate` with
+	`Purpose::Draft`), except the recipient list may be empty and images
+	may be missing — `Broadcast.missingAssets` lists them. Saving clears
+	`lastTestSentAt`: that test no longer shows what would go out. Same
+	owner-only guard and `NOT_FOUND` posture as `sendBroadcast`; a draft
+	sent in the meantime is `CONFLICT`.
+	"""
+	saveBroadcastDraft(instanceId: ID!, input: SaveBroadcastDraftInput!): Broadcast!
+	"""
+	Send a test copy of a saved draft to `to` (at most 5 addresses, the
+	owner's own, typically) — built exactly as the real copies will be,
+	subject prefixed `[TEST]`. **Sends email**, but only to `to`: never
+	to the draft's recipients, never recorded as one of them, and not
+	tagged for delivery tracking. A draft with missing images is refused,
+	and so is a suppressed test address (`CONFLICT`, naming it — pick
+	another). Sending is this mutation's whole effect, so a send failure
+	fails it. Records `lastTestSentAt`. Same guard and posture as
+	`saveBroadcastDraft`.
+	"""
+	sendBroadcastTest(instanceId: ID!, broadcastId: ID!, to: [String!]!): Broadcast!
+	"""
+	Send a saved draft for real: the same as `sendBroadcast` from here
+	on (one copy per recipient, queued and sent in paced batches, a
+	reply opens a new ticket). **Sends customer email that cannot be
+	unsent.** Re-validated in full first (`Purpose::Send`: at least one
+	recipient, no missing image). The draft turns into the sent
+	broadcast in one conditional write, so a second call — a double
+	click — is `CONFLICT`, never a second send. Same guard and posture as
+	`saveBroadcastDraft`.
+	"""
+	sendBroadcastDraft(instanceId: ID!, broadcastId: ID!): Broadcast!
+	"""
+	Delete a draft broadcast. A sent broadcast is a record and can't be
+	deleted (`CONFLICT`). Same guard and posture as `saveBroadcastDraft`.
+	Its uploaded images stay where they are — they're write-once.
+	"""
+	deleteBroadcastDraft(instanceId: ID!, broadcastId: ID!): ID!
+	"""
+	Presign an upload of one image an HTML broadcast shows. The file goes
+	to the **public** email-assets bucket under
+	`email-assets/{instance_id}/{random}/{filename}` and is served from the
+	web app's own origin at `url` — permanently: assets are write-once and
+	never deleted, so mail already sent keeps rendering. PNG, JPEG, GIF or
+	WebP, at most 5 MB (`size` is signed into the upload, which must match
+	it). Same owner-only guard and `NOT_FOUND` posture as `sendBroadcast`.
+	"""
+	createBroadcastAssetUpload(instanceId: ID!, filename: String!, contentType: String!, size: Int!): BroadcastAssetUpload!
 	"""
 	Save a From name + address to pick from when drafting a broadcast
 	(`Instance.broadcastSenders`), e.g. `SES Activity Updates
@@ -2208,6 +2314,28 @@ enum ReportBasisType {
 	By issue date.
 	"""
 	ACCRUAL
+}
+
+"""
+`saveBroadcastDraft`'s argument: the whole draft, every time (a full
+replace, like `updateInvoicingSettings`). `id` absent creates a new
+draft. `html` absent makes it a plain-text broadcast; with `html`,
+`body` is the optional plain-text version (blank derives one). See
+`broadcast::validate` and `broadcast_html::process`.
+"""
+input SaveBroadcastDraftInput {
+	id: ID
+	fromAddress: String!
+	fromName: String
+	subject: String!
+	body: String! = ""
+	html: String
+	"""
+	Uploaded images for the HTML's relative references
+	(`createBroadcastAssetUpload`), applied by rewriting them to `url`.
+	"""
+	assetUrls: [BroadcastAssetUrlInput!]! = []
+	recipients: [String!]! = []
 }
 
 """

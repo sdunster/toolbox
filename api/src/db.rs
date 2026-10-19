@@ -1365,7 +1365,26 @@ pub struct Broadcast {
     pub from_name: String,
     pub reply_to: String,
     pub subject: String,
+    /// The plain-text body. For an HTML broadcast, the `text/plain`
+    /// alternative the owner wrote — empty (and not stored) when they didn't,
+    /// in which case one is derived from the HTML at build time
+    /// (`broadcast_html::html_to_text`).
     pub body_text: String,
+    /// An HTML broadcast's body, already processed by
+    /// `broadcast_html::process` (sanitized, images rewritten to their hosted
+    /// URLs). `None` for a plain-text broadcast. At most
+    /// `broadcast_html::MAX_HTML_BYTES`, so the row stays well inside
+    /// DynamoDB's 400 KB item limit alongside every recipient's status.
+    pub body_html: Option<String>,
+    /// A draft: saved, editable, test-sendable, and not queued — no batch
+    /// job exists for it, and every recipient is `pending`. Stored as
+    /// `status = "draft"`, absent once sent (and on every broadcast written
+    /// before drafts existed). `sendBroadcastDraft` flips it, once.
+    pub draft: bool,
+    /// When a test copy of this draft was last sent (`sendBroadcastTest`).
+    /// Removed whenever the draft is saved again, since that test no longer
+    /// shows what would go out.
+    pub last_test_sent_at: Option<u64>,
     pub recipients: Vec<BroadcastRecipient>,
     /// The batch chain's position: the `seq` of the next
     /// `queue::Job::BroadcastBatch` expected. A job whose `seq` is below it
@@ -2823,7 +2842,8 @@ pub trait Handler: Sync {
 
     // ── broadcast ─────────────────────────────────────────────────────────
     /// `Put` a new broadcast (`attribute_not_exists(id)`), every recipient
-    /// `pending` or `suppressed`, with its `send_seq`/`next_batch_at`.
+    /// `pending` or `suppressed`, with its `send_seq`/`next_batch_at` — or a
+    /// new draft (`draft`, no `next_batch_at`).
     fn create_broadcast(&self, broadcast: &Broadcast) -> impl Future<Output = Result<()>> + Send;
     /// Claim recipient `index` for sending: `pending` → `sending`, conditioned
     /// on it still being `pending`. `Ok(false)` when it isn't (already
@@ -2880,6 +2900,36 @@ pub trait Handler: Sync {
         &self,
         id: &str,
     ) -> impl Future<Output = Result<Option<Broadcast>>> + Send;
+    /// Replace a draft broadcast's content (`Put` of the whole row, so
+    /// `last_test_sent_at` is dropped unless `broadcast` carries it),
+    /// conditioned on the stored row still being a draft. `Ok(false)` when
+    /// it's gone or has been sent.
+    fn update_broadcast_draft(
+        &self,
+        broadcast: &Broadcast,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Record a test send of a draft (`last_test_sent_at`), conditioned on it
+    /// still being a draft. `Ok(false)` otherwise.
+    fn set_broadcast_test_sent(
+        &self,
+        id: &str,
+        at: u64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Turn a draft into a queued broadcast: `REMOVE status`, write the
+    /// final `recipients` (every one `pending` or `suppressed`), and set
+    /// `created_at`/`next_batch_at` to `now` and `send_seq` to 0 — conditioned
+    /// on it still being a draft, so a double click can't queue it twice.
+    /// `Ok(false)` when it's gone or already sent.
+    fn start_broadcast_draft(
+        &self,
+        id: &str,
+        recipients: &[BroadcastRecipient],
+        now: u64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Delete a draft, conditioned on it still being one. `Ok(false)` when
+    /// it's gone or has been sent — a sent broadcast is a record, never
+    /// deleted.
+    fn delete_broadcast_draft(&self, id: &str) -> impl Future<Output = Result<bool>> + Send;
     /// An instance's broadcasts, newest `created_at` first, at most `limit`.
     fn list_broadcasts(
         &self,

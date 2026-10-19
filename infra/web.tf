@@ -134,6 +134,14 @@ resource "aws_cloudfront_distribution" "web" {
     }
   }
 
+  # HTML broadcast images (s3_email_assets.tf), through the same OAC — an
+  # OAC isn't tied to one bucket.
+  origin {
+    origin_id                = "email-assets-s3"
+    domain_name              = aws_s3_bucket.email_assets.bucket_regional_domain_name
+    origin_access_control_id = aws_cloudfront_origin_access_control.web.id
+  }
+
   default_cache_behavior {
     target_origin_id       = "web-s3"
     viewer_protocol_policy = "redirect-to-https"
@@ -164,6 +172,21 @@ resource "aws_cloudfront_distribution" "web" {
     cached_methods         = ["GET", "HEAD"]
     compress               = true
     cache_policy_id        = "658327ea-f89d-4fab-a63d-7e88639e58f6" # managed: CachingOptimized
+  }
+
+  # Images in sent broadcasts. Write-once keys (a random id per upload), so
+  # long caching is safe, like /assets/*. The managed SecurityHeadersPolicy
+  # adds `X-Content-Type-Options: nosniff`, so an object is only ever the
+  # image type its upload was signed for.
+  ordered_cache_behavior {
+    path_pattern               = "/email-assets/*"
+    target_origin_id           = "email-assets-s3"
+    viewer_protocol_policy     = "redirect-to-https"
+    allowed_methods            = ["GET", "HEAD"]
+    cached_methods             = ["GET", "HEAD"]
+    compress                   = true
+    cache_policy_id            = "658327ea-f89d-4fab-a63d-7e88639e58f6" # managed: CachingOptimized
+    response_headers_policy_id = "67f7725c-6f97-4210-82d7-5512b31e9d03" # managed: SecurityHeadersPolicy
   }
 
   # Never cached (managed CachingDisabled policy). The custom_error_response

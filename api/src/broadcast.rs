@@ -22,12 +22,13 @@
 //!   headers), and an auto-reply that ignores them is still dropped by
 //!   `mailloop::check_structural` when it arrives marked as one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mail_builder::MessageBuilder;
 use mail_builder::headers::raw::Raw;
 
+use crate::broadcast_html;
 use crate::db;
 use crate::outbound::{self, BuiltMessage};
 
@@ -70,8 +71,29 @@ pub struct BroadcastInput<'a> {
     pub from_address: &'a str,
     pub from_name: Option<&'a str>,
     pub subject: &'a str,
+    /// The plain-text body — for an HTML broadcast, the optional `text/plain`
+    /// alternative (blank derives one from the HTML).
     pub body: &'a str,
+    /// An HTML body (`broadcast_html::process` runs on it), or `None` for a
+    /// plain-text broadcast.
+    pub html: Option<&'a str>,
+    /// Uploaded images for the HTML's relative references: relative path →
+    /// public URL (`createBroadcastAssetUpload`).
+    pub asset_urls: &'a HashMap<String, String>,
     pub recipients: &'a [String],
+}
+
+/// What a broadcast is being validated for — how complete it must be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Purpose {
+    /// Saving a draft: the recipient list may still be empty, and images may
+    /// still be missing (each one is reported, not refused).
+    Draft,
+    /// A test copy to the owner's own addresses: the recipient list is not
+    /// used, but every image must be uploaded.
+    Test,
+    /// The real thing: at least one recipient and no missing image.
+    Send,
 }
 
 /// A broadcast that passed [`validate`] — everything needed to build and
@@ -82,7 +104,14 @@ pub struct ValidBroadcast {
     pub from_name: String,
     pub reply_to: String,
     pub subject: String,
+    /// Plain-text body, or an HTML broadcast's own `text/plain` alternative
+    /// (empty when it has none — [`build_broadcast_message`] derives one).
     pub body: String,
+    /// The processed HTML body, if this is an HTML broadcast.
+    pub html: Option<String>,
+    /// Relative images in `html` with no uploaded file — only ever non-empty
+    /// for [`Purpose::Draft`].
+    pub missing_assets: Vec<String>,
     pub recipients: Vec<String>,
 }
 
@@ -97,6 +126,8 @@ impl ValidBroadcast {
             reply_to: rec.reply_to.clone(),
             subject: rec.subject.clone(),
             body: rec.body_text.clone(),
+            html: rec.body_html.clone(),
+            missing_assets: Vec::new(),
             recipients: rec.recipients.iter().map(|r| r.email.clone()).collect(),
         }
     }
@@ -145,9 +176,11 @@ pub fn reply_to_address(addresses: &[db::InboundAddress], from: &str) -> Option<
 }
 
 /// Validate and normalize a broadcast request against the instance's
-/// inbound addresses. Errors are user-facing messages.
+/// inbound addresses, as complete as `purpose` needs it. Errors are
+/// user-facing messages.
 pub fn validate(
     input: BroadcastInput<'_>,
+    purpose: Purpose,
     instance: &db::Instance,
     addresses: &[db::InboundAddress],
 ) -> Result<ValidBroadcast> {
@@ -172,14 +205,44 @@ pub fn validate(
     }
 
     let body = input.body.trim().to_string();
-    if body.is_empty() {
-        bail!("body cannot be empty");
-    }
+    let (html, missing_assets) = match input.html {
+        None => {
+            if body.is_empty() {
+                bail!("body cannot be empty");
+            }
+            (None, Vec::new())
+        }
+        Some(html) => {
+            let processed = broadcast_html::process(html, input.asset_urls)?;
+            if body.len() + processed.html.len() > broadcast_html::MAX_HTML_BYTES {
+                bail!(
+                    "the HTML and its plain-text version are too large together (at most {} KB)",
+                    broadcast_html::MAX_HTML_BYTES / 1000
+                );
+            }
+            (Some(processed.html), processed.missing_assets)
+        }
+    };
     if body.chars().count() > MAX_BODY_CHARS {
         bail!("body is too long (at most {MAX_BODY_CHARS} characters)");
     }
+    if purpose != Purpose::Draft && !missing_assets.is_empty() {
+        bail!(
+            "upload the missing images first: {}",
+            missing_assets.join(", ")
+        );
+    }
 
-    let recipients = normalize_recipients(input.recipients, addresses)?;
+    let recipients = match purpose {
+        Purpose::Send => normalize_recipients(input.recipients, addresses)?,
+        Purpose::Draft | Purpose::Test => {
+            if input.recipients.iter().all(|r| r.trim().is_empty()) {
+                Vec::new()
+            } else {
+                normalize_recipients(input.recipients, addresses)?
+            }
+        }
+    };
 
     Ok(ValidBroadcast {
         from_address,
@@ -187,6 +250,8 @@ pub fn validate(
         reply_to,
         subject,
         body,
+        html,
+        missing_assets,
         recipients,
     })
 }
@@ -334,8 +399,8 @@ pub fn build_broadcast_message(
         .header("X-Auto-Response-Suppress", Raw::new("OOF, AutoReply"))
         .header("Precedence", Raw::new("bulk"))
         .header("X-Toolbox-Loop", Raw::new("1"))
-        .text_body(outbound::render_text(&broadcast.body, signature))
-        .html_body(outbound::render_html(&broadcast.body, signature))
+        .text_body(text_part(broadcast, signature))
+        .html_body(html_part(broadcast, signature))
         .write_to_vec()
         .context("building broadcast MIME message")?;
     Ok(BuiltMessage {
@@ -343,6 +408,38 @@ pub fn build_broadcast_message(
         to: vec![recipient.to_string()],
         cc: Vec::new(),
     })
+}
+
+/// The `text/plain` part. A plain-text broadcast gets the instance signature
+/// appended, like every other instance mail. An HTML broadcast gets the
+/// owner's own alternative, or one derived from the HTML — and no signature
+/// in either part: the design is sent as authored.
+fn text_part(broadcast: &ValidBroadcast, signature: &str) -> String {
+    match &broadcast.html {
+        None => outbound::render_text(&broadcast.body, signature),
+        Some(_) if !broadcast.body.is_empty() => broadcast.body.clone(),
+        Some(html) => broadcast_html::html_to_text(html),
+    }
+}
+
+fn html_part(broadcast: &ValidBroadcast, signature: &str) -> String {
+    match &broadcast.html {
+        None => outbound::render_html(&broadcast.body, signature),
+        Some(html) => html.clone(),
+    }
+}
+
+/// A test copy of `broadcast` for `to` (`sendBroadcastTest`): built exactly
+/// like a real one, so it shows what recipients will get, with the subject
+/// prefixed `[TEST]` so it can't be mistaken for the real send.
+pub fn build_test_message(
+    broadcast: &ValidBroadcast,
+    signature: &str,
+    to: &str,
+) -> Result<BuiltMessage> {
+    let mut test = broadcast.clone();
+    test.subject = format!("[TEST] {}", broadcast.subject);
+    build_broadcast_message(&test, signature, to)
 }
 
 /// The SES message tags for recipient `index` of broadcast `broadcast_id`.
@@ -395,12 +492,17 @@ mod tests {
         vec![addr("support@seslogin.test", db::AddressKind::Exact, 1)]
     }
 
+    static NO_ASSETS: std::sync::LazyLock<HashMap<String, String>> =
+        std::sync::LazyLock::new(HashMap::new);
+
     fn input<'a>(from: &'a str, recipients: &'a [String]) -> BroadcastInput<'a> {
         BroadcastInput {
             from_address: from,
             from_name: None,
             subject: "New in seslogin: location check-in",
             body: "Hello!\nWe've shipped something.",
+            html: None,
+            asset_urls: &NO_ASSETS,
             recipients,
         }
     }
@@ -424,14 +526,26 @@ mod tests {
     #[test]
     fn any_local_part_on_the_instance_domain_is_accepted() {
         let r = emails(&["a@example.com"]);
-        let v = validate(input("News@SESLOGIN.test", &r), &instance(), &exact_only()).unwrap();
+        let v = validate(
+            input("News@SESLOGIN.test", &r),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
         assert_eq!(v.from_address, "news@seslogin.test");
     }
 
     #[test]
     fn a_foreign_domain_is_refused() {
         let r = emails(&["a@example.com"]);
-        let err = validate(input("news@example.org", &r), &instance(), &exact_only()).unwrap_err();
+        let err = validate(
+            input("news@example.org", &r),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("seslogin.test"), "{err}");
     }
 
@@ -440,6 +554,7 @@ mod tests {
         let r = emails(&["a@example.com"]);
         let err = validate(
             input("support+tABC.tok@seslogin.test", &r),
+            Purpose::Send,
             &instance(),
             &exact_only(),
         )
@@ -475,7 +590,13 @@ mod tests {
     #[test]
     fn reply_to_never_carries_a_tag_and_always_routes_to_the_instance() {
         let r = emails(&["a@example.com"]);
-        let v = validate(input("news@seslogin.test", &r), &instance(), &exact_only()).unwrap();
+        let v = validate(
+            input("news@seslogin.test", &r),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
         assert_eq!(v.reply_to, "support@seslogin.test");
         let n = routing::normalize_recipient(&v.reply_to);
         assert_eq!(n.tag, None);
@@ -485,11 +606,17 @@ mod tests {
     #[test]
     fn from_name_defaults_to_the_instance_from_name() {
         let r = emails(&["a@example.com"]);
-        let v = validate(input("news@seslogin.test", &r), &instance(), &exact_only()).unwrap();
+        let v = validate(
+            input("news@seslogin.test", &r),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
         assert_eq!(v.from_name, "seslogin Support");
         let mut i = input("news@seslogin.test", &r);
         i.from_name = Some("  The seslogin team ");
-        let v = validate(i, &instance(), &exact_only()).unwrap();
+        let v = validate(i, Purpose::Send, &instance(), &exact_only()).unwrap();
         assert_eq!(v.from_name, "The seslogin team");
     }
 
@@ -563,7 +690,7 @@ mod tests {
         let r = emails(&["a@example.com"]);
         let mut i = input("news@seslogin.test", &r);
         i.subject = "Update on [#seslogin-12]";
-        assert!(validate(i, &instance(), &exact_only()).is_err());
+        assert!(validate(i, Purpose::Send, &instance(), &exact_only()).is_err());
     }
 
     #[test]
@@ -571,7 +698,7 @@ mod tests {
         let r = emails(&["a@example.com"]);
         let mut i = input("news@seslogin.test", &r);
         i.subject = "Hello\r\nBcc: everyone@example.com";
-        assert!(validate(i, &instance(), &exact_only()).is_err());
+        assert!(validate(i, Purpose::Send, &instance(), &exact_only()).is_err());
     }
 
     #[test]
@@ -579,10 +706,10 @@ mod tests {
         let r = emails(&["a@example.com"]);
         let mut i = input("news@seslogin.test", &r);
         i.subject = "   ";
-        assert!(validate(i, &instance(), &exact_only()).is_err());
+        assert!(validate(i, Purpose::Send, &instance(), &exact_only()).is_err());
         let mut i = input("news@seslogin.test", &r);
         i.body = "\n";
-        assert!(validate(i, &instance(), &exact_only()).is_err());
+        assert!(validate(i, Purpose::Send, &instance(), &exact_only()).is_err());
     }
 
     // ── recipients ───────────────────────────────────────────────────────
@@ -628,7 +755,13 @@ mod tests {
     #[test]
     fn built_message_is_addressed_to_one_recipient_with_suppression_headers_and_no_tags() {
         let r = emails(&["one@example.com", "two@example.com"]);
-        let v = validate(input("news@seslogin.test", &r), &instance(), &exact_only()).unwrap();
+        let v = validate(
+            input("news@seslogin.test", &r),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
         let built = build_broadcast_message(&v, &instance().signature, "two@example.com").unwrap();
         assert_eq!(built.to, vec!["two@example.com"]);
         assert!(built.cc.is_empty());
@@ -681,7 +814,13 @@ mod tests {
     #[test]
     fn from_record_rebuilds_what_validate_produced() {
         let r = emails(&["one@example.com", "two@example.com"]);
-        let v = validate(input("news@seslogin.test", &r), &instance(), &exact_only()).unwrap();
+        let v = validate(
+            input("news@seslogin.test", &r),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
         let rec = db::Broadcast {
             id: "b1".to_string(),
             instance_id: "inst1".to_string(),
@@ -692,6 +831,9 @@ mod tests {
             reply_to: v.reply_to.clone(),
             subject: v.subject.clone(),
             body_text: v.body.clone(),
+            body_html: v.html.clone(),
+            draft: false,
+            last_test_sent_at: None,
             recipients: v
                 .recipients
                 .iter()
@@ -712,5 +854,141 @@ mod tests {
                 ("broadcast_recipient".to_string(), "7".to_string()),
             ]
         );
+    }
+
+    // ── HTML ─────────────────────────────────────────────────────────────
+
+    const HTML: &str = r#"<html><body><h1>Big news</h1><p>Shipped.</p>
+        <img src="images/logo.png"></body></html>"#;
+
+    fn html_input<'a>(
+        recipients: &'a [String],
+        assets: &'a HashMap<String, String>,
+    ) -> BroadcastInput<'a> {
+        BroadcastInput {
+            body: "",
+            html: Some(HTML),
+            asset_urls: assets,
+            ..input("news@seslogin.test", recipients)
+        }
+    }
+
+    fn logo_hosted() -> HashMap<String, String> {
+        HashMap::from([(
+            "images/logo.png".to_string(),
+            "https://app.example.com/email-assets/inst1/x/logo.png".to_string(),
+        )])
+    }
+
+    #[test]
+    fn a_draft_may_have_no_recipients_and_missing_images() {
+        let v = validate(
+            html_input(&[], &NO_ASSETS),
+            Purpose::Draft,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
+        assert!(v.recipients.is_empty());
+        assert_eq!(v.missing_assets, vec!["images/logo.png"]);
+    }
+
+    #[test]
+    fn a_test_or_real_send_refuses_missing_images() {
+        let r = emails(&["one@example.com"]);
+        for purpose in [Purpose::Test, Purpose::Send] {
+            let err = validate(
+                html_input(&r, &NO_ASSETS),
+                purpose,
+                &instance(),
+                &exact_only(),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("images/logo.png"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_real_send_needs_recipients_but_a_test_does_not() {
+        let assets = logo_hosted();
+        assert!(
+            validate(
+                html_input(&[], &assets),
+                Purpose::Send,
+                &instance(),
+                &exact_only()
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                html_input(&[], &assets),
+                Purpose::Test,
+                &instance(),
+                &exact_only()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_html_broadcast_is_sent_as_authored_with_a_derived_text_part_and_no_signature() {
+        let r = emails(&["one@example.com"]);
+        let assets = logo_hosted();
+        let v = validate(
+            html_input(&r, &assets),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
+        let built = build_broadcast_message(&v, &instance().signature, "one@example.com").unwrap();
+        let msg = mail_parser::MessageParser::new().parse(&built.raw).unwrap();
+        let html = msg.body_html(0).unwrap();
+        assert!(html.contains("<h1>Big news</h1>"), "{html}");
+        assert!(
+            html.contains("https://app.example.com/email-assets/inst1/x/logo.png"),
+            "{html}"
+        );
+        assert!(!html.contains("The seslogin team"), "{html}");
+        let text = msg.body_text(0).unwrap().replace("\r\n", "\n");
+        assert_eq!(text.trim(), "Big news\n\nShipped.");
+        // The broadcast rules still hold: no reply tag, no ticket subject.
+        assert!(!String::from_utf8_lossy(&built.raw).contains("+t"));
+        assert_eq!(outbound::parse_subject_tag(msg.subject().unwrap()), None);
+    }
+
+    #[test]
+    fn an_html_broadcast_uses_its_own_text_part_when_given() {
+        let r = emails(&["one@example.com"]);
+        let assets = logo_hosted();
+        let i = BroadcastInput {
+            body: "Plain version.",
+            ..html_input(&r, &assets)
+        };
+        let v = validate(i, Purpose::Send, &instance(), &exact_only()).unwrap();
+        let built = build_broadcast_message(&v, &instance().signature, "one@example.com").unwrap();
+        let msg = mail_parser::MessageParser::new().parse(&built.raw).unwrap();
+        assert_eq!(msg.body_text(0).unwrap().trim(), "Plain version.");
+    }
+
+    #[test]
+    fn a_test_copy_is_built_like_the_real_one_with_a_test_subject() {
+        let r = emails(&["one@example.com"]);
+        let v = validate(
+            input("news@seslogin.test", &r),
+            Purpose::Send,
+            &instance(),
+            &exact_only(),
+        )
+        .unwrap();
+        let built = build_test_message(&v, &instance().signature, "me@example.com").unwrap();
+        assert_eq!(built.to, vec!["me@example.com"]);
+        let msg = mail_parser::MessageParser::new().parse(&built.raw).unwrap();
+        assert_eq!(
+            msg.subject(),
+            Some("[TEST] New in seslogin: location check-in")
+        );
+        assert_eq!(msg.header_raw("Precedence").map(str::trim), Some("bulk"));
     }
 }

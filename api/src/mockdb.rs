@@ -648,6 +648,27 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    async fn update_broadcast_draft(&self, _broadcast: &db::Broadcast) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn set_broadcast_test_sent(&self, _id: &str, _at: u64) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn start_broadcast_draft(
+        &self,
+        _id: &str,
+        _recipients: &[db::BroadcastRecipient],
+        _now: u64,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn delete_broadcast_draft(&self, _id: &str) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
     async fn list_broadcasts(
         &self,
         _instance_id: &str,

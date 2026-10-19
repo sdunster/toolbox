@@ -32,6 +32,15 @@
 //!   expense's receipt, uploaded straight to its final key by a presigned
 //!   PUT (`createExpenseReceiptUpload`) and recorded by
 //!   `attachExpenseReceipt`. Kept, like the PDFs.
+//!
+//! One thing lives in a **second, public bucket** instead (`EMAIL_ASSETS_BUCKET`,
+//! served by the web CloudFront distribution under `/email-assets/*`):
+//!
+//! - `email-assets/{instance_id}/{nanoid}/{filename}` — an image an HTML
+//!   broadcast shows (`createBroadcastAssetUpload`). Public because every
+//!   recipient's mail client fetches it; write-once and never deleted, so an
+//!   email sent years ago still renders. Never put anything private there:
+//!   the mail bucket holds customer mail and must stay private.
 
 use anyhow::Result;
 use std::future::Future;
@@ -106,6 +115,16 @@ pub trait Handler: Sync {
         &self,
         key: &str,
         filename: &str,
+    ) -> impl Future<Output = Result<String>> + Send;
+
+    /// A presigned PUT into the **public** email-assets bucket (see the
+    /// module doc) for exactly `content_length` bytes of `content_type`.
+    /// `key` is the object key, which is also its path under the web origin.
+    fn presign_put_public_asset(
+        &self,
+        key: &str,
+        content_type: &str,
+        content_length: u64,
     ) -> impl Future<Output = Result<String>> + Send;
 
     /// The size, in bytes, of an already-stored object — used after

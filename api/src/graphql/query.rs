@@ -505,6 +505,20 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
         Ok(rows.into_iter().map(Broadcast::new).collect())
     }
 
+    /// One of this instance's broadcasts (a draft, typically, to edit it),
+    /// or `null` if there's no such broadcast here. Owner-only, like
+    /// [`Self::broadcasts`].
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(self.rec.id.clone()))")]
+    async fn broadcast(&self, ctx: &Context<'_>, id: ID) -> Result<Option<Broadcast<A>>> {
+        let app = ctx.data_unchecked::<Arc<A>>();
+        Ok(app
+            .db()
+            .get_broadcast_consistent(id.as_str())
+            .await?
+            .filter(|b| b.instance_id == self.rec.id)
+            .map(Broadcast::new))
+    }
+
     /// The domains a broadcast from this instance may be sent from — the
     /// domains of its inbound addresses (`broadcast::instance_mail_domains`).
     /// Owner-only, like [`Self::broadcasts`]; empty for an invoicing
@@ -652,6 +666,36 @@ pub struct SendBroadcastInput {
     pub subject: String,
     pub body: String,
     pub recipients: Vec<String>,
+}
+
+/// `saveBroadcastDraft`'s argument: the whole draft, every time (a full
+/// replace, like `updateInvoicingSettings`). `id` absent creates a new
+/// draft. `html` absent makes it a plain-text broadcast; with `html`,
+/// `body` is the optional plain-text version (blank derives one). See
+/// `broadcast::validate` and `broadcast_html::process`.
+#[derive(InputObject, Clone, Debug)]
+pub struct SaveBroadcastDraftInput {
+    pub id: Option<ID>,
+    pub from_address: String,
+    pub from_name: Option<String>,
+    pub subject: String,
+    #[graphql(default)]
+    pub body: String,
+    pub html: Option<String>,
+    /// Uploaded images for the HTML's relative references
+    /// (`createBroadcastAssetUpload`), applied by rewriting them to `url`.
+    #[graphql(default)]
+    pub asset_urls: Vec<BroadcastAssetUrlInput>,
+    #[graphql(default)]
+    pub recipients: Vec<String>,
+}
+
+/// One relative image path in a draft's HTML (`images/logo.png`) and the
+/// public URL its file was uploaded to.
+#[derive(InputObject, Clone, Debug)]
+pub struct BroadcastAssetUrlInput {
+    pub path: String,
+    pub url: String,
 }
 
 /// `BroadcastRecipient.sendStatus` — see `db::BroadcastSendStatus`.
@@ -805,8 +849,36 @@ impl<A: App + HasDb + Send + Sync + 'static> Broadcast<A> {
     async fn subject(&self) -> &str {
         &self.rec.subject
     }
+    /// The plain-text body — for an HTML broadcast, its own plain-text
+    /// version, empty when it uses one derived from the HTML.
     async fn body(&self) -> &str {
         &self.rec.body_text
+    }
+    /// An HTML broadcast's body as it is (or will be) sent: sanitized, with
+    /// every uploaded image at its hosted URL (`broadcast_html::process`).
+    /// `null` for a plain-text broadcast. Render it only somewhere it can't
+    /// run as the viewer — the web app uses a sandboxed `<iframe>`.
+    async fn html(&self) -> Option<&str> {
+        self.rec.body_html.as_deref()
+    }
+    /// Relative images in `html` with no uploaded file yet. A draft with any
+    /// can't be test-sent or sent.
+    async fn missing_assets(&self) -> Vec<String> {
+        self.rec
+            .body_html
+            .as_deref()
+            .map(crate::broadcast_html::missing_assets)
+            .unwrap_or_default()
+    }
+    /// Saved but not sent (`saveBroadcastDraft`) — nothing is queued until
+    /// `sendBroadcastDraft`.
+    async fn is_draft(&self) -> bool {
+        self.rec.draft
+    }
+    /// When a test copy of this version of the draft was last sent
+    /// (`sendBroadcastTest`); `null` if never, or if it was edited since.
+    async fn last_test_sent_at(&self) -> Option<i64> {
+        self.rec.last_test_sent_at.map(|t| t as i64)
     }
     async fn created_at(&self) -> i64 {
         self.rec.created_at as i64

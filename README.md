@@ -15,6 +15,9 @@ be emailed to the client, paid off in part or in full, and corrected only by a c
 - Inbound email → ticket, with reply threading via `+tag` addressing and `In-Reply-To`/`References`
 - Outbound replies mailed to requesters and CCs, with internal notes that are never emailed
 - Multiple inbound addresses per instance, including domain wildcards (`*@sub.example.com`)
+- Broadcasts: one announcement to a list, plain text or designed HTML (pasted or uploaded as a
+  `.zip`, images hosted by Toolbox), saved as a draft, test-sent to yourself, then sent in paced
+  batches — every reply opens its own ticket
 - Passwordless auth — email code or passkeys — for agents; email-code verification for public
   ticket submission
 - Invoicing instances: clients/projects, billable items, invoices, and expenses — a second function
