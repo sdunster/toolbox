@@ -28,6 +28,12 @@
 //!   a permanent financial record, not transient mail.
 //! - `credit-notes/{instance_id}/{credit_note_id}/Credit-Note-CN-{n}.pdf` —
 //!   a credit note's PDF, cached the same way (`db::CreditNote.pdf_s3_key`).
+//! - `invoices/{instance_id}/{invoice_id}/Invoice-{displayNumber}.xml` and
+//!   `credit-notes/{instance_id}/{credit_note_id}/Credit-Note-CN-{n}.xml` —
+//!   the same documents as Peppol PINT A-NZ e-invoices
+//!   (`downloadInvoiceEinvoice`/`downloadCreditNoteEinvoice`), beside their
+//!   PDFs. Rewritten on every download rather than cached on the row: the XML
+//!   is byte-for-byte deterministic, so a rewrite never changes it.
 //! - `receipts/{instance_id}/{expense_id}/{nanoid}/{filename}` — an
 //!   expense's receipt, uploaded straight to its final key by a presigned
 //!   PUT (`createExpenseReceiptUpload`) and recorded by

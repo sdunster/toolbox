@@ -2425,6 +2425,13 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
     async fn payment_details(&self, ctx: &Context<'_>) -> Result<Option<String>> {
         Ok(self.effective(ctx).await?.payment_details)
     }
+    /// Why this invoice can't be issued as an Australian e-invoice (Peppol
+    /// PINT A-NZ) — empty when it can. On a draft these can still be fixed
+    /// in the project and invoicing settings; a finalized invoice's are
+    /// frozen with it (`invoicing::einvoice::problems`).
+    async fn einvoice_problems(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
+        Ok(invoicing::einvoice::problems(&self.effective(ctx).await?))
+    }
     async fn created_at(&self) -> i64 {
         self.rec.created_at as i64
     }

@@ -602,6 +602,20 @@ async fn credit_notes_are_numbered_capped_and_settle_invoices() {
         )
         .await;
     assert!(data(&r, "downloadCreditNotePdf").as_str().is_some());
+    // No ABN in this instance's settings, so no e-invoice — and it says why.
+    let r = w
+        .run(
+            "mutation($id: ID!) { downloadCreditNoteEinvoice(creditNoteId: $id) }",
+            json!({ "id": note_id }),
+        )
+        .await;
+    assert!(
+        r.errors
+            .first()
+            .is_some_and(|e| e.message.contains("invoicing settings have no ABN")),
+        "{:?}",
+        r.errors
+    );
     let r = w
         .run(
             "query($i: ID!) { creditNotes(instanceId: $i) { edges { node { displayNumber } } } }",

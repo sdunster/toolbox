@@ -1,4 +1,12 @@
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import UserEvent from "@testing-library/user-event";
 import { setupServer } from "msw/node";
@@ -68,6 +76,7 @@ function invoiceResponse(
     subtotalCents: number;
     gstCents: number;
     totalCents: number;
+    einvoiceProblems: string[];
   }> = {},
 ) {
   const status = overrides.status ?? "DRAFT";
@@ -123,6 +132,7 @@ function invoiceResponse(
         sentAt: null,
         sentTo: [],
         creditNotes: overrides.creditNotes ?? [],
+        einvoiceProblems: overrides.einvoiceProblems ?? [],
       },
     },
   };
@@ -465,6 +475,122 @@ describe("InvoiceDetailPage — preview", () => {
     expect(screen.getByText(/^Total AUD:/)).toBeInTheDocument();
     expect(
       screen.queryByText("No GST has been charged."),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("InvoiceDetailPage — e-invoice", () => {
+  it("lists what a draft is missing before it's finalized", async () => {
+    server.use(
+      relayEndpoint.query("InvoiceDetailPageQuery", () =>
+        HttpResponse.json(
+          invoiceResponse({
+            einvoiceProblems: ["The client has no ABN (set it on the project)"],
+          }),
+        ),
+      ),
+    );
+    renderPage();
+
+    expect(
+      await screen.findByText(
+        "This invoice can't be issued as an e-invoice yet:",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("The client has no ABN (set it on the project)"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Fix these before finalizing — a finalized invoice can't change.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("says a complete draft is ready", async () => {
+    server.use(
+      relayEndpoint.query("InvoiceDetailPageQuery", () =>
+        HttpResponse.json(invoiceResponse()),
+      ),
+    );
+    renderPage();
+
+    expect(
+      await screen.findByText(
+        "Ready to issue as an Australian e-invoice (Peppol PINT A-NZ) once finalized.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Download e-invoice (XML)" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("downloads a finalized invoice's e-invoice", async () => {
+    let receivedVariables: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.query("InvoiceDetailPageQuery", () =>
+        HttpResponse.json(
+          invoiceResponse({
+            status: "FINALIZED",
+            displayNumber: "008",
+            issueDate: "2026-08-19",
+          }),
+        ),
+      ),
+      relayEndpoint.mutation(
+        "InvoiceEinvoiceDownloadMutation",
+        ({ variables }) => {
+          receivedVariables = variables;
+          return HttpResponse.json({
+            data: {
+              downloadInvoiceEinvoice: "https://s3.example/Invoice-008.xml",
+            },
+          });
+        },
+      ),
+    );
+    const assign = vi.fn();
+    vi.spyOn(window, "location", "get").mockReturnValue({
+      ...window.location,
+      assign,
+    } as unknown as Location);
+    const user = UserEvent.setup();
+    renderPage();
+
+    await screen.findByText("Invoice 008");
+    await user.click(
+      screen.getByRole("button", { name: "Download e-invoice (XML)" }),
+    );
+
+    await waitFor(() =>
+      expect(receivedVariables).toEqual({ invoiceId: "inv-1" }),
+    );
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith("https://s3.example/Invoice-008.xml"),
+    );
+    vi.restoreAllMocks();
+  });
+
+  it("explains why a finalized invoice has no e-invoice", async () => {
+    server.use(
+      relayEndpoint.query("InvoiceDetailPageQuery", () =>
+        HttpResponse.json(
+          invoiceResponse({
+            status: "FINALIZED",
+            displayNumber: "008",
+            issueDate: "2026-08-19",
+            einvoiceProblems: ["The invoicing settings have no ABN"],
+          }),
+        ),
+      ),
+    );
+    renderPage();
+
+    expect(
+      await screen.findByText("This invoice can't be issued as an e-invoice:"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Download e-invoice (XML)" }),
     ).not.toBeInTheDocument();
   });
 });

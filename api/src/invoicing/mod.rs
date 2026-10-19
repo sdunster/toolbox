@@ -20,6 +20,7 @@
 //!   checks need.
 
 pub mod csv;
+pub mod einvoice;
 pub mod expense;
 pub mod ledger;
 pub mod money;

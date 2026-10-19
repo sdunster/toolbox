@@ -99,6 +99,7 @@ function AddInvoiceItemsPanel({
             ...BillableItemRow_item
           }
           ...InvoicePreview_invoice
+          ...InvoiceEinvoice_invoice
         }
       }
     `,
@@ -224,6 +225,7 @@ export function InvoiceDraftPanel({
           ...BillableItemRow_item
         }
         ...InvoicePreview_invoice
+        ...InvoiceEinvoice_invoice
       }
     }
   `);
@@ -252,6 +254,7 @@ export function InvoiceDraftPanel({
             ...BillableItemRow_item
           }
           ...InvoicePreview_invoice
+          ...InvoiceEinvoice_invoice
           ...InvoicePaidControl_invoice
           ...InvoiceSendPanel_invoice
           ...InvoiceCreditNotes_invoice

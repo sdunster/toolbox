@@ -356,6 +356,36 @@ async fn download_invoice_pdf(schema: &TestSchema, invoice_id: &str, auth: AuthI
         .await
 }
 
+const DOWNLOAD_INVOICE_EINVOICE_MUTATION: &str =
+    "mutation($invoiceId: ID!) { downloadInvoiceEinvoice(invoiceId: $invoiceId) }";
+
+async fn download_invoice_einvoice(
+    schema: &TestSchema,
+    invoice_id: &str,
+    auth: AuthInfo,
+) -> Response {
+    schema
+        .execute(
+            Request::new(DOWNLOAD_INVOICE_EINVOICE_MUTATION)
+                .variables(Variables::from_json(json!({ "invoiceId": invoice_id })))
+                .data(auth),
+        )
+        .await
+}
+
+const EINVOICE_PROBLEMS_QUERY: &str = "query($id: ID!) { invoice(id: $id) { einvoiceProblems } }";
+
+async fn einvoice_problems(schema: &TestSchema, invoice_id: &str, auth: AuthInfo) -> Vec<String> {
+    let response = schema
+        .execute(
+            Request::new(EINVOICE_PROBLEMS_QUERY)
+                .variables(Variables::from_json(json!({ "id": invoice_id })))
+                .data(auth),
+        )
+        .await;
+    serde_json::from_value(expect_data(&response, "invoice.einvoiceProblems")).unwrap()
+}
+
 const SET_NEXT_INVOICE_NUMBER_MUTATION: &str = "mutation($instanceId: ID!, $next: Int!) {
     setNextInvoiceNumber(instanceId: $instanceId, next: $next) {
         invoicingSettings { nextInvoiceNumber }
@@ -1556,6 +1586,107 @@ async fn download_invoice_pdf_renders_caches_and_presigns_twice() {
         .unwrap()
         .unwrap();
     assert_eq!(after_second.pdf_s3_key, Some(key));
+}
+
+/// `downloadInvoiceEinvoice`: refused with every reason while the invoice
+/// lacks what a PINT A-NZ e-invoice needs (the setup's ABN fails the
+/// checksum and its project has no client ABN), which `einvoiceProblems`
+/// lists on the draft in advance; `CONFLICT` on a draft.
+#[tokio::test]
+async fn download_invoice_einvoice_explains_what_is_missing() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "einvmissing").await;
+    let schema = build_schema(db.clone());
+    let auth = || member_auth(&agent_id, &instance_id);
+
+    let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
+    let created = create_invoice(&schema, &project_id, &items, auth()).await;
+    let invoice_id = expect_data(&created, "createInvoice")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let problems = einvoice_problems(&schema, &invoice_id, auth()).await;
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    let draft = download_invoice_einvoice(&schema, &invoice_id, auth()).await;
+    assert_eq!(expect_error_code(&draft), "CONFLICT");
+
+    finalize(&schema, &invoice_id, "2026-08-19", auth()).await;
+    let refused = download_invoice_einvoice(&schema, &invoice_id, auth()).await;
+    let message = expect_error_message(&refused);
+    assert!(message.contains("business ABN"), "{message}");
+    assert!(message.contains("client has no ABN"), "{message}");
+}
+
+/// With valid ABNs on both sides, a finalized invoice renders to PINT A-NZ
+/// UBL stored beside its PDF; an outsider gets `NOT_FOUND`.
+#[tokio::test]
+async fn download_invoice_einvoice_renders_ubl() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance_id, _owner_id, agent_id, _project_id) = setup(&db, "einvoice").await;
+    db.update_instance(
+        &instance_id,
+        db::InstanceUpdateShape::SetInvoicingSettings {
+            business_name: Some("Fictional Trades Pty Ltd"),
+            business_abn: Some("51 824 753 556"),
+            business_address: Some("1 Fictional St\nSomewhere NSW 2000"),
+            business_phone: None,
+            business_email: None,
+            payment_details: Some("BSB 000-000 Acc 00000000"),
+            gst_registered: true,
+            currency: None,
+            payment_terms_days: None,
+        },
+    )
+    .await
+    .expect("set invoicing settings");
+    let project = db
+        .create_project(
+            &instance_id,
+            &db::ProjectFields {
+                name: "E-invoiced Job".into(),
+                client_name: "Fictional Client Pty Ltd".into(),
+                client_abn: Some("53 004 085 616".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create_project");
+    let schema = build_schema(db.clone());
+    let auth = || member_auth(&agent_id, &instance_id);
+
+    let items = create_items(&db, &instance_id, &project.id, &agent_id, 2).await;
+    let created = create_invoice(&schema, &project.id, &items, auth()).await;
+    let invoice_id = expect_data(&created, "createInvoice")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        einvoice_problems(&schema, &invoice_id, auth())
+            .await
+            .is_empty()
+    );
+    let finalized = finalize(&schema, &invoice_id, "2026-08-19", auth()).await;
+    let number = expect_data(&finalized, "finalizeInvoice.displayNumber");
+    let number = number.as_str().unwrap();
+
+    let response = download_invoice_einvoice(&schema, &invoice_id, auth()).await;
+    let url = expect_data(&response, "downloadInvoiceEinvoice");
+    assert!(!url.as_str().unwrap().is_empty());
+    let key = format!("invoices/{instance_id}/{invoice_id}/Invoice-{number}.xml");
+    let bytes = mockstorage::Storage::new()
+        .get_bytes(&key)
+        .await
+        .expect("stored e-invoice");
+    let xml = String::from_utf8(bytes).unwrap();
+    assert!(xml.contains("urn:peppol:pint:billing-1@aunz-1"));
+    assert!(xml.contains(r#"<cbc:EndpointID schemeID="0151">53004085616</cbc:EndpointID>"#));
+    // 2 items × 2 × 100.00 = 400.00, plus 10% GST.
+    assert!(xml.contains(r#"<cbc:PayableAmount currencyID="AUD">440.00</cbc:PayableAmount>"#));
+
+    let outsider = download_invoice_einvoice(&schema, &invoice_id, outsider_auth("nobody")).await;
+    assert_eq!(expect_error_code(&outsider), "NOT_FOUND");
 }
 
 #[tokio::test]

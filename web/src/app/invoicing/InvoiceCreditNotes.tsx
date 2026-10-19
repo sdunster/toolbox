@@ -3,6 +3,7 @@ import { graphql, useFragment, useMutation } from "react-relay";
 import type { InvoiceCreditNotes_invoice$key } from "./__generated__/InvoiceCreditNotes_invoice.graphql";
 import type { InvoiceCreditNotesIssueMutation } from "./__generated__/InvoiceCreditNotesIssueMutation.graphql";
 import type { InvoiceCreditNotesPdfMutation } from "./__generated__/InvoiceCreditNotesPdfMutation.graphql";
+import type { InvoiceCreditNotesEinvoiceMutation } from "./__generated__/InvoiceCreditNotesEinvoiceMutation.graphql";
 import type { InvoiceCreditNotesSendMutation } from "./__generated__/InvoiceCreditNotesSendMutation.graphql";
 import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
@@ -90,6 +91,12 @@ function CreditNoteRow({
       }
     `,
   );
+  const [commitEinvoice, isPreparingEinvoice] =
+    useMutation<InvoiceCreditNotesEinvoiceMutation>(graphql`
+      mutation InvoiceCreditNotesEinvoiceMutation($id: ID!) {
+        downloadCreditNoteEinvoice(creditNoteId: $id)
+      }
+    `);
   const [commitSend, isSending] = useMutation<InvoiceCreditNotesSendMutation>(
     graphql`
       mutation InvoiceCreditNotesSendMutation(
@@ -145,6 +152,27 @@ function CreditNoteRow({
         >
           {isPreparing ? "Preparing PDF…" : "Download PDF"}
         </Button>
+        <Button
+          variant="secondary"
+          disabled={isPreparingEinvoice}
+          onClick={() => {
+            setError(null);
+            commitEinvoice({
+              variables: { id: note.id },
+              onCompleted: (d) =>
+                window.location.assign(d.downloadCreditNoteEinvoice),
+              onError: (err) =>
+                setError(
+                  relayMutationErrorMessage(
+                    err,
+                    "Failed to prepare the e-invoice.",
+                  ),
+                ),
+            });
+          }}
+        >
+          {isPreparingEinvoice ? "Preparing e-invoice…" : "Download e-invoice"}
+        </Button>
         {!sending && (
           <Button variant="secondary" onClick={() => setSending(true)}>
             Email to client
@@ -186,10 +214,10 @@ function CreditNoteRow({
 
 /**
  * Credit notes against a finalized invoice — the one way to correct it,
- * since a finalized invoice never changes. Lists the ones issued (PDF and
- * email for each) and issues another: the whole invoice (only while
- * nothing has been credited), or specific GST-exclusive amounts. Issuing
- * is irreversible, and the form says so.
+ * since a finalized invoice never changes. Lists the ones issued (PDF,
+ * e-invoice and email for each) and issues another: the whole invoice
+ * (only while nothing has been credited), or specific GST-exclusive
+ * amounts. Issuing is irreversible, and the form says so.
  */
 export function InvoiceCreditNotes({
   invoice,
