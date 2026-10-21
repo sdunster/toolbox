@@ -51,35 +51,35 @@ instance record, so projecting more into the index would just be wasted storage.
 **Non-obvious attributes (not in the table definition):**
 
 - `name` (S) — display name
-- `kind` (S) — `"invoicing"` only; absent means `"support"`. Set once at creation
+- `kind` (S) — `"finance"` only; absent means `"support"`. Set once at creation
   (`createInstance`/`instance create --kind`), **immutable after creation** — no mutation and no
-  CLI command changes it. See CLAUDE.md's "Invoicing" house rule for the kind-isolation rule this
-  drives (a support-only operation rejects an invoicing instance identically to a missing/deleted
-  one; an invoicing-only operation rejects a support instance with a plain validation error).
+  CLI command changes it. See CLAUDE.md's "Finance" house rule for the kind-isolation rule this
+  drives (a support-only operation rejects a finance instance identically to a missing/deleted
+  one; a finance-only operation rejects a support instance with a plain validation error).
 - `from_name` (S) — the `From:` display name used on outbound mail
 - `signature` (S) — appended to outbound replies
 - `public_submission_enabled` (Bool) — opt-in, default off/absent; gates whether the instance
   appears in the bare `/submit` list. Support instances only in practice — `publicInstances`/
   `requestSubmitCode` both also require `kind = support`.
 - `business_name`, `business_abn`, `business_address`, `business_phone`, `business_email`,
-  `payment_details` (all S) — invoicing settings: the seller details and payment footer an invoice
-  prints. Invoicing instances only (nothing enforces that at the storage layer; every write path
-  that could set them, `updateInvoicingSettings`, rejects a support instance first). Full-replace
-  write: every call to `updateInvoicingSettings` writes every field, and a blank string `REMOVE`s
+  `payment_details` (all S) — finance settings: the seller details and payment footer an invoice
+  prints. Finance instances only (nothing enforces that at the storage layer; every write path
+  that could set them, `updateFinanceSettings`, rejects a support instance first). Full-replace
+  write: every call to `updateFinanceSettings` writes every field, and a blank string `REMOVE`s
   the attribute rather than storing an empty one.
-- `gst_registered` (Bool) — invoicing setting, only ever written `true`; absent means not
+- `gst_registered` (Bool) — finance setting, only ever written `true`; absent means not
   registered for GST, same omit convention as `deleted` below.
-- `currency` (S) — invoicing setting; absent means `"AUD"` (`db::Instance::currency_or_default`).
+- `currency` (S) — finance setting; absent means `"AUD"` (`db::Instance::currency_or_default`).
   A non-blank value must be 3 uppercase ASCII letters (`db::validate_currency_code`).
-- `payment_terms_days` (N) — invoicing setting, `0..=365`; absent means 14
+- `payment_terms_days` (N) — finance setting, `0..=365`; absent means 14
   (`db::DEFAULT_PAYMENT_TERMS_DAYS`). A project's own `payment_terms_days` overrides it.
 - `broadcast_senders` (S) — support instances only: JSON list of saved broadcast senders
   (`db::BroadcastSender` — `{id, name, address}`), at most 20, absent when empty. Written whole by
   `set_broadcast_senders`, conditioned on the stored string still being the one the caller read
   (or absent), so concurrent edits fail with `CONFLICT` instead of losing one.
-- `brands` (S) — invoicing instances only: JSON list of the instance's extra brands (`db::Brand` —
+- `brands` (S) — finance instances only: JSON list of the instance's extra brands (`db::Brand` —
   `{id, name, email?, phone?, address?, payment_details?, archived?}`, `archived` only ever `true`),
-  at most `db::MAX_BRANDS` (20), absent when empty. The invoicing settings above are the default
+  at most `db::MAX_BRANDS` (20), absent when empty. The finance settings above are the default
   brand and are not in it. Written whole by `set_brands`, conditioned exactly like
   `broadcast_senders`. See CLAUDE.md's "Brands" entry.
 - `deleted` (Bool) — soft-delete marker, same omit convention: only ever
@@ -320,7 +320,7 @@ the finalized invoice it records. Invoices finalized before reservation rows exi
 
 - `next_ticket_number` (N) — incremented with an atomic `UpdateItem ADD`, never read-then-written;
   see "Known issues and risks" below for what happens if that rule is broken
-- `next_invoice_number` (N) — the invoicing counterpart, same atomic-`ADD`-only rule, incremented
+- `next_invoice_number` (N) — the finance counterpart, same atomic-`ADD`-only rule, incremented
   by `finalizeInvoice` (`db::Handler::increment_invoice_counter`) and settable forward-only via
   `setNextInvoiceNumber` (`db::Handler::set_next_invoice_number`, condition
   `attribute_not_exists(next_invoice_number) OR next_invoice_number <= :new_value`). An owner's
@@ -329,7 +329,7 @@ the finalized invoice it records. Invoices finalized before reservation rows exi
   for a number at or below it — so automatic numbering continues after the highest number used
   and never lands on a claimed one. Absent means
   `0` (no invoice finalized yet, and `nextInvoiceNumber` has never been set) —
-  `InvoicingSettingsInfo.nextInvoiceNumber` reads this lazily (a single `GetItem`, not carried on
+  `FinanceSettingsInfo.nextInvoiceNumber` reads this lazily (a single `GetItem`, not carried on
   every `Instance` fetch) and reports `this + 1`. See "Known issues and risks" for the same
   gap-not-duplicate reasoning as `next_ticket_number`.
 - `next_credit_note_number` (N) — the credit-note sequence (`CN-001`, …), incremented by
@@ -495,8 +495,8 @@ verify a signature, the settings page to render each passkey's metadata.
 
 ### `{prefix}_project`
 
-A client/job an invoicing instance bills against — the first invoicing-only table. See CLAUDE.md's
-"Invoicing" house rule. Billable items (below) and invoices (a later PR) each reference a project by id.
+A client/job a finance instance bills against — the first finance-only table. See CLAUDE.md's
+"Finance" house rule. Billable items (below) and invoices (a later PR) each reference a project by id.
 
 | Attribute     | Type | Role                  |
 | ------------- | ---- | --------------------- |
@@ -538,8 +538,8 @@ user-generated table, and every field is rendered directly from the list.
   `instance.deleted`/`instance.gst_registered`. There is no delete in v1.
 - `created_at`, `updated_at` (N)
 
-Any member (owner or agent) of the invoicing instance can create/update a project — day-to-day
-work, not an owner-only setting, unlike the instance's own invoicing settings above. Superusers get
+Any member (owner or agent) of the finance instance can create/update a project — day-to-day
+work, not an owner-only setting, unlike the instance's own finance settings above. Superusers get
 no access (they don't pass `Member`) — the same superuser boundary tickets have always had.
 
 ---
@@ -547,7 +547,7 @@ no access (they don't pass `Member`) — the same superuser boundary tickets hav
 ### `{prefix}_billable_item`
 
 One line of work recorded against a project, later collected onto an invoice. See CLAUDE.md's
-"Invoicing" house rule for the money rules.
+"Finance" house rule for the money rules.
 
 | Attribute     | Type | Role                                   |
 | ------------- | ---- | -------------------------------------- |
@@ -577,7 +577,7 @@ page is full or the index is exhausted, and `billable_items_dynamodb_local.rs` p
 
 **Non-obvious attributes:**
 
-- `date` (S) — `YYYY-MM-DD`, always the canonical zero-padded form (`invoicing::validate_item_date`
+- `date` (S) — `YYYY-MM-DD`, always the canonical zero-padded form (`finance::validate_item_date`
   rejects `2026-8-1`), since the sort key's string order must be the date order. **`date` is a
   DynamoDB reserved word:** any update/condition/filter/key expression must alias it via
   `ExpressionAttributeNames` (`#d`), like `project.reference`. Raw attribute names in an
@@ -606,14 +606,14 @@ The line amount is **not stored** — the API derives it (round-half-up of `quan
 unit_price_cents / 100`) on every read. At the bounds it reaches 10^15 cents, above GraphQL's
 32-bit `Int` but exact as a JSON number in JS (under 2^53); it is served as a JSON number.
 
-Any member (owner or agent) of the invoicing instance can create/update/delete items; superusers get
+Any member (owner or agent) of the finance instance can create/update/delete items; superusers get
 no access.
 
 ---
 
 ### `{prefix}_invoice`
 
-A project's billable items collected for billing — see CLAUDE.md's "Invoicing" house rule for the
+A project's billable items collected for billing — see CLAUDE.md's "Finance" house rule for the
 domain rules (snapshot-on-finalize, strict finality, the transactional attach/detach machinery).
 
 | Attribute     | Type | Role                                          |
@@ -662,12 +662,12 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   `{prefix}_counter`'s `next_invoice_number` (see that table's entry) — the next in sequence, or
   any unused number an owner gives `finalizeInvoice(number:)`. Unique per instance, enforced by the
   number's reservation row in `{prefix}_counter`. Displayed zero-padded to 3
-  digits (`invoicingSettings`'s convention; it simply grows past 999).
+  digits (`financeSettings`'s convention; it simply grows past 999).
 - `issue_date` (S) — optional; `YYYY-MM-DD`. Absent for a draft; set once, at finalization, never
   changed afterward.
-- `snapshot` (S) — optional; JSON (`invoicing::snapshot::InvoiceSnapshot`, see `schema_version` below).
+- `snapshot` (S) — optional; JSON (`finance::snapshot::InvoiceSnapshot`, see `schema_version` below).
   Absent for a draft (whose printable content is instead built live,
-  `invoicing::snapshot::build_snapshot`, from the project/instance/items as they currently stand).
+  `finance::snapshot::build_snapshot`, from the project/instance/items as they currently stand).
   Set once, at finalization, and never touched again — this is the entire mechanism behind "a
   project/settings edit after finalize never changes an already-finalized invoice".
 - `total_cents` (N) — optional; absent for a draft. Denormalised from the snapshot (rather than
@@ -679,7 +679,7 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   least once. Set exactly once, by `db::Handler::set_invoice_pdf_key` (condition `status =
   finalized`), to `invoices/{instance_id}/{id}/Invoice-{displayNumber}.pdf` — see `storage.rs`'s
   key-layout doc comment. Rendering is deterministic from `snapshot` (content, layout and page
-  count — not quite the file's raw bytes; see `api/src/invoicing/pdf.rs`'s doc comment for why),
+  count — not quite the file's raw bytes; see `api/src/finance/pdf.rs`'s doc comment for why),
   so this is an unconditional `SET`, not an `attribute_not_exists` guard: a concurrent
   double-render just writes the same key twice, with two equally correct renderings of the same
   invoice, never a real race. Along with `paid_date`, the only attributes that may still change on
@@ -721,7 +721,7 @@ with the items — by the time it runs, every item's `invoice_id` already points
 (from the moment it was attached) — with the number's reservation row in `{prefix}_counter` (see
 that table's entry). Both are `Update` items, so `UpdateItem` grants authorise it.
 
-Any member (owner or agent) of the invoicing instance can create/attach/detach/delete a draft, and
+Any member (owner or agent) of the finance instance can create/attach/detach/delete a draft, and
 finalize or mark paid; superusers get no access — same boundary as `project`/`billable_item`.
 
 ---
@@ -870,7 +870,7 @@ arrive on the shared `toolbox-mail-feedback` stream (`ses_events`).
 
 ### `{prefix}_expense`
 
-Money an invoicing instance spent — a purchase, or a cents-per-km vehicle trip — optionally against
+Money a finance instance spent — a purchase, or a cents-per-km vehicle trip — optionally against
 one of its projects. See CLAUDE.md's "Expenses" house rule. Linked to an invoice only indirectly,
 through the billable item `rebillExpense` makes from it.
 
@@ -896,7 +896,7 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
 
 **Non-obvious attributes:**
 
-- `date` (S) — canonical `YYYY-MM-DD` (`invoicing::validate_item_date`); a reserved word, aliased `#d`.
+- `date` (S) — canonical `YYYY-MM-DD` (`finance::validate_item_date`); a reserved word, aliased `#d`.
 - `category` (S) — one of a fixed list (`db::ExpenseCategory::as_str`, e.g. `materials`,
   `vehicle_km`). `vehicle_km` decides the row's shape: a trip carries `distance_tenths_km` and
   `rate_cents_per_km` and never `supplier`/`amount_cents`/`gst_cents`; every other category is the
@@ -907,7 +907,7 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
   `0 ≤ g ≤ amount_cents`. Absent means GST-free.
 - `distance_tenths_km` (N) — trips only; km × 10, `0 < d ≤ 50,000` (5,000 km).
 - `rate_cents_per_km` (N) — trips only; the ATO rate for the trip date's financial year
-  (`invoicing::vehicle::ATO_RATES`), looked up on every write and stored, so a later table change
+  (`finance::vehicle::ATO_RATES`), looked up on every write and stored, so a later table change
   never alters a saved trip. A trip's amount is **not stored** — derived as round-half-up(`distance
   × rate / 10`) on read.
 - `description` (S) — optional for a purchase; required for a trip (its business purpose). ≤ 2000.
@@ -922,7 +922,7 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
 - `created_by_user_id` (S) — whoever logged it; also whose km running total a trip counts toward.
 - `created_at`, `updated_at` (N)
 
-Any member (owner or agent) of the invoicing instance can create/update/delete expenses; superusers
+Any member (owner or agent) of the finance instance can create/update/delete expenses; superusers
 get no access. An archived project takes no new expenses, but one already on it stays editable.
 
 ---

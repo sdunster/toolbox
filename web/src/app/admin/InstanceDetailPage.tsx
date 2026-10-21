@@ -11,9 +11,9 @@ import { InstanceDeleteControl } from "./InstanceDeleteControl";
 import { MembersSection } from "./MembersSection";
 import { InboundAddressesSection } from "./InboundAddressesSection";
 import { ApiTokensSection } from "./ApiTokensSection";
-import { InvoicingSettingsForm } from "../invoicing/InvoicingSettingsForm";
-import { InvoiceNumberingForm } from "../invoicing/InvoiceNumberingForm";
-import { BrandsSection } from "../invoicing/BrandsSection";
+import { FinanceSettingsForm } from "../finance/FinanceSettingsForm";
+import { InvoiceNumberingForm } from "../finance/InvoiceNumberingForm";
+import { BrandsSection } from "../finance/BrandsSection";
 
 const instanceDetailPageQuery = graphql`
   query InstanceDetailPageQuery($id: ID!) @throwOnFieldError {
@@ -21,7 +21,7 @@ const instanceDetailPageQuery = graphql`
       id
       kind
       ...InstanceEditForm_instance
-      ...InvoicingSettingsForm_instance
+      ...FinanceSettingsForm_instance
       ...InvoiceNumberingForm_instance
       ...BrandsSection_instance
       ...InstanceDeleteControl_instance
@@ -55,9 +55,9 @@ function Content({ id }: { id: string }) {
   }
 
   // Inbound addresses and API tokens are support-only (the API rejects both
-  // for an invoicing instance); an invoicing instance gets its business
+  // for a finance instance); a finance instance gets its business
   // settings here instead — the same form its owner sees.
-  const isInvoicing = data.adminInstance.kind === "INVOICING";
+  const isFinance = data.adminInstance.kind === "FINANCE";
 
   return (
     <div className="flex max-w-2xl flex-col gap-6">
@@ -69,15 +69,15 @@ function Content({ id }: { id: string }) {
         ← Back to instances
       </ButtonLink>
       <InstanceEditForm instance={data.adminInstance} />
-      {isInvoicing && (
+      {isFinance && (
         <>
-          <InvoicingSettingsForm instance={data.adminInstance} />
+          <FinanceSettingsForm instance={data.adminInstance} />
           <BrandsSection instance={data.adminInstance} />
           <InvoiceNumberingForm instance={data.adminInstance} />
         </>
       )}
       <MembersSection instance={data.adminInstance} query={data} />
-      {!isInvoicing && (
+      {!isFinance && (
         <>
           <InboundAddressesSection instance={data.adminInstance} />
           <ApiTokensSection instance={data.adminInstance} />
@@ -90,7 +90,7 @@ function Content({ id }: { id: string }) {
 
 /**
  * `/app/admin/instances/:id` — edit, members, inbound addresses and API
- * tokens (support) or business settings (invoicing), and delete/restore for
+ * tokens (support) or business settings (finance), and delete/restore for
  * one instance. Unlike `/app/tickets/:id`, reaching a
  * *superuser* here grants no ticket access — this page only ever touches
  * `Instance`'s own fields plus `members`/`inboundAddresses`, never

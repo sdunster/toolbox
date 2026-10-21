@@ -22,7 +22,7 @@
 //! - `invoices/{instance_id}/{invoice_id}/Invoice-{displayNumber}.pdf` — a
 //!   finalized invoice's rendered PDF (`graphql::mutations::download_invoice_pdf`),
 //!   written once and cached forever (`db::Invoice.pdf_s3_key`) — see
-//!   CLAUDE.md's "Invoicing" house rule. Unlike everything else in this
+//!   CLAUDE.md's "Finance" house rule. Unlike everything else in this
 //!   bucket, nothing expires this key: `infra/s3_mail.tf`'s lifecycle rule
 //!   deliberately excludes `invoices/` because a finalized invoice's PDF is
 //!   a permanent financial record, not transient mail.

@@ -21,8 +21,8 @@ use crate::broadcast;
 use crate::broadcast_send;
 use crate::db;
 use crate::db::Handler as _;
+use crate::finance;
 use crate::inbound::{attachments, routing};
-use crate::invoicing;
 use crate::mail::Handler as _;
 use crate::outbound;
 use crate::staff_notify::{self, Actor, StaffEvent};
@@ -34,8 +34,8 @@ use super::error::ApiError;
 use super::finance::{CreditNote, CreditNoteInput, RecordPaymentInput, SendDocumentInput};
 use super::query::{
     ApiTokenInfo, BillableItem, BillableItemInput, BrandInput, Broadcast, CreateProjectInput,
-    CreatedApiToken, Expense, ExpenseInput, InboundAddressInfo, Instance, InstanceKindType,
-    Invoice, InvoicingSettingsInput, MembershipInfo, MembershipRoleType, NotificationSettingsInput,
+    CreatedApiToken, Expense, ExpenseInput, FinanceSettingsInput, InboundAddressInfo, Instance,
+    InstanceKindType, Invoice, MembershipInfo, MembershipRoleType, NotificationSettingsInput,
     PasskeyInfo, Project, SaveBroadcastDraftInput, SendBroadcastInput, Ticket, TicketMessage,
     TicketStatusType, UpdateProjectInput, User,
 };
@@ -62,18 +62,18 @@ const MAX_VERIFIED_TICKET_RECIPIENTS: usize = 20;
 /// human-chosen label ("Zendesk sync", "Partner portal"), not meant to be a
 /// meaningful constraint in practice.
 const MAX_API_TOKEN_NAME_LEN: usize = 100;
-/// Length cap for a short invoicing-settings/project field (name, ABN,
+/// Length cap for a short finance-settings/project field (name, ABN,
 /// phone, email, reference) — see the build plan's validation-limits entry.
-const MAX_INVOICING_FIELD_LEN: usize = 200;
-/// Length cap for a long, multi-line invoicing-settings/project field
+const MAX_FINANCE_FIELD_LEN: usize = 200;
+/// Length cap for a long, multi-line finance-settings/project field
 /// (address, payment details).
-const MAX_INVOICING_LONG_FIELD_LEN: usize = 2000;
-/// Alias of [`MAX_INVOICING_FIELD_LEN`] for project fields — same limit,
+const MAX_FINANCE_LONG_FIELD_LEN: usize = 2000;
+/// Alias of [`MAX_FINANCE_FIELD_LEN`] for project fields — same limit,
 /// named for the call site it reads at.
-const MAX_PROJECT_FIELD_LEN: usize = MAX_INVOICING_FIELD_LEN;
-/// Alias of [`MAX_INVOICING_LONG_FIELD_LEN`] for project fields.
-const MAX_PROJECT_LONG_FIELD_LEN: usize = MAX_INVOICING_LONG_FIELD_LEN;
-/// Most items one invoice may carry — see CLAUDE.md's "Invoicing" house
+const MAX_PROJECT_FIELD_LEN: usize = MAX_FINANCE_FIELD_LEN;
+/// Alias of [`MAX_FINANCE_LONG_FIELD_LEN`] for project fields.
+const MAX_PROJECT_LONG_FIELD_LEN: usize = MAX_FINANCE_LONG_FIELD_LEN;
+/// Most items one invoice may carry — see CLAUDE.md's "Finance" house
 /// rule ("Validation limits"): a `TransactWriteItems` call caps out at 100
 /// actions, and one item is always taken by the invoice row itself.
 const MAX_INVOICE_ITEMS: usize = 50;
@@ -256,20 +256,20 @@ fn normalize_project_field(
     Ok(Some(trimmed.to_string()))
 }
 
-/// Trim an invoicing-settings string field; a blank result is `None` (the
+/// Trim a finance-settings string field; a blank result is `None` (the
 /// caller `REMOVE`s the attribute), matching the omit-optional-attributes
-/// house rule — `updateInvoicingSettings` is a full replace, so a field the
+/// house rule — `updateFinanceSettings` is a full replace, so a field the
 /// caller leaves blank is explicitly cleared, not left alone. Capped at
-/// [`MAX_INVOICING_FIELD_LEN`].
-fn normalize_invoicing_field(raw: &str, field_name: &str) -> Result<Option<String>> {
-    normalize_project_field(Some(raw), field_name, MAX_INVOICING_FIELD_LEN)
+/// [`MAX_FINANCE_FIELD_LEN`].
+fn normalize_finance_field(raw: &str, field_name: &str) -> Result<Option<String>> {
+    normalize_project_field(Some(raw), field_name, MAX_FINANCE_FIELD_LEN)
 }
 
-/// Same as [`normalize_invoicing_field`], for the two long/multi-line fields
+/// Same as [`normalize_finance_field`], for the two long/multi-line fields
 /// (`businessAddress`/`paymentDetails`), capped at
-/// [`MAX_INVOICING_LONG_FIELD_LEN`].
-fn normalize_invoicing_long_field(raw: &str, field_name: &str) -> Result<Option<String>> {
-    normalize_project_field(Some(raw), field_name, MAX_INVOICING_LONG_FIELD_LEN)
+/// [`MAX_FINANCE_LONG_FIELD_LEN`].
+fn normalize_finance_long_field(raw: &str, field_name: &str) -> Result<Option<String>> {
+    normalize_project_field(Some(raw), field_name, MAX_FINANCE_LONG_FIELD_LEN)
 }
 
 /// `updateBillableItem`/`deleteBillableItem`'s per-record authorization —
@@ -339,7 +339,7 @@ async fn validate_expense<A: App + HasDb + Send + Sync>(
 ) -> Result<db::ExpenseFields> {
     let instance_id = instance.id.as_str();
     let current_project_id = current.and_then(|c| c.project_id.as_deref());
-    let brand_id = invoicing::brand::validate_choice(
+    let brand_id = finance::brand::validate_choice(
         instance,
         input.brand_id.as_ref().map(|b| b.as_str()),
         current.and_then(|c| c.brand_id.as_deref()),
@@ -361,7 +361,7 @@ async fn validate_expense<A: App + HasDb + Send + Sync>(
             ));
         }
     }
-    invoicing::expense::validate_expense_input(invoicing::expense::ExpenseInput {
+    finance::expense::validate_expense_input(finance::expense::ExpenseInput {
         project_id: input.project_id.as_ref().map(|p| p.to_string()),
         brand_id,
         date: &input.date,
@@ -494,23 +494,23 @@ async fn fetch_eligible_items<A: App + HasDb + Send + Sync>(
 }
 
 /// Reject a prospective invoice total (subtotal + GST, in cents) that would
-/// exceed `Number.MAX_SAFE_INTEGER` — see CLAUDE.md's "Invoicing" house
-/// rule ("Totals overflow") and `invoicing::validate_total_within_safe_integer`.
+/// exceed `Number.MAX_SAFE_INTEGER` — see CLAUDE.md's "Finance" house
+/// rule ("Totals overflow") and `finance::validate_total_within_safe_integer`.
 fn check_invoice_total_within_safe_integer(
     items: &[db::BillableItem],
     gst_registered: bool,
 ) -> Result<()> {
     let subtotal: i64 = items
         .iter()
-        .map(|it| invoicing::money::line_amount_cents(it.quantity_hundredths, it.unit_price_cents))
+        .map(|it| finance::money::line_amount_cents(it.quantity_hundredths, it.unit_price_cents))
         .sum();
     let gst = if gst_registered {
-        invoicing::money::gst_cents(subtotal)
+        finance::money::gst_cents(subtotal)
     } else {
         0
     };
     let total = subtotal.saturating_add(gst);
-    invoicing::validate_total_within_safe_integer(total).map_err(|e| anyhow!(e))
+    finance::validate_total_within_safe_integer(total).map_err(|e| anyhow!(e))
 }
 
 /// A [`BillableItemInput`] after validation — canonical date, trimmed
@@ -529,11 +529,11 @@ fn validate_billable_item_input(
     unit_price_cents: i64,
 ) -> Result<ValidBillableItem> {
     Ok(ValidBillableItem {
-        date: invoicing::validate_item_date(&input.date).map_err(|e| anyhow!(e))?,
-        description: invoicing::validate_description(&input.description).map_err(|e| anyhow!(e))?,
-        quantity_hundredths: invoicing::money::parse_quantity(&input.quantity)
+        date: finance::validate_item_date(&input.date).map_err(|e| anyhow!(e))?,
+        description: finance::validate_description(&input.description).map_err(|e| anyhow!(e))?,
+        quantity_hundredths: finance::money::parse_quantity(&input.quantity)
             .map_err(|e| anyhow!(e))?,
-        unit_price_cents: invoicing::validate_unit_price_cents(unit_price_cents)
+        unit_price_cents: finance::validate_unit_price_cents(unit_price_cents)
             .map_err(|e| anyhow!(e))?,
     })
 }
@@ -575,15 +575,15 @@ fn validate_project_fields(input: ProjectFieldsInput<'_>) -> Result<db::ProjectF
         reference: normalize_project_field(input.reference, "reference", MAX_PROJECT_FIELD_LEN)?,
         payment_terms_days: input
             .payment_terms_days
-            .map(invoicing::validate_payment_terms_days)
+            .map(finance::validate_payment_terms_days)
             .transpose()
             .map_err(|e| anyhow!(e))?,
         default_unit_price_cents: input
             .default_unit_price_cents
-            .map(invoicing::validate_unit_price_cents)
+            .map(finance::validate_unit_price_cents)
             .transpose()
             .map_err(|e| anyhow!(e))?,
-        brand_id: invoicing::brand::validate_choice(
+        brand_id: finance::brand::validate_choice(
             input.instance,
             input.brand_id.map(|b| b.as_str()),
             input.current_brand_id,
@@ -616,7 +616,7 @@ fn new_payment(
 }
 
 /// Write a finalized invoice's new `payments` list, recomputing `paid_date`
-/// (`invoicing::ledger::settled_date`) in the same conditional write, and
+/// (`finance::ledger::settled_date`) in the same conditional write, and
 /// return the updated invoice. An invoice that was already settled keeps
 /// its `paid_date` if it still is; one newly settled is dated by its latest
 /// payment. `CONFLICT` if it changed since `invoice` was read.
@@ -626,7 +626,7 @@ async fn write_payments<A: App + HasDb + Send + Sync>(
     payments: Vec<db::InvoicePayment>,
 ) -> Result<Invoice<A>> {
     let fallback = invoice.paid_date.clone().unwrap_or_default();
-    let paid_date = invoicing::ledger::settled_date(
+    let paid_date = finance::ledger::settled_date(
         invoice.total_cents.unwrap_or(0),
         invoice.credited_cents,
         &payments,
@@ -639,7 +639,7 @@ async fn write_payments<A: App + HasDb + Send + Sync>(
     // Settled by credits alone with nothing to date it by.
     .map(|d| {
         if d.is_empty() {
-            invoicing::today_utc()
+            finance::today_utc()
         } else {
             d
         }
@@ -707,14 +707,14 @@ fn resolve_send_input(
     } else {
         input.to.clone()
     };
-    let (to, cc) = invoicing::send::normalize_recipients(&to, &input.cc).map_err(|e| anyhow!(e))?;
+    let (to, cc) = finance::send::normalize_recipients(&to, &input.cc).map_err(|e| anyhow!(e))?;
     let message =
-        invoicing::send::validate_message(input.message.as_deref()).map_err(|e| anyhow!(e))?;
+        finance::send::validate_message(input.message.as_deref()).map_err(|e| anyhow!(e))?;
     Ok((to, cc, message))
 }
 
 /// A finalized invoice's frozen snapshot.
-fn invoice_snapshot(invoice: &db::Invoice) -> Result<invoicing::snapshot::InvoiceSnapshot> {
+fn invoice_snapshot(invoice: &db::Invoice) -> Result<finance::snapshot::InvoiceSnapshot> {
     let json = invoice
         .snapshot
         .as_deref()
@@ -723,7 +723,7 @@ fn invoice_snapshot(invoice: &db::Invoice) -> Result<invoicing::snapshot::Invoic
         .map_err(|e| anyhow!("Invoice {} has a corrupt snapshot: {e}", invoice.id))
 }
 
-fn credit_note_snapshot(note: &db::CreditNote) -> Result<invoicing::snapshot::InvoiceSnapshot> {
+fn credit_note_snapshot(note: &db::CreditNote) -> Result<finance::snapshot::InvoiceSnapshot> {
     serde_json::from_str(&note.snapshot)
         .map_err(|e| anyhow!("Credit note {} has a corrupt snapshot: {e}", note.id))
 }
@@ -748,13 +748,13 @@ fn credit_note_pdf_filename(note: &db::CreditNote) -> String {
 async fn document_pdf<A: App + HasStorage + Send + Sync>(
     app: &A,
     cached_key: Option<&str>,
-    snapshot: &invoicing::snapshot::InvoiceSnapshot,
+    snapshot: &finance::snapshot::InvoiceSnapshot,
     new_key: &str,
 ) -> Result<(String, Vec<u8>)> {
     if let Some(key) = cached_key {
         return Ok((key.to_string(), app.storage().get_bytes(key).await?));
     }
-    let bytes = invoicing::pdf::render_invoice_pdf(snapshot)?;
+    let bytes = finance::pdf::render_invoice_pdf(snapshot)?;
     app.storage()
         .put_bytes(new_key, &bytes, "application/pdf")
         .await?;
@@ -793,7 +793,7 @@ fn rebill_description(expense: &db::Expense) -> String {
             distance_tenths_km, ..
         } => format!(
             "Vehicle travel: {} km",
-            invoicing::vehicle::format_distance_km(*distance_tenths_km)
+            finance::vehicle::format_distance_km(*distance_tenths_km)
         ),
     };
     match expense.fields.description.as_deref() {
@@ -1140,7 +1140,7 @@ struct SubmittedTicket {
 }
 
 /// The support instance a broadcast mutation names — `NOT_FOUND` for an
-/// invoicing, deleted or missing one alike, per the kind-isolation rule.
+/// finance, deleted or missing one alike, per the kind-isolation rule.
 async fn broadcast_instance<A: App + HasDb>(app: &A, instance_id: &ID) -> Result<db::Instance> {
     Ok(app
         .db()
@@ -1183,7 +1183,7 @@ fn validate_brand(
     input: &BrandInput,
     archived: bool,
 ) -> Result<db::Brand> {
-    let name = normalize_invoicing_field(&input.name, "name")?
+    let name = normalize_finance_field(&input.name, "name")?
         .ok_or_else(|| anyhow!("Brand name is required"))?;
     if instance
         .brands
@@ -1193,10 +1193,10 @@ fn validate_brand(
         return Err(anyhow!("There is already a brand called {name:?}"));
     }
     let opt = |v: &Option<String>, field: &str| {
-        normalize_invoicing_field(v.as_deref().unwrap_or(""), field)
+        normalize_finance_field(v.as_deref().unwrap_or(""), field)
     };
     let opt_long = |v: &Option<String>, field: &str| {
-        normalize_invoicing_long_field(v.as_deref().unwrap_or(""), field)
+        normalize_finance_long_field(v.as_deref().unwrap_or(""), field)
     };
     Ok(db::Brand {
         id,
@@ -1209,9 +1209,9 @@ fn validate_brand(
     })
 }
 
-/// Fetch an invoicing instance for brand management — `NOT_FOUND` when
+/// Fetch a finance instance for brand management — `NOT_FOUND` when
 /// missing, a validation error for a support instance (like
-/// `updateInvoicingSettings`).
+/// `updateFinanceSettings`).
 async fn brand_instance<A: App + HasDb + Send + Sync>(
     app: &A,
     instance_id: &ID,
@@ -1224,7 +1224,7 @@ async fn brand_instance<A: App + HasDb + Send + Sync>(
         .next()
         .flatten()
         .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-    db::require_instance_kind(&instance, db::InstanceKind::Invoicing).map_err(|e| anyhow!(e))?;
+    db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
     Ok(instance)
 }
 
@@ -1915,7 +1915,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// **Owner-only — not superuser.** Mass mail from an instance's domain is
     /// both a reputation risk (owner, like `addInboundAddress`) and customer
     /// communication whose replies become tickets (the ticket side of the
-    /// superuser boundary). An invoicing, deleted or missing instance is
+    /// superuser boundary). A finance, deleted or missing instance is
     /// `NOT_FOUND`, per the kind-isolation rule.
     ///
     /// **Queues, doesn't send.** Everything is validated (and one copy
@@ -2239,7 +2239,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// `broadcastSenders` updates in place.
     ///
     /// Owner-only — not superuser — like `sendBroadcast`, the only thing a
-    /// sender is for. An invoicing, deleted or missing instance is
+    /// sender is for. A finance, deleted or missing instance is
     /// `NOT_FOUND`; a concurrent change to the list is `CONFLICT`.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(instance_id.to_string()))")]
     async fn add_broadcast_sender(
@@ -2299,7 +2299,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         address: String,
     ) -> Result<InboundAddressInfo> {
         // Support-only — see CLAUDE.md's kind-isolation house rule. An
-        // invoicing instance is treated identically to "not found", never a
+        // finance instance is treated identically to "not found", never a
         // distinct error, so this can't be used to probe an instance's kind.
         self.app
             .db()
@@ -2813,7 +2813,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         }
 
         // Support-only — see CLAUDE.md's kind-isolation house rule. An
-        // invoicing instance is treated identically to "not found".
+        // finance instance is treated identically to "not found".
         self.app
             .db()
             .get_instances(&[instance_id.as_str()])
@@ -4183,14 +4183,14 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         Ok(true)
     }
 
-    // ── Invoicing settings ────────────────────────────────────────────────────
+    // ── Finance settings ────────────────────────────────────────────────────
 
-    /// Full-replace an invoicing instance's seller settings/payment footer —
-    /// `InstanceUpdateShape::SetInvoicingSettings`. Owner-or-superuser, the
+    /// Full-replace a finance instance's seller settings/payment footer —
+    /// `InstanceUpdateShape::SetFinanceSettings`. Owner-or-superuser, the
     /// same posture as `addInboundAddress`/`createApiToken`: this is
     /// instance settings, not something a plain agent can change. Rejects a
     /// support instance (`db::require_instance_kind`) — see CLAUDE.md's
-    /// "Invoicing" house rule.
+    /// "Finance" house rule.
     ///
     /// Every string field in `input` is trimmed; a blank result after
     /// trimming `REMOVE`s the corresponding attribute rather than writing an
@@ -4204,10 +4204,10 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     #[graphql(
         guard = "AuthGuard::new(AuthRequirement::InstanceOwnerOrSuperuser(instance_id.to_string()))"
     )]
-    async fn update_invoicing_settings(
+    async fn update_finance_settings(
         &self,
         instance_id: ID,
-        input: InvoicingSettingsInput,
+        input: FinanceSettingsInput,
     ) -> Result<Instance<A>> {
         let instance = self
             .app
@@ -4218,17 +4218,16 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
 
-        let business_name = normalize_invoicing_field(&input.business_name, "businessName")?;
-        let business_abn = normalize_invoicing_field(&input.business_abn, "businessAbn")?;
+        let business_name = normalize_finance_field(&input.business_name, "businessName")?;
+        let business_abn = normalize_finance_field(&input.business_abn, "businessAbn")?;
         let business_address =
-            normalize_invoicing_long_field(&input.business_address, "businessAddress")?;
-        let business_phone = normalize_invoicing_field(&input.business_phone, "businessPhone")?;
-        let business_email = normalize_invoicing_field(&input.business_email, "businessEmail")?;
+            normalize_finance_long_field(&input.business_address, "businessAddress")?;
+        let business_phone = normalize_finance_field(&input.business_phone, "businessPhone")?;
+        let business_email = normalize_finance_field(&input.business_email, "businessEmail")?;
         let payment_details =
-            normalize_invoicing_long_field(&input.payment_details, "paymentDetails")?;
+            normalize_finance_long_field(&input.payment_details, "paymentDetails")?;
         let currency = {
             let trimmed = input.currency.trim();
             if trimmed.is_empty() {
@@ -4240,7 +4239,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         };
         let payment_terms_days = input
             .payment_terms_days
-            .map(invoicing::validate_payment_terms_days)
+            .map(finance::validate_payment_terms_days)
             .transpose()
             .map_err(|e| anyhow!(e))?;
 
@@ -4248,7 +4247,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .db()
             .update_instance(
                 instance_id.as_str(),
-                db::InstanceUpdateShape::SetInvoicingSettings {
+                db::InstanceUpdateShape::SetFinanceSettings {
                     business_name: business_name.as_deref(),
                     business_abn: business_abn.as_deref(),
                     business_address: business_address.as_deref(),
@@ -4276,9 +4275,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         }))
     }
 
-    /// Add a brand — another name this invoicing instance issues under
+    /// Add a brand — another name this finance instance issues under
     /// (e.g. a registered business name beside the owner's legal name).
-    /// Owner-or-superuser, like `updateInvoicingSettings`: brands are
+    /// Owner-or-superuser, like `updateFinanceSettings`: brands are
     /// instance settings. At most `db::MAX_BRANDS`. Returns the instance,
     /// so a client's cached `brands` updates in place. See CLAUDE.md's
     /// "Brands" entry.
@@ -4302,8 +4301,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// Full-replace a brand, including `archived` (default `false`). An
     /// archived brand can't be chosen for a new project or expense but
     /// still appears in filters; there is no delete. The default brand
-    /// (`"default"`) is the instance's invoicing settings — change it with
-    /// `updateInvoicingSettings`. Changing a brand changes drafts and
+    /// (`"default"`) is the instance's finance settings — change it with
+    /// `updateFinanceSettings`. Changing a brand changes drafts and
     /// future invoices, never a finalized one.
     #[graphql(
         guard = "AuthGuard::new(AuthRequirement::InstanceOwnerOrSuperuser(instance_id.to_string()))"
@@ -4318,7 +4317,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         let instance = brand_instance(&*self.app, &instance_id).await?;
         if brand_id.as_str() == db::DEFAULT_BRAND_ID {
             return Err(anyhow!(
-                "The default brand is the invoicing settings — edit those instead"
+                "The default brand is the finance settings — edit those instead"
             ));
         }
         let Some(index) = instance
@@ -4336,9 +4335,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
 
     // ── Projects ──────────────────────────────────────────────────────────────
 
-    /// Create a project in an invoicing instance. Member (owner or agent) —
+    /// Create a project in a finance instance. Member (owner or agent) —
     /// managing projects/items/draft invoices is day-to-day work, not an
-    /// owner-only setting, per CLAUDE.md's "Invoicing" house rule. Rejects a
+    /// owner-only setting, per CLAUDE.md's "Finance" house rule. Rejects a
     /// support instance.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
     async fn create_project(
@@ -4355,8 +4354,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
 
         let fields = validate_project_fields(ProjectFieldsInput {
             instance: &instance,
@@ -4467,7 +4465,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     // ── Billable items ────────────────────────────────────────────────────────
 
     /// Record a billable item against a project. Any member of the project's
-    /// (invoicing) instance — authorised through the project, like
+    /// (finance) instance — authorised through the project, like
     /// `updateProject`: `NOT_FOUND` for a missing project and a non-member
     /// alike, and a superuser without a membership is a non-member. An
     /// archived project takes no new items (un-archive it first). See
@@ -4594,7 +4592,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
 
     /// Delete a billable item, returning its id (for the client's store).
     /// Unbilled only, regardless of the item's invoice's own status — see
-    /// CLAUDE.md's "Invoicing" house rule. Deleting an item `rebillExpense`
+    /// CLAUDE.md's "Finance" house rule. Deleting an item `rebillExpense`
     /// made frees its expense to be re-billed again (same transaction).
     async fn delete_billable_item(&self, ctx: &Context<'_>, id: ID) -> Result<ID> {
         let item = require_billable_item_member(ctx, &*self.app, id.as_str()).await?;
@@ -4617,7 +4615,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
 
     // ── Expenses ──────────────────────────────────────────────────────────────
 
-    /// Record an expense in an invoicing instance, optionally against one
+    /// Record an expense in a finance instance, optionally against one
     /// of its projects. Any member (owner or agent); superusers without a
     /// membership get nothing. Rejects a support instance. See
     /// `ExpenseInput` for which fields a purchase and a vehicle trip take.
@@ -4640,8 +4638,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
         let fields = validate_expense(&*self.app, &instance, &input, None).await?;
         let created = self
             .app
@@ -4707,7 +4704,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// transaction (`db::Handler::create_invoice`). Authorised through the
     /// project like `createBillableItem` — `NOT_FOUND` for a missing
     /// project or a non-member alike; an archived project is allowed (you
-    /// may be invoicing final work on a job you've since archived). Every
+    /// may be finance final work on a job you've since archived). Every
     /// id in `itemIds` must belong to this project and be currently
     /// unbilled (`CONFLICT`/`NOT_FOUND` otherwise), 1–50 of them
     /// (`MAX_INVOICE_ITEMS`), no duplicates.
@@ -4743,7 +4740,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 &project.id,
                 &ids,
                 user_id,
-                invoicing::brand::find(&instance, project.brand_id.as_deref())
+                finance::brand::find(&instance, project.brand_id.as_deref())
                     .map(|b| b.id.as_str()),
             )
             .await?
@@ -4945,7 +4942,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         if invoice.item_ids.is_empty() {
             return Err(anyhow!("Add at least one item before finalizing"));
         }
-        let issue_date = invoicing::validate_item_date(&issue_date).map_err(|e| anyhow!(e))?;
+        let issue_date = finance::validate_item_date(&issue_date).map_err(|e| anyhow!(e))?;
 
         // Step 2: a consistent BatchGetItem, verifying every item still
         // points back at this invoice — closes the race between this
@@ -4997,12 +4994,12 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .unwrap_or("")
             .is_empty()
         {
-            return Err(anyhow!("Complete the invoicing settings first"));
+            return Err(anyhow!("Complete the finance settings first"));
         }
 
         let due_date = match due_date.as_deref() {
-            Some(d) => invoicing::validate_item_date(d).map_err(|e| anyhow!(e))?,
-            None => invoicing::add_days(&issue_date, project.payment_terms_days(&instance))
+            Some(d) => finance::validate_item_date(d).map_err(|e| anyhow!(e))?,
+            None => finance::add_days(&issue_date, project.payment_terms_days(&instance))
                 .map_err(|e| anyhow!(e))?,
         };
         if due_date < issue_date {
@@ -5040,7 +5037,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         };
 
         // Step 5: build the snapshot.
-        let snapshot = invoicing::snapshot::build_snapshot(
+        let snapshot = finance::snapshot::build_snapshot(
             &instance,
             &project,
             &resolved_items,
@@ -5048,13 +5045,13 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             Some(&issue_date),
             Some(&due_date),
         );
-        invoicing::validate_total_within_safe_integer(snapshot.total_cents)
+        finance::validate_total_within_safe_integer(snapshot.total_cents)
             .map_err(|e| anyhow!(e))?;
         let snapshot_json = serde_json::to_string(&snapshot)
             .map_err(|e| anyhow!("Failed to serialize invoice snapshot: {e}"))?;
         // Stamped on the row with the snapshot: the brand it was built with.
         let brand_id =
-            invoicing::brand::find(&instance, project.brand_id.as_deref()).map(|b| b.id.clone());
+            finance::brand::find(&instance, project.brand_id.as_deref()).map(|b| b.id.clone());
 
         // Step 6: the conditional write, with the number's reservation. A
         // failure here leaves a counter-allocated `number` unused — a gap,
@@ -5130,7 +5127,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         }
         let payments = match &paid_date {
             Some(d) => {
-                let date = invoicing::validate_item_date(d).map_err(|e| anyhow!(e))?;
+                let date = finance::validate_item_date(d).map_err(|e| anyhow!(e))?;
                 let balance = invoice.balance_cents();
                 if balance <= 0 {
                     return Err(ApiError::conflict("Invoice is already paid").into());
@@ -5160,8 +5157,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         if invoice.status != db::InvoiceStatus::Finalized {
             return Err(ApiError::conflict("Only a finalized invoice can take payments").into());
         }
-        let date = invoicing::validate_item_date(&input.date).map_err(|e| anyhow!(e))?;
-        let note = invoicing::ledger::validate_payment_note(input.note.as_deref())
+        let date = finance::validate_item_date(&input.date).map_err(|e| anyhow!(e))?;
+        let note = finance::ledger::validate_payment_note(input.note.as_deref())
             .map_err(|e| anyhow!(e))?;
         let balance = invoice.balance_cents();
         if balance <= 0 {
@@ -5173,13 +5170,13 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         if input.amount_cents > balance {
             return Err(anyhow!(
                 "Amount is more than the {} still owing",
-                invoicing::money::format_cents(balance)
+                finance::money::format_cents(balance)
             ));
         }
-        if invoice.payments.len() >= invoicing::ledger::MAX_PAYMENTS_PER_INVOICE {
+        if invoice.payments.len() >= finance::ledger::MAX_PAYMENTS_PER_INVOICE {
             return Err(anyhow!(
                 "An invoice can have at most {} payments",
-                invoicing::ledger::MAX_PAYMENTS_PER_INVOICE
+                finance::ledger::MAX_PAYMENTS_PER_INVOICE
             ));
         }
         let mut payments = invoice.payments.clone();
@@ -5213,7 +5210,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// attached: to `input.to` (default: the project's client email) and
     /// `input.cc`, at most 10 in total, with an optional covering
     /// `message`. Sent from the system sender under the business name, with
-    /// `Reply-To` the business email — see `invoicing::send`. Sending is
+    /// `Reply-To` the business email — see `finance::send`. Sending is
     /// this mutation's whole point, so a send failure fails it (nothing is
     /// recorded); on success `sentAt`/`sentTo` are updated. Can be sent
     /// again (a reminder). `CONFLICT` on a draft.
@@ -5250,7 +5247,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         if invoice.pdf_s3_key.is_none() {
             self.app.db().set_invoice_pdf_key(&invoice.id, &key).await?;
         }
-        let built = invoicing::send::build(
+        let built = finance::send::build(
             &snapshot,
             invoice.balance_cents(),
             &bytes,
@@ -5284,16 +5281,16 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// `Content-Disposition: attachment; filename="Invoice-{displayNumber}.pdf"`
     /// (`storage::Handler::presign_get_download`, filename sanitised there).
     /// `CONFLICT` on a draft — finalization is what freezes the content a
-    /// PDF prints (CLAUDE.md's "Invoicing" house rule), so there's nothing
+    /// PDF prints (CLAUDE.md's "Finance" house rule), so there's nothing
     /// yet to render.
     ///
     /// This is a mutation, not a query, because the *first* call for a
     /// given invoice writes: it renders the frozen `snapshot` (the only input
-    /// `invoicing::pdf::render_invoice_pdf` reads), stores it, and caches the
+    /// `finance::pdf::render_invoice_pdf` reads), stores it, and caches the
     /// key on the row (`db::Handler::set_invoice_pdf_key`). Every later call
     /// presigns the cached key. Rendering is deterministic from the snapshot,
     /// so two callers racing the first render each store a correct PDF of
-    /// the same invoice — see `invoicing::pdf`'s doc comment.
+    /// the same invoice — see `finance::pdf`'s doc comment.
     async fn download_invoice_pdf(&self, ctx: &Context<'_>, invoice_id: ID) -> Result<String> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
         if invoice.status != db::InvoiceStatus::Finalized {
@@ -5346,8 +5343,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 ApiError::conflict("A credit note can only adjust a finalized invoice").into(),
             );
         }
-        let issue_date =
-            invoicing::validate_item_date(&input.issue_date).map_err(|e| anyhow!(e))?;
+        let issue_date = finance::validate_item_date(&input.issue_date).map_err(|e| anyhow!(e))?;
         if invoice
             .issue_date
             .as_deref()
@@ -5374,7 +5370,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                         "This invoice already has a credit note — list the lines to credit"
                     ));
                 }
-                invoicing::snapshot::full_credit_lines(&invoice_snap)
+                finance::snapshot::full_credit_lines(&invoice_snap)
             }
             Some(lines) => {
                 if lines.is_empty() || lines.len() > MAX_INVOICE_ITEMS {
@@ -5388,10 +5384,10 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                         if l.amount_cents <= 0 {
                             return Err(anyhow!("Each line's amount must be greater than zero"));
                         }
-                        invoicing::validate_unit_price_cents(l.amount_cents)
+                        finance::validate_unit_price_cents(l.amount_cents)
                             .map_err(|e| anyhow!(e))?;
-                        Ok(invoicing::snapshot::CreditLine {
-                            description: invoicing::validate_description(&l.description)
+                        Ok(finance::snapshot::CreditLine {
+                            description: finance::validate_description(&l.description)
                                 .map_err(|e| anyhow!(e))?,
                             amount_cents: l.amount_cents,
                             gst_free: l.gst_free,
@@ -5401,7 +5397,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             }
         };
         // Check the total against what's left before spending a number on it.
-        let trial = invoicing::snapshot::build_credit_note_snapshot(
+        let trial = finance::snapshot::build_credit_note_snapshot(
             &invoice_snap,
             0,
             &issue_date,
@@ -5412,8 +5408,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         if trial.total_cents > creditable {
             return Err(anyhow!(
                 "That credits {} but only {} of this invoice is left to credit",
-                invoicing::money::format_cents(trial.total_cents),
-                invoicing::money::format_cents(creditable.max(0))
+                finance::money::format_cents(trial.total_cents),
+                finance::money::format_cents(creditable.max(0))
             ));
         }
 
@@ -5423,7 +5419,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .increment_credit_note_counter(&invoice.instance_id)
             .await?;
         let number = u32::try_from(number).unwrap_or(u32::MAX);
-        let snapshot = invoicing::snapshot::build_credit_note_snapshot(
+        let snapshot = finance::snapshot::build_credit_note_snapshot(
             &invoice_snap,
             number,
             &issue_date,
@@ -5451,7 +5447,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             brand_id: invoice.brand_id.clone(),
         };
         let settled = if invoice.paid_date.is_none() {
-            invoicing::ledger::settled_date(
+            finance::ledger::settled_date(
                 invoice.total_cents.unwrap_or(0),
                 invoice.credited_cents + note.total_cents,
                 &invoice.payments,
@@ -5543,7 +5539,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 .set_credit_note_pdf_key(&note.id, &key)
                 .await?;
         }
-        let built = invoicing::send::build(
+        let built = finance::send::build(
             &snapshot,
             0,
             &bytes,
@@ -5612,11 +5608,11 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 "Project is archived — un-archive it to add billable items"
             ));
         }
-        let markup = invoicing::parse_markup_basis_points(markup_percent.as_deref().unwrap_or(""))
+        let markup = finance::parse_markup_basis_points(markup_percent.as_deref().unwrap_or(""))
             .map_err(|e| anyhow!(e))?;
         let unit_price_cents =
-            invoicing::rebill_unit_price_cents(expense.amount_ex_gst_cents(), markup);
-        invoicing::validate_unit_price_cents(unit_price_cents).map_err(|e| anyhow!(e))?;
+            finance::rebill_unit_price_cents(expense.amount_ex_gst_cents(), markup);
+        finance::validate_unit_price_cents(unit_price_cents).map_err(|e| anyhow!(e))?;
         let description = match description
             .as_deref()
             .map(str::trim)
@@ -5625,7 +5621,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             Some(d) => d.to_string(),
             None => rebill_description(&expense),
         };
-        let description = invoicing::validate_description(&description).map_err(|e| anyhow!(e))?;
+        let description = finance::validate_description(&description).map_err(|e| anyhow!(e))?;
         let created = self
             .app
             .db()
@@ -5772,8 +5768,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
         if next < 1 {
             return Err(anyhow!("next must be at least 1"));
         }

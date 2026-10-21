@@ -5,10 +5,10 @@ gets one or more inbound email addresses; mail to those addresses opens or updat
 Requesters and CCs stay in the loop by email while agents work the queue from a web admin UI.
 Anyone can also raise a ticket from the public web form after verifying their email with a code.
 
-A second, separate function — **invoicing** — lives in its own instances alongside support ones,
+A second, separate function — **finance** — lives in its own instances alongside support ones,
 sharing the same instance switcher and membership roles: track clients/projects, record billable
 items, turn them into invoices, and track expenses (including cents-per-km vehicle trips). Once finalized, an invoice is read-only and downloadable as a
-PDF, rendered server-side from its frozen content (see CLAUDE.md's "Invoicing" house rule); it can
+PDF, rendered server-side from its frozen content (see CLAUDE.md's "Finance" house rule); it can
 be emailed to the client, paid off in part or in full, and corrected only by a credit note.
 
 **Features:**
@@ -20,7 +20,7 @@ be emailed to the client, paid off in part or in full, and corrected only by a c
   batches — every reply opens its own ticket
 - Passwordless auth — email code or passkeys — for agents; email-code verification for public
   ticket submission
-- Invoicing instances: clients/projects, billable items, invoices, and expenses — a second function
+- Finance instances: clients/projects, billable items, invoices, and expenses — a second function
   alongside support, isolated from it but sharing the same login and instance switcher
 - Finalized invoices download as a PDF, rendered server-side and cached in S3 behind a presigned,
   filename-forcing download link, and can be emailed to the client with the PDF attached

@@ -54,7 +54,7 @@ Tools:
 | `update_ticket_recipients` | Add/remove one requester or CC | no |
 | `list_instance_members` | Members of an instance the caller owns (to find an id to assign to) | — |
 
-Invoicing tools (INVOICING instances only; only `send_invoice`/`send_credit_note` send email):
+Finance tools (FINANCE instances only; only `send_invoice`/`send_credit_note` send email):
 
 | Tool | What |
 |---|---|
@@ -73,7 +73,7 @@ Invoicing tools (INVOICING instances only; only `send_invoice`/`send_credit_note
 | `get_vehicle_km_summary` | The caller's own trip km for a financial year against the ATO's 5,000 km cap |
 
 Not exposed: attachments (an MCP client can't upload, and download URLs are presigned links), the
-raw HTML body, and the owner-level invoicing settings and next-invoice-number (use the web app).
+raw HTML body, and the owner-level finance settings and next-invoice-number (use the web app).
 
 Connecting a client (e.g. Claude Code): `claude mcp add --transport http toolbox https://<web_domain>/mcp`,
 then approve the request on the consent page. Locally, run `make dev-local` and use

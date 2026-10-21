@@ -370,26 +370,26 @@ pub enum WebauthnCredentialUpdate {
 /// creation** — `updateInstance`/`InstanceUpdateShape` has no way to change
 /// it, and there is no CLI command that does either. Per the
 /// omit-optional-attributes house rule, `kind` is written to the row only
-/// for `Invoicing`; an absent attribute means `Support`, so every instance
-/// created before invoicing existed needs no migration.
+/// for `Finance`; an absent attribute means `Support`, so every instance
+/// created before finance existed needs no migration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InstanceKind {
     Support,
-    Invoicing,
+    Finance,
 }
 
 impl InstanceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Support => "support",
-            Self::Invoicing => "invoicing",
+            Self::Finance => "finance",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "support" => Some(Self::Support),
-            "invoicing" => Some(Self::Invoicing),
+            "finance" => Some(Self::Finance),
             _ => None,
         }
     }
@@ -408,7 +408,7 @@ pub struct Instance {
     /// `publicInstances` and whether `requestSubmitCode` will issue a code for
     /// it. Per the omit-optional-attributes house rule, only ever written as
     /// `true`; `false` is the absence of the attribute. Support-only in
-    /// practice (an invoicing instance is rejected by
+    /// practice (a finance instance is rejected by
     /// [`require_instance_kind`] everywhere this would matter), but the
     /// attribute itself is not kind-gated at the storage layer.
     pub public_submission_enabled: bool,
@@ -419,11 +419,11 @@ pub struct Instance {
     /// `public_submission_enabled`: present (and `true`) means deleted, absent
     /// means active.
     pub deleted: bool,
-    // ── Invoicing settings (invoicing instances only; see CLAUDE.md's
-    // "Invoicing" house rule) — every field here is optional and follows the
+    // ── Finance settings (finance instances only; see CLAUDE.md's
+    // "Finance" house rule) — every field here is optional and follows the
     // omit-optional-attributes convention. A support instance never has any
     // of these set; nothing enforces that at the storage layer, but every
-    // write path that could set them (`updateInvoicingSettings`) rejects a
+    // write path that could set them (`updateFinanceSettings`) rejects a
     // support instance first via `require_instance_kind`.
     pub business_name: Option<String>,
     pub business_abn: Option<String>,
@@ -435,7 +435,7 @@ pub struct Instance {
     /// instance starts not registered for GST. See CLAUDE.md.
     pub gst_registered: bool,
     /// Absent means `"AUD"` — see [`Handler::update_instance`]'s
-    /// `SetInvoicingSettings` doc comment and `validate_currency_code`.
+    /// `SetFinanceSettings` doc comment and `validate_currency_code`.
     pub currency: Option<String>,
     /// Days after the issue date an invoice falls due, unless its project
     /// overrides it. Absent means [`DEFAULT_PAYMENT_TERMS_DAYS`] — see
@@ -445,13 +445,13 @@ pub struct Instance {
     /// [`BroadcastSender`]. Stored as one JSON string attribute
     /// (`broadcast_senders`), absent when empty.
     pub broadcast_senders: Vec<BroadcastSender>,
-    /// Extra brands (invoicing instances only) — see [`Brand`]. Stored as one
+    /// Extra brands (finance instances only) — see [`Brand`]. Stored as one
     /// JSON string attribute (`brands`), absent when empty. The instance's
-    /// own invoicing settings are the default brand and are not in here.
+    /// own finance settings are the default brand and are not in here.
     pub brands: Vec<Brand>,
 }
 
-/// The id the API gives the default brand — the instance's own invoicing
+/// The id the API gives the default brand — the instance's own finance
 /// settings. Never stored: a row with no `brand_id` belongs to it. A stored
 /// brand's id is a nanoid, which can't collide with this.
 pub const DEFAULT_BRAND_ID: &str = "default";
@@ -526,7 +526,7 @@ pub struct BroadcastSender {
 impl Instance {
     /// This instance's currency code, defaulting to `"AUD"` when unset — the
     /// one place that default is decided, shared by the GraphQL resolver and
-    /// anything else (the invoicing snapshot builder, in a later PR) that
+    /// anything else (the finance snapshot builder, in a later PR) that
     /// needs the effective code rather than the raw optional attribute.
     pub fn currency_or_default(&self) -> &str {
         self.currency.as_deref().unwrap_or("AUD")
@@ -569,17 +569,17 @@ pub enum InstanceUpdateShape<'a> {
     /// `deleted` attribute; `false` removes it — never written as `Bool(false)`,
     /// per the omit-optional-attributes house rule.
     SetDeleted(bool),
-    /// Full-replace of every invoicing-settings attribute —
-    /// `updateInvoicingSettings`'s write path. Each `Option<&str>` field is
+    /// Full-replace of every finance-settings attribute —
+    /// `updateFinanceSettings`'s write path. Each `Option<&str>` field is
     /// `Some` to `SET` (after the caller has trimmed and length-checked it)
-    /// or `None` to `REMOVE` — the caller (`graphql::mutations::update_invoicing_settings`)
+    /// or `None` to `REMOVE` — the caller (`graphql::mutations::update_finance_settings`)
     /// turns an empty/blank input string into `None` before this is built, so
     /// this variant itself does no trimming. `gst_registered` is the one
     /// plain `bool`: `true` `SET`s the attribute, `false` `REMOVE`s it, per
     /// the omit-optional-attributes house rule (it is only ever written
-    /// `true`). Never touches `kind`, `name`, or any other non-invoicing
+    /// `true`). Never touches `kind`, `name`, or any other non-finance
     /// field.
-    SetInvoicingSettings {
+    SetFinanceSettings {
         business_name: Option<&'a str>,
         business_abn: Option<&'a str>,
         business_address: Option<&'a str>,
@@ -595,17 +595,17 @@ pub enum InstanceUpdateShape<'a> {
 
 /// Reject an instance whose `kind` isn't the one an operation requires — the
 /// one place both directions of the kind-isolation house rule (CLAUDE.md) are
-/// checked, so a support-only mutation and an invoicing-only one can't
+/// checked, so a support-only mutation and a finance-only one can't
 /// independently drift on the wording or the check itself.
 ///
 /// Callers that need "not found" semantics (a support-only operation reached
-/// with an invoicing instance id, treated identically to a missing/deleted
+/// with a finance instance id, treated identically to a missing/deleted
 /// instance — `addInboundAddress`, `createApiToken`, `submitTicket`/
 /// `submitVerifiedTicket`, the requester submit-code flow) fold the kind
 /// check into their own `.filter(...)`/`ok_or_else` chain (comparing
 /// `instance.kind` directly) rather than calling this and mapping its error;
-/// this function is for the other direction — an invoicing-only operation
-/// (projects, `updateInvoicingSettings`) rejecting a support instance with a
+/// this function is for the other direction — a finance-only operation
+/// (projects, `updateFinanceSettings`) rejecting a support instance with a
 /// plain validation-style error.
 pub fn require_instance_kind(
     instance: &Instance,
@@ -635,8 +635,8 @@ pub fn validate_currency_code(code: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// A `project` row — a client/job an invoicing instance bills against.
-/// Invoicing-only: every write path that creates or updates one rejects a
+/// A `project` row — a client/job a finance instance bills against.
+/// Finance-only: every write path that creates or updates one rejects a
 /// support instance via [`require_instance_kind`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
@@ -712,7 +712,7 @@ pub enum ProjectUpdateShape<'a> {
 
 /// A `billable_item` row — one line of work recorded against a [`Project`],
 /// later collected onto an invoice. Money is integer throughout — see
-/// `crate::invoicing::money`.
+/// `crate::finance::money`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BillableItem {
     pub id: String,
@@ -722,7 +722,7 @@ pub struct BillableItem {
     pub instance_id: String,
     pub project_id: String,
     /// `YYYY-MM-DD`, always in exactly that form
-    /// (`invoicing::validate_item_date`) — it is the listing GSIs' sort key,
+    /// (`finance::validate_item_date`) — it is the listing GSIs' sort key,
     /// so the string order must be the date order.
     pub date: String,
     /// Trimmed, non-empty, ≤ 2000 chars, may be multi-line.
@@ -733,7 +733,7 @@ pub struct BillableItem {
     pub unit_price_cents: i64,
     /// The invoice this item is on, if any — absent means unbilled. Nothing
     /// sets it yet: invoices (and the transactional attach/detach that writes
-    /// this) arrive in the next PR of the invoicing stack. Until then every
+    /// this) arrive in the next PR of the finance stack. Until then every
     /// item is unbilled, and the update/delete paths already refuse an item
     /// that has one.
     pub invoice_id: Option<String>,
@@ -931,7 +931,7 @@ impl ExpenseCategory {
 /// The shape-specific half of an expense. Which variant a row has is
 /// decided by its category — [`ExpenseCategory::VehicleKm`] is always a
 /// `VehicleKm`, every other category a `Purchase` — enforced by
-/// `invoicing::expense::validate_expense_input`, the one constructor every
+/// `finance::expense::validate_expense_input`, the one constructor every
 /// write path goes through.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExpenseDetail {
@@ -945,7 +945,7 @@ pub enum ExpenseDetail {
     },
     /// A business trip claimed by the ATO's cents-per-km method. Carries no
     /// GST. The amount is derived, never stored —
-    /// [`crate::invoicing::vehicle::trip_amount_cents`].
+    /// [`crate::finance::vehicle::trip_amount_cents`].
     VehicleKm {
         distance_tenths_km: i64,
         /// Looked up from the ATO table by the trip's date at write time
@@ -975,7 +975,7 @@ pub struct ExpenseFields {
     pub brand_id: Option<String>,
 }
 
-/// An `expense` row — money an invoicing instance spent, optionally against
+/// An `expense` row — money a finance instance spent, optionally against
 /// one of its [`Project`]s. Never linked to an invoice.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Expense {
@@ -1028,10 +1028,9 @@ impl Expense {
             ExpenseDetail::VehicleKm {
                 distance_tenths_km,
                 rate_cents_per_km,
-            } => crate::invoicing::vehicle::trip_amount_cents(
-                *distance_tenths_km,
-                *rate_cents_per_km,
-            ),
+            } => {
+                crate::finance::vehicle::trip_amount_cents(*distance_tenths_km, *rate_cents_per_km)
+            }
         }
     }
 }
@@ -1069,7 +1068,7 @@ pub struct ListExpensesPage {
 }
 
 /// `invoice.status`. **Strictly one-way**: `Finalized` never reverts to
-/// `Draft` — no void, no un-finalize, per CLAUDE.md's "Invoicing" house
+/// `Draft` — no void, no un-finalize, per CLAUDE.md's "Finance" house
 /// rule. The only thing that changes on a finalized invoice afterward is
 /// `paid_date`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1096,7 +1095,7 @@ impl InvoiceStatus {
 }
 
 /// An `invoice` row — a project's billable items collected for billing. See
-/// CLAUDE.md's "Invoicing" house rule for the domain rules this shape
+/// CLAUDE.md's "Finance" house rule for the domain rules this shape
 /// exists to support: `item_ids`/`version` back the transactional attach/
 /// detach/finalize machinery in [`Handler`]'s `invoice` methods; everything
 /// from `number` onward is `None` until [`Handler::finalize_invoice`] sets
@@ -1129,10 +1128,10 @@ pub struct Invoice {
     /// `YYYY-MM-DD`. Absent for a draft; set once, at finalization, never
     /// changed afterward.
     pub issue_date: Option<String>,
-    /// Frozen JSON (`invoicing::snapshot::InvoiceSnapshot`, `schema_version:
+    /// Frozen JSON (`finance::snapshot::InvoiceSnapshot`, `schema_version:
     /// 1`) of everything the invoice prints — set once, at finalization.
     /// Absent for a draft, whose printable content is instead built live
-    /// (`invoicing::snapshot::build_snapshot`) from the project/instance/
+    /// (`finance::snapshot::build_snapshot`) from the project/instance/
     /// items as they stand right now.
     pub snapshot: Option<String>,
     /// Denormalised from the snapshot so listing/sorting never needs to
@@ -1247,7 +1246,7 @@ pub struct CreditNote {
     /// `YYYY-MM-DD`.
     pub issue_date: String,
     pub reason: String,
-    /// Frozen `invoicing::snapshot::InvoiceSnapshot` JSON, with its
+    /// Frozen `finance::snapshot::InvoiceSnapshot` JSON, with its
     /// `credit_note` block set.
     pub snapshot: String,
     pub subtotal_cents: i64,
@@ -2495,7 +2494,7 @@ pub trait Handler: Sync {
     ) -> impl Future<Output = Result<Vec<Option<Project>>>> + Send;
     /// Every project for one instance, via `instance_id-index` — the
     /// projects list's data source. Unpaginated, matching
-    /// `list_inbound_addresses_by_instance`: an invoicing instance's project
+    /// `list_inbound_addresses_by_instance`: a finance instance's project
     /// list is small enough (clients/jobs, not a user-generated table) that
     /// a Relay connection would be overhead with no real page to turn.
     fn list_projects_by_instance(
@@ -2557,7 +2556,7 @@ pub trait Handler: Sync {
     /// Delete, with the same "exists and unbilled" condition and `Ok(false)`
     /// contract as [`Self::update_billable_item`]'s `None` path. Deleting an
     /// item on any invoice (draft or finalized) is refused — see
-    /// CLAUDE.md's "Invoicing" house rule.
+    /// CLAUDE.md's "Finance" house rule.
     ///
     /// `source_expense_id` must be the item's current one: when set, the
     /// delete is a transaction that also `REMOVE`s the expense's
@@ -2886,7 +2885,7 @@ pub trait Handler: Sync {
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Atomically allocate the next invoice number via `UpdateItem ADD` on
     /// `counter` (`id = instance_id`, attribute `next_invoice_number`) —
-    /// the invoicing counterpart of [`Self::increment_ticket_counter`], same
+    /// the finance counterpart of [`Self::increment_ticket_counter`], same
     /// gap-not-duplicate reasoning.
     fn increment_invoice_counter(
         &self,
@@ -2894,7 +2893,7 @@ pub trait Handler: Sync {
     ) -> impl Future<Output = Result<u64>> + Send;
     /// Read the counter's current value without incrementing it — `0` if
     /// the attribute is absent (no invoice finalized yet). Backs
-    /// `InvoicingSettingsInfo.nextInvoiceNumber` (`= this + 1`), read lazily
+    /// `FinanceSettingsInfo.nextInvoiceNumber` (`= this + 1`), read lazily
     /// by that one field's resolver rather than on every `Instance` fetch.
     fn get_invoice_counter(&self, instance_id: &str) -> impl Future<Output = Result<u64>> + Send;
     /// `setNextInvoiceNumber`'s write path: set `next_invoice_number =
@@ -3514,7 +3513,7 @@ mod tests {
 
     #[test]
     fn instance_kind_as_str_parse_round_trips() {
-        for kind in [InstanceKind::Support, InstanceKind::Invoicing] {
+        for kind in [InstanceKind::Support, InstanceKind::Finance] {
             assert_eq!(InstanceKind::parse(kind.as_str()), Some(kind));
         }
     }
@@ -3532,7 +3531,7 @@ mod tests {
             id: "inst1".into(),
             name: "Test".into(),
             slug: "test".into(),
-            kind: InstanceKind::Invoicing,
+            kind: InstanceKind::Finance,
             public_submission_enabled: false,
             from_name: String::new(),
             signature: String::new(),
@@ -3550,7 +3549,7 @@ mod tests {
             broadcast_senders: Vec::new(),
             brands: Vec::new(),
         };
-        assert!(require_instance_kind(&instance, InstanceKind::Invoicing).is_ok());
+        assert!(require_instance_kind(&instance, InstanceKind::Finance).is_ok());
         assert!(require_instance_kind(&instance, InstanceKind::Support).is_err());
     }
 
@@ -3560,7 +3559,7 @@ mod tests {
             id: "inst1".into(),
             name: "Test".into(),
             slug: "test".into(),
-            kind: InstanceKind::Invoicing,
+            kind: InstanceKind::Finance,
             public_submission_enabled: false,
             from_name: String::new(),
             signature: String::new(),

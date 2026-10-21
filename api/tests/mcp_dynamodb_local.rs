@@ -201,9 +201,9 @@ async fn whoami_reports_memberships_with_role_and_kind() {
     let f = fixture(&prefix).await;
     let user = make_user(&f, "mcp-who", false).await;
     let (support, _) = make_instance(&f, "mcp-support", db::InstanceKind::Support).await;
-    let (invoicing, _) = make_instance(&f, "mcp-invoicing", db::InstanceKind::Invoicing).await;
+    let (finance, _) = make_instance(&f, "mcp-finance", db::InstanceKind::Finance).await;
     add_member(&f, &user, &support, true).await;
-    add_member(&f, &user, &invoicing, false).await;
+    add_member(&f, &user, &finance, false).await;
     let token = access_token_for(&f, &user).await;
 
     let who = call_tool(&f, &token, "whoami", json!({})).await.unwrap();
@@ -225,7 +225,7 @@ async fn whoami_reports_memberships_with_role_and_kind() {
         })
         .collect();
     assert_eq!(by_instance[support.as_str()], ("OWNER", "SUPPORT"));
-    assert_eq!(by_instance[invoicing.as_str()], ("AGENT", "INVOICING"));
+    assert_eq!(by_instance[finance.as_str()], ("AGENT", "FINANCE"));
     // Nothing that belongs to the site session leaks into the tool output.
     let text = who.to_string();
     for forbidden in [

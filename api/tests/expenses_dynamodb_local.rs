@@ -192,7 +192,7 @@ fn build_schema(db: dynamodb::Handler) -> TestSchema {
     }
 }
 
-/// An invoicing instance with one agent and one project, returning
+/// A finance instance with one agent and one project, returning
 /// `(instance_id, agent_user_id, project_id)`.
 async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) {
     let instance = db
@@ -202,7 +202,7 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) 
             label,
             "",
             false,
-            db::InstanceKind::Invoicing,
+            db::InstanceKind::Finance,
         )
         .await
         .expect("create_instance");

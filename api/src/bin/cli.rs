@@ -253,14 +253,14 @@ impl From<RoleArg> for MembershipRole {
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum KindArg {
     Support,
-    Invoicing,
+    Finance,
 }
 
 impl From<KindArg> for InstanceKind {
     fn from(k: KindArg) -> Self {
         match k {
             KindArg::Support => InstanceKind::Support,
-            KindArg::Invoicing => InstanceKind::Invoicing,
+            KindArg::Finance => InstanceKind::Finance,
         }
     }
 }

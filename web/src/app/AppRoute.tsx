@@ -10,14 +10,14 @@ import Settings from "./Settings";
 import { TicketListPage } from "./tickets/TicketListPage";
 import { TicketThreadPage } from "./tickets/TicketThreadPage";
 import { BroadcastPage } from "./broadcast/BroadcastPage";
-import { ProjectListPage } from "./invoicing/ProjectListPage";
-import { ProjectDetailPage } from "./invoicing/ProjectDetailPage";
-import { BillableItemListPage } from "./invoicing/BillableItemListPage";
-import { ExpenseListPage } from "./invoicing/ExpenseListPage";
-import { InvoiceListPage } from "./invoicing/InvoiceListPage";
-import { InvoiceDetailPage } from "./invoicing/InvoiceDetailPage";
-import { InvoicingSettingsPage } from "./invoicing/InvoicingSettingsPage";
-import { ReportsPage } from "./invoicing/ReportsPage";
+import { ProjectListPage } from "./finance/ProjectListPage";
+import { ProjectDetailPage } from "./finance/ProjectDetailPage";
+import { BillableItemListPage } from "./finance/BillableItemListPage";
+import { ExpenseListPage } from "./finance/ExpenseListPage";
+import { InvoiceListPage } from "./finance/InvoiceListPage";
+import { InvoiceDetailPage } from "./finance/InvoiceDetailPage";
+import { FinanceSettingsPage } from "./finance/FinanceSettingsPage";
+import { ReportsPage } from "./finance/ReportsPage";
 import { useSelectedInstance } from "./SelectedInstanceContext";
 import { homePathForKind } from "./selectedInstance";
 
@@ -35,7 +35,7 @@ const AdminRoute = lazyWithReload("admin", () => import("./admin/AdminRoute"));
  * area instead, where they actually have something to do. Anyone else
  * (including a superuser who *is* a member somewhere) lands on the selected
  * instance's home page — the ticket queue for a support instance, invoices
- * for an invoicing one. With memberships but no selection yet (the
+ * for a finance one. With memberships but no selection yet (the
  * switcher publishes its initial pick from an effect, one render after
  * this first mounts), it renders nothing and redirects on the next render,
  * rather than guessing a kind and bouncing.
@@ -129,10 +129,7 @@ export default function AppRoute() {
           <Route path="billable-items" element={<BillableItemListPage />} />
           <Route path="expenses" element={<ExpenseListPage />} />
           <Route path="reports" element={<ReportsPage />} />
-          <Route
-            path="invoicing-settings"
-            element={<InvoicingSettingsPage />}
-          />
+          <Route path="finance-settings" element={<FinanceSettingsPage />} />
           <Route path="settings" element={<Settings />} />
           <Route
             path="admin/*"

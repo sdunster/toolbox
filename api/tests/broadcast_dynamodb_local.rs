@@ -406,11 +406,11 @@ async fn only_an_owner_of_a_support_instance_can_send() {
     let resp = send(&schema, superuser, &instance.id, &from, &to).await;
     assert_eq!(expect_error_code(&resp), "UNAUTHENTICATED");
 
-    let (invoicing, inv_owner, _) = setup_instance(&db, "permi", db::InstanceKind::Invoicing).await;
+    let (finance, inv_owner, _) = setup_instance(&db, "permi", db::InstanceKind::Finance).await;
     let resp = send(
         &schema,
-        user_auth(&inv_owner, &invoicing.id, true),
-        &invoicing.id,
+        user_auth(&inv_owner, &finance.id, true),
+        &finance.id,
         &from,
         &to,
     )
@@ -595,15 +595,15 @@ async fn saved_senders_are_added_listed_and_deleted_by_an_owner_only() {
 }
 
 #[tokio::test]
-async fn saved_senders_are_not_found_on_an_invoicing_instance() {
+async fn saved_senders_are_not_found_on_an_finance_instance() {
     let prefix = require_local_db!();
     let db = dynamodb::Handler::new(&prefix, false).await;
-    let (invoicing, owner, _) = setup_instance(&db, "sndi", db::InstanceKind::Invoicing).await;
+    let (finance, owner, _) = setup_instance(&db, "sndi", db::InstanceKind::Finance).await;
     let (_app, schema) = build_app_and_schema(db.clone());
     let resp = add_sender(
         &schema,
-        user_auth(&owner, &invoicing.id, true),
-        &invoicing.id,
+        user_auth(&owner, &finance.id, true),
+        &finance.id,
         "News",
         "news@example.org",
     )

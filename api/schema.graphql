@@ -144,7 +144,7 @@ of editable fields for both (update is a full replace).
 - `description`: trimmed, non-empty, ≤ 2000 chars, multi-line allowed.
 - `quantity`: a decimal **string** with at most 2 dp, `0 < q ≤ 1,000,000`
 (`"2"`, `"1.5"`, `"0.25"`) — a string so no client float ever gets
-near it; the server is the one parser (`invoicing::money::parse_quantity`).
+near it; the server is the one parser (`finance::money::parse_quantity`).
 - `unitPriceCents`: integer cents, GST-exclusive, `0 ≤ p ≤ 1,000,000,000`.
 Optional: omitted, a new item takes its project's
 `defaultUnitPriceCents` (an error if the project has none), and an
@@ -161,8 +161,8 @@ input BillableItemInput {
 }
 
 """
-Where a billable item stands relative to invoicing. Every item is
-`UNBILLED` until invoices exist (the next PR of the invoicing stack); from
+Where a billable item stands relative to finance. Every item is
+`UNBILLED` until invoices exist (the next PR of the finance stack); from
 then on, an item on a draft invoice is `DRAFT` and one on a finalized
 invoice is `INVOICED`. Defined in full now so the web client's handling
 doesn't have to change shape when the other two start appearing.
@@ -174,9 +174,9 @@ enum BillableItemStatusType {
 }
 
 """
-A name an invoicing instance issues invoices under — see `db::Brand`.
+A name a finance instance issues invoices under — see `db::Brand`.
 The default brand (`isDefault`, id `"default"`) is the instance's own
-invoicing settings, edited through `updateInvoicingSettings`; any other
+finance settings, edited through `updateFinanceSettings`; any other
 brand's unset `email`/`phone`/`address`/`paymentDetails` fall back to
 those settings when an invoice is printed.
 
@@ -203,7 +203,7 @@ type Brand {
 """
 `addBrand`/`updateBrand`'s argument — full replace. `name` is required;
 every other field is optional, blank meaning "use the default brand's"
-(the instance's invoicing settings) when an invoice is printed.
+(the instance's finance settings) when an invoice is printed.
 """
 input BrandInput {
 	name: String!
@@ -493,7 +493,7 @@ input CreditNoteLineInput {
 }
 
 """
-`invoicingExport`'s kind.
+`financeExport`'s kind.
 """
 enum CsvExportType {
 	INVOICES
@@ -633,7 +633,7 @@ type ExpenseEdge {
 """
 `createExpense`/`updateExpense`'s argument (update is a full replace).
 Which fields apply depends on `category` — see
-`invoicing::expense::validate_expense_input`:
+`finance::expense::validate_expense_input`:
 
 - A purchase (every category but `VEHICLE_KM`): `supplier` and
 `amountCents` (integer cents, **GST-inclusive** — what was paid) are
@@ -671,6 +671,56 @@ type ExpenseReceiptInfo {
 	filename: String!
 	contentType: String!
 	size: Int!
+}
+
+type FinanceSettingsInfo {
+	businessName: String
+	businessAbn: String
+	businessAddress: String
+	businessPhone: String
+	businessEmail: String
+	paymentDetails: String
+	gstRegistered: Boolean!
+	"""
+	Defaults to `"AUD"` — see `db::Instance::currency_or_default`.
+	"""
+	currency: String!
+	"""
+	Days after issue an invoice falls due, unless its project says
+	otherwise. Defaults to 14.
+	"""
+	paymentTermsDays: Int!
+	"""
+	`(counter value, or 0 if never finalized) + 1` — the number
+	`finalizeInvoice` will assign next, and `setNextInvoiceNumber`'s
+	argument shape. Read lazily here (a `counter` `GetItem`), not
+	carried on `db::Instance`, so a plain `Instance`/`financeSettings`
+	fetch that doesn't ask for this field costs nothing extra.
+	"""
+	nextInvoiceNumber: Int!
+}
+
+"""
+`updateFinanceSettings`'s argument — full-replace, unlike
+[`NotificationSettingsInput`]'s per-field patch: every call writes every
+field. Every string field is required by the schema but treated as
+"unset" when blank after trimming — see
+`graphql::mutations::update_finance_settings`'s doc comment for the
+REMOVE-on-blank rule this input drives.
+"""
+input FinanceSettingsInput {
+	businessName: String!
+	businessAbn: String!
+	businessAddress: String!
+	businessPhone: String!
+	businessEmail: String!
+	paymentDetails: String!
+	gstRegistered: Boolean!
+	currency: String!
+	"""
+	`0..=365`; `null` resets to the default (14).
+	"""
+	paymentTermsDays: Int
 }
 
 """
@@ -736,13 +786,13 @@ type Instance {
 	"""
 	kind: InstanceKindType!
 	"""
-	This instance's invoicing settings, or `null` for a support instance.
-	See [`InvoicingSettingsInfo`]'s doc comment.
+	This instance's finance settings, or `null` for a support instance.
+	See [`FinanceSettingsInfo`]'s doc comment.
 	"""
-	invoicingSettings: InvoicingSettingsInfo
+	financeSettings: FinanceSettingsInfo
 	"""
-	The names this invoicing instance issues under: the default brand
-	(its own invoicing settings, id `"default"`) first, then every
+	The names this finance instance issues under: the default brand
+	(its own finance settings, id `"default"`) first, then every
 	other brand in the order they were added, archived ones included.
 	Empty for a support instance. See CLAUDE.md's "Brands" entry.
 	"""
@@ -800,7 +850,7 @@ type Instance {
 	This instance's broadcasts, newest first (at most `first`, default
 	25, max 100). Owner-only — **not** superuser: a broadcast is
 	customer communication, the ticket side of the superuser boundary in
-	CLAUDE.md. `null`-free empty list for an invoicing instance, which
+	CLAUDE.md. `null`-free empty list for a finance instance, which
 	can't send one.
 	"""
 	broadcasts(first: Int! = 25): [Broadcast!]!
@@ -813,14 +863,14 @@ type Instance {
 	"""
 	The domains a broadcast from this instance may be sent from — the
 	domains of its inbound addresses (`broadcast::instance_mail_domains`).
-	Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+	Owner-only, like [`Self::broadcasts`]; empty for a finance
 	instance.
 	"""
 	broadcastFromDomains: [String!]!
 	"""
 	Saved From name + address pairs to pick from when drafting a
 	broadcast, in the order they were added (`addBroadcastSender`).
-	Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+	Owner-only, like [`Self::broadcasts`]; empty for a finance
 	instance.
 	"""
 	broadcastSenders: [BroadcastSender!]!
@@ -832,7 +882,7 @@ type Instance {
 """
 enum InstanceKindType {
 	SUPPORT
-	INVOICING
+	FINANCE
 }
 
 type Invoice {
@@ -841,7 +891,7 @@ type Invoice {
 	number: Int
 	"""
 	Zero-padded to 3 digits (`"008"`); `null` for a draft. Mirrors
-	`invoicing::snapshot::InvoiceSnapshot::display_number` exactly.
+	`finance::snapshot::InvoiceSnapshot::display_number` exactly.
 	"""
 	displayNumber: String
 	"""
@@ -933,7 +983,7 @@ type Invoice {
 
 """
 The printed "Invoice to" block — from the project's client fields, per
-`invoicing::snapshot::InvoiceSnapshotBillTo`.
+`finance::snapshot::InvoiceSnapshotBillTo`.
 """
 type InvoiceBillToInfo {
 	name: String!
@@ -986,7 +1036,7 @@ enum InvoiceFilterType {
 }
 
 """
-One printed line — per `invoicing::snapshot::InvoiceSnapshotLine`.
+One printed line — per `finance::snapshot::InvoiceSnapshotLine`.
 """
 type InvoiceLineInfo {
 	date: String!
@@ -1022,7 +1072,7 @@ type InvoicePaymentInfo {
 
 """
 The printed seller block — from the instance's business settings, per
-`invoicing::snapshot::InvoiceSnapshotSeller`.
+`finance::snapshot::InvoiceSnapshotSeller`.
 """
 type InvoiceSellerInfo {
 	name: String
@@ -1043,56 +1093,6 @@ type InvoiceSellerInfo {
 enum InvoiceStatusType {
 	DRAFT
 	FINALIZED
-}
-
-type InvoicingSettingsInfo {
-	businessName: String
-	businessAbn: String
-	businessAddress: String
-	businessPhone: String
-	businessEmail: String
-	paymentDetails: String
-	gstRegistered: Boolean!
-	"""
-	Defaults to `"AUD"` — see `db::Instance::currency_or_default`.
-	"""
-	currency: String!
-	"""
-	Days after issue an invoice falls due, unless its project says
-	otherwise. Defaults to 14.
-	"""
-	paymentTermsDays: Int!
-	"""
-	`(counter value, or 0 if never finalized) + 1` — the number
-	`finalizeInvoice` will assign next, and `setNextInvoiceNumber`'s
-	argument shape. Read lazily here (a `counter` `GetItem`), not
-	carried on `db::Instance`, so a plain `Instance`/`invoicingSettings`
-	fetch that doesn't ask for this field costs nothing extra.
-	"""
-	nextInvoiceNumber: Int!
-}
-
-"""
-`updateInvoicingSettings`'s argument — full-replace, unlike
-[`NotificationSettingsInput`]'s per-field patch: every call writes every
-field. Every string field is required by the schema but treated as
-"unset" when blank after trimming — see
-`graphql::mutations::update_invoicing_settings`'s doc comment for the
-REMOVE-on-blank rule this input drives.
-"""
-input InvoicingSettingsInput {
-	businessName: String!
-	businessAbn: String!
-	businessAddress: String!
-	businessPhone: String!
-	businessEmail: String!
-	paymentDetails: String!
-	gstRegistered: Boolean!
-	currency: String!
-	"""
-	`0..=365`; `null` resets to the default (14).
-	"""
-	paymentTermsDays: Int
 }
 
 type MemberInfo {
@@ -1211,7 +1211,7 @@ type MutationRoot {
 	**Owner-only — not superuser.** Mass mail from an instance's domain is
 	both a reputation risk (owner, like `addInboundAddress`) and customer
 	communication whose replies become tickets (the ticket side of the
-	superuser boundary). An invoicing, deleted or missing instance is
+	superuser boundary). A finance, deleted or missing instance is
 	`NOT_FOUND`, per the kind-isolation rule.
 	
 	**Queues, doesn't send.** Everything is validated (and one copy
@@ -1290,7 +1290,7 @@ type MutationRoot {
 	`broadcastSenders` updates in place.
 	
 	Owner-only — not superuser — like `sendBroadcast`, the only thing a
-	sender is for. An invoicing, deleted or missing instance is
+	sender is for. A finance, deleted or missing instance is
 	`NOT_FOUND`; a concurrent change to the list is `CONFLICT`.
 	"""
 	addBroadcastSender(instanceId: ID!, name: String!, address: String!): Instance!
@@ -1708,12 +1708,12 @@ type MutationRoot {
 	"""
 	revokeOauthGrant(id: ID!): Boolean!
 	"""
-	Full-replace an invoicing instance's seller settings/payment footer —
-	`InstanceUpdateShape::SetInvoicingSettings`. Owner-or-superuser, the
+	Full-replace a finance instance's seller settings/payment footer —
+	`InstanceUpdateShape::SetFinanceSettings`. Owner-or-superuser, the
 	same posture as `addInboundAddress`/`createApiToken`: this is
 	instance settings, not something a plain agent can change. Rejects a
 	support instance (`db::require_instance_kind`) — see CLAUDE.md's
-	"Invoicing" house rule.
+	"Finance" house rule.
 	
 	Every string field in `input` is trimmed; a blank result after
 	trimming `REMOVE`s the corresponding attribute rather than writing an
@@ -1725,11 +1725,11 @@ type MutationRoot {
 	to `"AUD"` — `db::Instance::currency_or_default`); a non-blank value
 	must be 3 uppercase ASCII letters (`db::validate_currency_code`).
 	"""
-	updateInvoicingSettings(instanceId: ID!, input: InvoicingSettingsInput!): Instance!
+	updateFinanceSettings(instanceId: ID!, input: FinanceSettingsInput!): Instance!
 	"""
-	Add a brand — another name this invoicing instance issues under
+	Add a brand — another name this finance instance issues under
 	(e.g. a registered business name beside the owner's legal name).
-	Owner-or-superuser, like `updateInvoicingSettings`: brands are
+	Owner-or-superuser, like `updateFinanceSettings`: brands are
 	instance settings. At most `db::MAX_BRANDS`. Returns the instance,
 	so a client's cached `brands` updates in place. See CLAUDE.md's
 	"Brands" entry.
@@ -1739,15 +1739,15 @@ type MutationRoot {
 	Full-replace a brand, including `archived` (default `false`). An
 	archived brand can't be chosen for a new project or expense but
 	still appears in filters; there is no delete. The default brand
-	(`"default"`) is the instance's invoicing settings — change it with
-	`updateInvoicingSettings`. Changing a brand changes drafts and
+	(`"default"`) is the instance's finance settings — change it with
+	`updateFinanceSettings`. Changing a brand changes drafts and
 	future invoices, never a finalized one.
 	"""
 	updateBrand(instanceId: ID!, brandId: ID!, input: BrandInput!, archived: Boolean! = false): Instance!
 	"""
-	Create a project in an invoicing instance. Member (owner or agent) —
+	Create a project in a finance instance. Member (owner or agent) —
 	managing projects/items/draft invoices is day-to-day work, not an
-	owner-only setting, per CLAUDE.md's "Invoicing" house rule. Rejects a
+	owner-only setting, per CLAUDE.md's "Finance" house rule. Rejects a
 	support instance.
 	"""
 	createProject(instanceId: ID!, input: CreateProjectInput!): Project!
@@ -1762,7 +1762,7 @@ type MutationRoot {
 	updateProject(id: ID!, input: UpdateProjectInput!): Project!
 	"""
 	Record a billable item against a project. Any member of the project's
-	(invoicing) instance — authorised through the project, like
+	(finance) instance — authorised through the project, like
 	`updateProject`: `NOT_FOUND` for a missing project and a non-member
 	alike, and a superuser without a membership is a non-member. An
 	archived project takes no new items (un-archive it first). See
@@ -1785,12 +1785,12 @@ type MutationRoot {
 	"""
 	Delete a billable item, returning its id (for the client's store).
 	Unbilled only, regardless of the item's invoice's own status — see
-	CLAUDE.md's "Invoicing" house rule. Deleting an item `rebillExpense`
+	CLAUDE.md's "Finance" house rule. Deleting an item `rebillExpense`
 	made frees its expense to be re-billed again (same transaction).
 	"""
 	deleteBillableItem(id: ID!): ID!
 	"""
-	Record an expense in an invoicing instance, optionally against one
+	Record an expense in a finance instance, optionally against one
 	of its projects. Any member (owner or agent); superusers without a
 	membership get nothing. Rejects a support instance. See
 	`ExpenseInput` for which fields a purchase and a vehicle trip take.
@@ -1813,7 +1813,7 @@ type MutationRoot {
 	transaction (`db::Handler::create_invoice`). Authorised through the
 	project like `createBillableItem` — `NOT_FOUND` for a missing
 	project or a non-member alike; an archived project is allowed (you
-	may be invoicing final work on a job you've since archived). Every
+	may be finance final work on a job you've since archived). Every
 	id in `itemIds` must belong to this project and be currently
 	unbilled (`CONFLICT`/`NOT_FOUND` otherwise), 1–50 of them
 	(`MAX_INVOICE_ITEMS`), no duplicates.
@@ -1900,7 +1900,7 @@ type MutationRoot {
 	attached: to `input.to` (default: the project's client email) and
 	`input.cc`, at most 10 in total, with an optional covering
 	`message`. Sent from the system sender under the business name, with
-	`Reply-To` the business email — see `invoicing::send`. Sending is
+	`Reply-To` the business email — see `finance::send`. Sending is
 	this mutation's whole point, so a send failure fails it (nothing is
 	recorded); on success `sentAt`/`sentTo` are updated. Can be sent
 	again (a reminder). `CONFLICT` on a draft.
@@ -1911,16 +1911,16 @@ type MutationRoot {
 	`Content-Disposition: attachment; filename="Invoice-{displayNumber}.pdf"`
 	(`storage::Handler::presign_get_download`, filename sanitised there).
 	`CONFLICT` on a draft — finalization is what freezes the content a
-	PDF prints (CLAUDE.md's "Invoicing" house rule), so there's nothing
+	PDF prints (CLAUDE.md's "Finance" house rule), so there's nothing
 	yet to render.
 	
 	This is a mutation, not a query, because the *first* call for a
 	given invoice writes: it renders the frozen `snapshot` (the only input
-	`invoicing::pdf::render_invoice_pdf` reads), stores it, and caches the
+	`finance::pdf::render_invoice_pdf` reads), stores it, and caches the
 	key on the row (`db::Handler::set_invoice_pdf_key`). Every later call
 	presigns the cached key. Rendering is deterministic from the snapshot,
 	so two callers racing the first render each store a correct PDF of
-	the same invoice — see `invoicing::pdf`'s doc comment.
+	the same invoice — see `finance::pdf`'s doc comment.
 	"""
 	downloadInvoicePdf(invoiceId: ID!): String!
 	"""
@@ -2229,7 +2229,7 @@ type QueryRoot {
 	"""
 	ticket(id: ID!): Ticket
 	"""
-	Every project for an invoicing instance, sorted by name
+	Every project for a finance instance, sorted by name
 	case-insensitively — the projects list page's data source.
 	Unpaginated, like `Instance.inboundAddresses` (see
 	`db::Handler::list_projects_by_instance`'s doc comment for why).
@@ -2241,14 +2241,14 @@ type QueryRoot {
 	projects(instanceId: ID!, includeArchived: Boolean! = false): [Project!]!
 	"""
 	Fetch a single project by id. Reachable only by a member of its
-	(invoicing) instance — a project that doesn't exist, belongs to an
+	(finance) instance — a project that doesn't exist, belongs to an
 	instance the caller isn't a member of, or belongs to a support
 	instance, is reported identically — `null` — mirroring
 	[`Self::ticket`]'s no-probing posture.
 	"""
 	project(id: ID!): Project
 	"""
-	Billable items in an invoicing instance — every project's, or one
+	Billable items in a finance instance — every project's, or one
 	project's when `projectId` is given — as a Relay connection, newest
 	`date` first (see `db::Handler::list_billable_items`). Forward-only
 	(`first`/`after`). Member of `instanceId`; a support instance is
@@ -2259,7 +2259,7 @@ type QueryRoot {
 	"""
 	billableItems(instanceId: ID!, projectId: ID, filter: BillableItemFilterType! = ALL, first: Int, after: String): BillableItemConnection!
 	"""
-	Expenses in an invoicing instance — all of them, or one project's
+	Expenses in a finance instance — all of them, or one project's
 	when `projectId` is given — as a Relay connection, newest `date`
 	first. Same posture as [`Self::billable_items`]: member of
 	`instanceId`, support instance rejected with a plain validation
@@ -2282,7 +2282,7 @@ type QueryRoot {
 	"""
 	vehicleKmSummary(instanceId: ID!, financialYear: Int): VehicleKmSummary!
 	"""
-	Invoices in an invoicing instance — every project's, or one
+	Invoices in a finance instance — every project's, or one
 	project's when `projectId` is given — as a Relay connection, newest
 	`createdAt` first (see `db::Handler::list_invoices`). Same posture as
 	[`Self::billable_items`]: member of `instanceId`, support instance
@@ -2297,7 +2297,7 @@ type QueryRoot {
 	): InvoiceConnection!
 	"""
 	Fetch a single invoice by id. Reachable only by a member of its
-	(invoicing) instance — missing, wrong instance, and belonging to a
+	(finance) instance — missing, wrong instance, and belonging to a
 	support instance are all reported identically — `null` — mirroring
 	[`Self::project`]'s no-probing posture. A strongly consistent
 	`GetItem` (`get_invoice_consistent`), not the dataloader path: the web
@@ -2307,7 +2307,7 @@ type QueryRoot {
 	"""
 	invoice(id: ID!): Invoice
 	"""
-	Credit notes in an invoicing instance — all of them, or one
+	Credit notes in a finance instance — all of them, or one
 	invoice's when `invoiceId` is given — as a Relay connection, newest
 	first. Same posture as [`Self::invoices`].
 	"""
@@ -2327,7 +2327,7 @@ type QueryRoot {
 	apart): sales and GST on sales (G1/1A) from finalized invoices,
 	credit notes and payments on the chosen `basis`, and purchases and
 	GST on purchases (1B) from expenses by their date. See
-	`invoicing::report::gst_summary` for exactly how each basis counts.
+	`finance::report::gst_summary` for exactly how each basis counts.
 	Member; a support instance is rejected.
 	"""
 	gstReport(		instanceId: ID!,		from: String!,		to: String!,		basis: ReportBasisType!,
@@ -2352,9 +2352,9 @@ type QueryRoot {
 	finalized invoices by issue date, credit notes by issue date,
 	payments by payment date, or expenses by date. Returned as the CSV
 	text itself; the web app saves it as a file. Member; a support
-	instance is rejected. See `invoicing::csv`.
+	instance is rejected. See `finance::csv`.
 	"""
-	invoicingExport(		instanceId: ID!,		kind: CsvExportType!,		from: String!,		to: String!,
+	financeExport(		instanceId: ID!,		kind: CsvExportType!,		from: String!,		to: String!,
 		"""
 		Only this brand's (`"default"` for the default brand).
 		"""
@@ -2445,7 +2445,7 @@ enum ReportBasisType {
 
 """
 `saveBroadcastDraft`'s argument: the whole draft, every time (a full
-replace, like `updateInvoicingSettings`). `id` absent creates a new
+replace, like `updateFinanceSettings`). `id` absent creates a new
 draft. `html` absent makes it a plain-text broadcast; with `html`,
 `body` is the optional plain-text version (blank derives one). See
 `broadcast::validate` and `broadcast_html::process`.

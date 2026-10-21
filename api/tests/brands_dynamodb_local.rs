@@ -1,4 +1,4 @@
-//! Integration tests for brands — the other names one invoicing instance
+//! Integration tests for brands — the other names one finance instance
 //! issues under — against **DynamoDB Local**. Covers:
 //!
 //!   - `addBrand`/`updateBrand`: owner-only, names unique, the default brand
@@ -166,7 +166,7 @@ impl World {
         user_auth(&self.agent_id, &self.instance_id, false)
     }
 
-    /// Run as the agent — day-to-day invoicing work.
+    /// Run as the agent — day-to-day finance work.
     async fn run(&self, query: &str, vars: Value) -> Response {
         self.s.run(query, vars, self.agent()).await
     }
@@ -176,7 +176,7 @@ impl World {
     }
 }
 
-/// An instance of `kind` named `label`, with invoicing settings whose
+/// An instance of `kind` named `label`, with finance settings whose
 /// legal name is "Samuel James Dunster", one owner and one agent.
 async fn setup_kind(label: &str, kind: db::InstanceKind) -> Option<World> {
     let prefix = local_db_prefix().await?;
@@ -192,10 +192,10 @@ async fn setup_kind(label: &str, kind: db::InstanceKind) -> Option<World> {
         )
         .await
         .expect("create_instance");
-    if kind == db::InstanceKind::Invoicing {
+    if kind == db::InstanceKind::Finance {
         db.update_instance(
             &instance.id,
-            db::InstanceUpdateShape::SetInvoicingSettings {
+            db::InstanceUpdateShape::SetFinanceSettings {
                 business_name: Some("Samuel James Dunster"),
                 business_abn: Some("11 222 333 444"),
                 business_address: None,
@@ -246,7 +246,7 @@ async fn setup_kind(label: &str, kind: db::InstanceKind) -> Option<World> {
 }
 
 async fn setup(label: &str) -> Option<World> {
-    setup_kind(label, db::InstanceKind::Invoicing).await
+    setup_kind(label, db::InstanceKind::Finance).await
 }
 
 const BRAND_FIELDS: &str = "brandId name email phone address paymentDetails archived isDefault";
@@ -481,7 +481,7 @@ async fn owner_manages_brands_and_the_default_comes_first() {
     // The default brand is edited through the settings, and an unknown id
     // is NOT_FOUND.
     let r = update_brand(&w, "default", json!({ "name": "x" }), false).await;
-    assert!(error_message(&r).contains("invoicing settings"), "{r:?}");
+    assert!(error_message(&r).contains("finance settings"), "{r:?}");
     let r = update_brand(&w, "nope", json!({ "name": "x" }), false).await;
     assert_eq!(error_code(&r), "NOT_FOUND");
 

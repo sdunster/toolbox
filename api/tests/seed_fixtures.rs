@@ -184,7 +184,7 @@ fn synthetic_references_resolve() {
         );
         let date = s(item, "date").expect("billable_item.date");
         assert!(
-            toolbox::invoicing::validate_item_date(&date).as_deref() == Ok(date.as_str()),
+            toolbox::finance::validate_item_date(&date).as_deref() == Ok(date.as_str()),
             "billable_item {} has a non-canonical date {date:?} — the listing GSIs sort on it",
             id(item)
         );
@@ -271,10 +271,10 @@ fn synthetic_references_resolve() {
     }
 }
 
-/// PR 3 of the invoicing feature adds a seeded draft invoice so a fresh
+/// PR 3 of the finance feature adds a seeded draft invoice so a fresh
 /// local stack has an invoice detail page to look at without a manual
 /// `createInvoice` first — mirrors
-/// `there_is_an_invoicing_instance_with_at_least_one_project`'s reasoning.
+/// `there_is_an_finance_instance_with_at_least_one_project`'s reasoning.
 /// Deliberately a draft, not finalized (see the fixture's own `_comment`):
 /// finalizing would consume the per-instance counter a fresh stack's first
 /// real finalize should get to use itself.
@@ -300,37 +300,37 @@ fn there_is_a_draft_invoice_with_billed_items() {
     );
 }
 
-/// The build plan's PR 1 adds a second, separate function (invoicing) to
+/// The build plan's PR 1 adds a second, separate function (finance) to
 /// support: the fixture needs at least one instance of each `kind`, and an
-/// invoicing instance's project(s), so a fresh local stack has something to
-/// look at on the invoicing pages without a manual `instance create --kind
-/// invoicing` first.
+/// finance instance's project(s), so a fresh local stack has something to
+/// look at on the finance pages without a manual `instance create --kind
+/// finance` first.
 #[test]
-fn there_is_an_invoicing_instance_with_at_least_one_project() {
+fn there_is_an_finance_instance_with_at_least_one_project() {
     let doc = synthetic();
-    let invoicing_instances: HashSet<String> = rows(&doc, "instance")
+    let finance_instances: HashSet<String> = rows(&doc, "instance")
         .iter()
-        .filter(|i| s(i, "kind").as_deref() == Some("invoicing"))
+        .filter(|i| s(i, "kind").as_deref() == Some("finance"))
         .map(id)
         .collect();
     assert_eq!(
-        invoicing_instances.len(),
+        finance_instances.len(),
         1,
-        "expected exactly one seeded instance with kind: invoicing"
+        "expected exactly one seeded instance with kind: finance"
     );
 
-    let support_instances = rows(&doc, "instance").len() - invoicing_instances.len();
+    let support_instances = rows(&doc, "instance").len() - finance_instances.len();
     assert!(
         support_instances >= 1,
         "expected at least one seeded instance with kind absent (support)"
     );
 
-    let has_project_on_invoicing_instance = rows(&doc, "project")
+    let has_project_on_finance_instance = rows(&doc, "project")
         .iter()
-        .any(|p| s(p, "instance_id").is_some_and(|iid| invoicing_instances.contains(&iid)));
+        .any(|p| s(p, "instance_id").is_some_and(|iid| finance_instances.contains(&iid)));
     assert!(
-        has_project_on_invoicing_instance,
-        "expected at least one seeded project on the invoicing instance"
+        has_project_on_finance_instance,
+        "expected at least one seeded project on the finance instance"
     );
 }
 

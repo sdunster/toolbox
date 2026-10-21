@@ -27,7 +27,7 @@
 //! invalid tokens get a 401 carrying `WWW-Authenticate` pointing at the
 //! protected-resource metadata (RFC 9728), per the MCP authorization spec.
 
-pub mod invoicing;
+pub mod finance;
 pub mod tickets;
 pub mod tool;
 pub mod whoami;
@@ -135,15 +135,15 @@ fn initialize_result(params: &Value) -> Value {
 }
 
 /// Shown to the model at `initialize`. Grows one paragraph per tool family.
-const INSTRUCTIONS: &str = "Toolbox is a multi-tenant support-ticket and invoicing system. \
+const INSTRUCTIONS: &str = "Toolbox is a multi-tenant support-ticket and finance system. \
     Every tool acts with the authenticated caller's own permissions: a member sees only the \
     instances they belong to, and a superuser gets admin functions but no implicit access to \
     any instance's tickets or invoices. Call `whoami` first to learn who you are acting as \
     and which instances (and kinds of instance) you can work in. Ticket tools apply to SUPPORT \
     instances only. `reply_to_ticket` and closing or reopening a ticket send email to the \
-    customer and cannot be unsent; internal notes and assignment do not. Invoicing tools apply \
-    to INVOICING instances only. `send_invoice` and `send_credit_note` email the client and \
-    cannot be unsent; no other invoicing tool sends email. `finalize_invoice` and \
+    customer and cannot be unsent; internal notes and assignment do not. Finance tools apply \
+    to FINANCE instances only. `send_invoice` and `send_credit_note` email the client and \
+    cannot be unsent; no other finance tool sends email. `finalize_invoice` and \
     `issue_credit_note` are irreversible: only call them when the user has explicitly asked \
     for that specific invoice or credit note.";
 
@@ -155,7 +155,7 @@ const INSTRUCTIONS: &str = "Toolbox is a multi-tenant support-ticket and invoici
 fn tool_catalogue() -> Vec<Value> {
     let mut tools = whoami::catalogue();
     tools.extend(tickets::catalogue());
-    tools.extend(invoicing::catalogue());
+    tools.extend(finance::catalogue());
     tools
 }
 
@@ -169,7 +169,7 @@ where
     if let Some(outcome) = tickets::dispatch(ctx, name, arguments).await {
         return outcome;
     }
-    if let Some(outcome) = invoicing::dispatch(ctx, name, arguments).await {
+    if let Some(outcome) = finance::dispatch(ctx, name, arguments).await {
         return outcome;
     }
     ToolOutcome::error(format!("Unknown tool \"{name}\""))

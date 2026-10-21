@@ -48,7 +48,7 @@
         }
       },
       {
-        "_comment": "An invoicing instance (kind: invoicing, written explicitly \u2014 support instances above simply omit the attribute). Fictional business details, never the real sample invoice's. Registered for GST, so the seeded pages exercise the 'Tax Invoice'/GST-row path.",
+        "_comment": "A finance instance (kind: finance, written explicitly \u2014 support instances above simply omit the attribute). Fictional business details, never the real sample invoice's. Registered for GST, so the seeded pages exercise the 'Tax Invoice'/GST-row path.",
         "id": {
           "S": "SeedLedger01"
         },
@@ -59,7 +59,7 @@
           "S": "ledger"
         },
         "kind": {
-          "S": "invoicing"
+          "S": "finance"
         },
         "from_name": {
           "S": "Ledger & Co Bookkeeping"
@@ -228,7 +228,7 @@
         }
       },
       {
-        "_comment": "Also owner of the invoicing instance, Ledger & Co — the seeded owner ends up a member of all three instances (two support, one invoicing), which is what exercises the instance switcher's Support/Invoicing optgroups.",
+        "_comment": "Also owner of the finance instance, Ledger & Co — the seeded owner ends up a member of all three instances (two support, one finance), which is what exercises the instance switcher's Support/Finance optgroups.",
         "id": {
           "S": "SeedMembOwn3"
         },
@@ -519,7 +519,7 @@
     ],
     "project": [
       {
-        "_comment": "A fictional client/job on the seeded invoicing instance, with every optional field set.",
+        "_comment": "A fictional client/job on the seeded finance instance, with every optional field set.",
         "id": { "S": "SeedProj0001" },
         "instance_id": { "S": "SeedLedger01" },
         "name": { "S": "Website Redesign" },
@@ -542,7 +542,7 @@
     ],
     "billable_item": [
       {
-        "_comment": "Fictional billable items on the seeded invoicing instance. Quantities are hundredths (300 = 3), prices are cents (15000 = 150.00). Billed onto the seeded draft invoice below (invoice_id set) — the rest stay unbilled.",
+        "_comment": "Fictional billable items on the seeded finance instance. Quantities are hundredths (300 = 3), prices are cents (15000 = 150.00). Billed onto the seeded draft invoice below (invoice_id set) — the rest stay unbilled.",
         "id": { "S": "SeedItem0001" },
         "instance_id": { "S": "SeedLedger01" },
         "project_id": { "S": "SeedProj0001" },
@@ -635,7 +635,7 @@
     ],
     "invoice": [
       {
-        "_comment": "A fictional draft invoice on the seeded invoicing instance, collecting two of SeedProj0001's items (SeedItem0001, SeedItem0002 — both stamped with this invoice's id above) — exercises the invoice detail page's draft state without a manual createInvoice first. Deliberately left as a draft: finalizing consumes the per-instance counter, and a seeded fixture shouldn't pre-empt the counter a fresh local stack's first real finalize would use.",
+        "_comment": "A fictional draft invoice on the seeded finance instance, collecting two of SeedProj0001's items (SeedItem0001, SeedItem0002 — both stamped with this invoice's id above) — exercises the invoice detail page's draft state without a manual createInvoice first. Deliberately left as a draft: finalizing consumes the per-instance counter, and a seeded fixture shouldn't pre-empt the counter a fresh local stack's first real finalize would use.",
         "id": { "S": "SeedInvoice1" },
         "instance_id": { "S": "SeedLedger01" },
         "project_id": { "S": "SeedProj0001" },

@@ -21,8 +21,8 @@ afterEach(() => {
 });
 afterAll(() => server.close());
 
-function membership(role: "OWNER" | "AGENT", kind: "SUPPORT" | "INVOICING") {
-  const slug = kind === "INVOICING" ? "ledger" : "acme";
+function membership(role: "OWNER" | "AGENT", kind: "SUPPORT" | "FINANCE") {
+  const slug = kind === "FINANCE" ? "ledger" : "acme";
   return {
     role,
     instance: { id: `inst-${slug}`, name: slug, slug, kind },
@@ -113,8 +113,8 @@ describe("AppShell — kind-aware nav", () => {
     ]);
   });
 
-  it("shows invoices, projects and business settings to an invoicing owner", async () => {
-    renderShell(true, [membership("OWNER", "INVOICING")]);
+  it("shows invoices, projects and business settings to a finance owner", async () => {
+    renderShell(true, [membership("OWNER", "FINANCE")]);
     await screen.findByRole("link", { name: "Projects" });
     expect(navLinkNames()).toEqual([
       "Invoices",
@@ -128,8 +128,8 @@ describe("AppShell — kind-aware nav", () => {
     ]);
   });
 
-  it("hides business settings from an invoicing agent", async () => {
-    renderShell(false, [membership("AGENT", "INVOICING")]);
+  it("hides business settings from a finance agent", async () => {
+    renderShell(false, [membership("AGENT", "FINANCE")]);
     await screen.findByRole("link", { name: "Projects" });
     expect(navLinkNames()).toEqual([
       "Invoices",

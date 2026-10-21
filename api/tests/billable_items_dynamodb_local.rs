@@ -1,6 +1,6 @@
-//! Integration tests for PR 2 of the invoicing feature — the `billable_item`
+//! Integration tests for PR 2 of the finance feature — the `billable_item`
 //! table and its GraphQL surface — against **DynamoDB Local**, following
-//! `invoicing_dynamodb_local.rs`'s helper pattern. Covers:
+//! `finance_dynamodb_local.rs`'s helper pattern. Covers:
 //!
 //!   - an agent can create/update/list/delete items; amounts and quantity
 //!     formatting come back as the API computes them;
@@ -192,7 +192,7 @@ fn build_schema(db: dynamodb::Handler) -> TestSchema {
     }
 }
 
-/// An invoicing instance with one agent and one project, returning
+/// A finance instance with one agent and one project, returning
 /// `(instance_id, agent_user_id, project_id)`.
 async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) {
     let instance = db
@@ -202,7 +202,7 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) 
             label,
             "",
             false,
-            db::InstanceKind::Invoicing,
+            db::InstanceKind::Finance,
         )
         .await
         .expect("create_instance");

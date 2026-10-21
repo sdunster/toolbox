@@ -30,7 +30,7 @@ const instanceEditFormFragment = graphql`
  *
  * The kind is shown read-only too (it's fixed at creation). From name,
  * signature and public submission are support-only — outbound mail and the
- * `/submit` form don't exist for an invoicing instance — so they're hidden
+ * `/submit` form don't exist for a finance instance — so they're hidden
  * for one, and resubmitted unchanged since `updateInstance` still takes
  * them.
  */
@@ -40,7 +40,7 @@ export function InstanceEditForm({
   instance: InstanceEditForm_instance$key;
 }) {
   const data = useFragment(instanceEditFormFragment, instance);
-  const isSupport = data.kind !== "INVOICING";
+  const isSupport = data.kind !== "FINANCE";
   const [name, setName] = useState(data.name);
   const [fromName, setFromName] = useState(data.fromName);
   const [signature, setSignature] = useState(data.signature);
@@ -129,7 +129,7 @@ export function InstanceEditForm({
         <FormField label="Kind" htmlFor="instance-kind">
           <TextInput
             id="instance-kind"
-            value={isSupport ? "Support" : "Invoicing"}
+            value={isSupport ? "Support" : "Finance"}
             readOnly
             className="bg-surface-sunken text-ink-muted"
           />

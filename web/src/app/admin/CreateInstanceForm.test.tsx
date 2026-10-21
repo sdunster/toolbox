@@ -62,7 +62,7 @@ describe("CreateInstanceForm", () => {
     });
   });
 
-  it("sends the invoicing kind and hides the support-only fields", async () => {
+  it("sends the finance kind and hides the support-only fields", async () => {
     let receivedVariables: Record<string, unknown> | undefined;
     server.use(
       relayEndpoint.mutation("CreateInstanceFormMutation", ({ variables }) => {
@@ -83,7 +83,7 @@ describe("CreateInstanceForm", () => {
     await user.click(
       screen.getByRole("checkbox", { name: "Public submission enabled" }),
     );
-    await user.selectOptions(screen.getByLabelText("Kind"), "INVOICING");
+    await user.selectOptions(screen.getByLabelText("Kind"), "FINANCE");
 
     expect(
       screen.queryByRole("checkbox", { name: "Public submission enabled" }),
@@ -100,7 +100,7 @@ describe("CreateInstanceForm", () => {
       fromName: null,
       signature: null,
       publicSubmissionEnabled: false,
-      kind: "INVOICING",
+      kind: "FINANCE",
     });
   });
 });
