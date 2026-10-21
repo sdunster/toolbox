@@ -1,0 +1,13 @@
+[env]
+# 16 MiB thread stacks for everything `cargo test` / `cargo run` starts (test
+# threads and tokio workers both take the std default, which reads this).
+#
+# Debug builds only need it. async-graphql's `#[Object]` puts every mutation's
+# resolver in one `MutationRoot::resolve_field` poll function, and without
+# optimisation each match arm gets its own stack slots, so that one frame holds
+# every resolver's future at once: ~1.2 MB at 70 mutations, growing ~17 KB per
+# mutation. On the default 2 MB stack the `*_dynamodb_local` tests aborted with
+# "has overflowed its stack". Release builds (the Lambdas) share the slots and
+# are nowhere near the limit, so boxing every resolver to fix it for real
+# wasn't worth the boilerplate. `_check-local.yml` runs those tests in CI.
+RUST_MIN_STACK = "16777216"

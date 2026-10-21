@@ -57,6 +57,19 @@ jobs:
         run: make local-tables
       - name: Every expected table exists
         run: make local-tables-check
+      # _check-api.yml runs `cargo test` with no database, so every
+      # *_dynamodb_local.rs test skips itself there. This is the run where they
+      # actually execute. Every test uses nanoid-unique ids, so running before
+      # the seed step is harmless. Built without debuginfo: with it, every test
+      # target together is ~29 GB, more than a hosted runner's disk; a failing
+      # assertion still reports its file and line.
+      - name: API tests against DynamoDB Local
+        env:
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+        run: |
+          set -a && . local/local.env && set +a
+          cd api && cargo test --locked --no-fail-fast
       - name: Seed fixtures
         run: make local-seed
       - name: Stop DynamoDB Local

@@ -3,9 +3,8 @@ on:
   pull_request:
     paths:
       - 'local/**'
-      - 'api/src/bin/local-*.rs'
-      - 'api/src/local_dev.rs'
-      - 'api/tests/seed_fixtures.rs'
+      # Any API change: this workflow is where the *_dynamodb_local tests run.
+      - 'api/**'
       - 'infra/dynamodb.tf'
       - 'Makefile'
       - '.github/workflows/local-check.yml'
