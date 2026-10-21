@@ -16,9 +16,12 @@
 //! - [`report`]: the GST/BAS summary, aged receivables, project figures.
 //! - [`csv`]: the accountant's CSV exports.
 //! - [`send`]: emailing an invoice or credit note with its PDF attached.
+//! - [`brand`]: brands — resolving the seller an invoice prints, and
+//!   validating a brand choice or filter.
 //! - [`today_utc`]/[`add_days`]: the date arithmetic due dates and overdue
 //!   checks need.
 
+pub mod brand;
 pub mod csv;
 pub mod expense;
 pub mod ledger;

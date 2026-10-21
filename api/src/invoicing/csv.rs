@@ -302,6 +302,7 @@ mod tests {
             instance_id: "i".into(),
             fields: db::ExpenseFields {
                 project_id: None,
+                brand_id: None,
                 date: date.into(),
                 category: db::ExpenseCategory::Materials,
                 description: Some("Timber, treated".into()),

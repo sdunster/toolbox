@@ -17,6 +17,7 @@ const invoiceListFragment = graphql`
     instanceId: { type: "ID!" }
     projectId: { type: "ID" }
     filter: { type: "InvoiceFilterType!" }
+    brandId: { type: "ID" }
     count: { type: "Int", defaultValue: 25 }
     cursor: { type: "String" }
   ) {
@@ -24,6 +25,7 @@ const invoiceListFragment = graphql`
       instanceId: $instanceId
       projectId: $projectId
       filter: $filter
+      brandId: $brandId
       first: $count
       after: $cursor
     ) @connection(key: "InvoiceList_invoices") {
@@ -42,7 +44,7 @@ const invoiceListFragment = graphql`
  * column) or one project's "Invoices" section (without). Newest
  * `createdAt` first, "Load more" at the bottom — the same refetch-owning
  * pattern as `BillableItemList`: the parent's query runs once per mount,
- * and a new `filter` (or a bumped `refreshKey`) refetches through this
+ * and a new `filter` or `brandId` (or a bumped `refreshKey`) refetches through this
  * fragment's own `refetch` inside a transition, keeping the current rows
  * (dimmed) instead of flashing a Suspense fallback, and going back to the
  * first page.
@@ -50,12 +52,14 @@ const invoiceListFragment = graphql`
 export function InvoiceList({
   query,
   filter,
+  brandId = null,
   showProject,
   emptyMessage,
   refreshKey = 0,
 }: {
   query: InvoiceList_query$key;
   filter: InvoiceFilterType;
+  brandId?: string | null;
   showProject: boolean;
   emptyMessage: string;
   refreshKey?: number;
@@ -67,19 +71,20 @@ export function InvoiceList({
     );
   const [isRefetching, startTransition] = useTransition();
 
-  const mounted = useRef({ filter, refreshKey });
+  const mounted = useRef({ filter, brandId, refreshKey });
   useEffect(() => {
     if (
       mounted.current.filter === filter &&
+      mounted.current.brandId === brandId &&
       mounted.current.refreshKey === refreshKey
     ) {
       return;
     }
-    mounted.current = { filter, refreshKey };
+    mounted.current = { filter, brandId, refreshKey };
     startTransition(() => {
-      refetch({ filter }, { fetchPolicy: "network-only" });
+      refetch({ filter, brandId }, { fetchPolicy: "network-only" });
     });
-  }, [filter, refreshKey, refetch]);
+  }, [filter, brandId, refreshKey, refetch]);
 
   const edges = data.invoices.edges;
 

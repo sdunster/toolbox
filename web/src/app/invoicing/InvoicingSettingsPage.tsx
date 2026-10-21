@@ -7,6 +7,7 @@ import LoadingIndicator from "../../components/LoadingIndicator";
 import { RequireInvoicingInstance } from "./RequireInvoicingInstance";
 import { InvoicingSettingsForm } from "./InvoicingSettingsForm";
 import { InvoiceNumberingForm } from "./InvoiceNumberingForm";
+import { BrandsSection } from "./BrandsSection";
 
 const invoicingSettingsPageQuery = graphql`
   query InvoicingSettingsPageQuery($slug: String!) @throwOnFieldError {
@@ -14,6 +15,7 @@ const invoicingSettingsPageQuery = graphql`
       id
       ...InvoicingSettingsForm_instance
       ...InvoiceNumberingForm_instance
+      ...BrandsSection_instance
     }
   }
 `;
@@ -35,6 +37,7 @@ function Content({ slug }: { slug: string }) {
   return (
     <div className="flex flex-col gap-6">
       <InvoicingSettingsForm instance={data.instance} />
+      <BrandsSection instance={data.instance} />
       <InvoiceNumberingForm instance={data.instance} />
     </div>
   );

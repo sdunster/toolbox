@@ -22,6 +22,7 @@ import { formatCents } from "../../lib/money";
 import { presetPeriods } from "../../lib/periods";
 import { relayMutationErrorMessage } from "../../lib/relayMutationError";
 import { RequireInvoicingInstance } from "./RequireInvoicingInstance";
+import { InstanceBrandFilter } from "./BrandSelect";
 
 const gstQuery = graphql`
   query ReportsPageGstQuery(
@@ -29,8 +30,15 @@ const gstQuery = graphql`
     $from: String!
     $to: String!
     $basis: ReportBasisType!
+    $brandId: ID
   ) @throwOnFieldError {
-    gstReport(instanceId: $instanceId, from: $from, to: $to, basis: $basis) {
+    gstReport(
+      instanceId: $instanceId
+      from: $from
+      to: $to
+      basis: $basis
+      brandId: $brandId
+    ) {
       gstRegistered
       currency
       salesCents
@@ -47,8 +55,9 @@ const gstQuery = graphql`
 `;
 
 const receivablesQuery = graphql`
-  query ReportsPageReceivablesQuery($instanceId: ID!) @throwOnFieldError {
-    receivables(instanceId: $instanceId) {
+  query ReportsPageReceivablesQuery($instanceId: ID!, $brandId: ID)
+  @throwOnFieldError {
+    receivables(instanceId: $instanceId, brandId: $brandId) {
       asOf
       currency
       totalCents
@@ -78,8 +87,15 @@ const exportQuery = graphql`
     $kind: CsvExportType!
     $from: String!
     $to: String!
+    $brandId: ID
   ) {
-    invoicingExport(instanceId: $instanceId, kind: $kind, from: $from, to: $to)
+    invoicingExport(
+      instanceId: $instanceId
+      kind: $kind
+      from: $from
+      to: $to
+      brandId: $brandId
+    )
   }
 `;
 
@@ -112,15 +128,17 @@ function GstReport({
   from,
   to,
   basis,
+  brandId,
 }: {
   instanceId: string;
   from: string;
   to: string;
   basis: ReportBasisType;
+  brandId: string | null;
 }) {
   const data = useRetryableLazyLoadQuery<ReportsPageGstQuery>(
     gstQuery,
-    { instanceId, from, to, basis },
+    { instanceId, from, to, basis, brandId },
     { fetchPolicy: "network-only" },
   );
   const r = data.gstReport;
@@ -156,10 +174,16 @@ function GstReport({
   );
 }
 
-function Receivables({ instanceId }: { instanceId: string }) {
+function Receivables({
+  instanceId,
+  brandId,
+}: {
+  instanceId: string;
+  brandId: string | null;
+}) {
   const data = useRetryableLazyLoadQuery<ReportsPageReceivablesQuery>(
     receivablesQuery,
-    { instanceId },
+    { instanceId, brandId },
     { fetchPolicy: "store-and-network" },
   );
   const r = data.receivables;
@@ -247,10 +271,12 @@ function Exports({
   instanceId,
   from,
   to,
+  brandId,
 }: {
   instanceId: string;
   from: string;
   to: string;
+  brandId: string | null;
 }) {
   const environment = useRelayEnvironment();
   const [busy, setBusy] = useState<CsvExportType | null>(null);
@@ -263,7 +289,7 @@ function Exports({
       const data = await fetchQuery<ReportsPageExportQuery>(
         environment,
         exportQuery,
-        { instanceId, kind, from, to },
+        { instanceId, kind, from, to, brandId },
         { fetchPolicy: "network-only" },
       ).toPromise();
       const blob = new Blob([data?.invoicingExport ?? ""], {
@@ -309,8 +335,10 @@ function Exports({
   );
 }
 
-function Content({ instanceId }: { instanceId: string }) {
+function Content({ instanceId, slug }: { instanceId: string; slug: string }) {
   const presets = presetPeriods(localToday());
+  // `null` is every brand — the business's whole figures.
+  const [brandId, setBrandId] = useState<string | null>(null);
   const [from, setFrom] = useState(presets[1].from);
   const [to, setTo] = useState(presets[1].to);
   const [basis, setBasis] = useState<ReportBasisType>("CASH");
@@ -356,6 +384,13 @@ function Content({ instanceId }: { instanceId: string }) {
               />
             </FormField>
           </div>
+          <InstanceBrandFilter
+            slug={slug}
+            id="report-brand"
+            value={brandId}
+            onChange={setBrandId}
+            className="w-56"
+          />
         </div>
       </Card>
 
@@ -395,6 +430,7 @@ function Content({ instanceId }: { instanceId: string }) {
                 from={from}
                 to={to}
                 basis={basis}
+                brandId={brandId}
               />
             </Suspense>
           </RelayErrorBoundary>
@@ -410,7 +446,12 @@ function Content({ instanceId }: { instanceId: string }) {
         <p className="mb-3 text-sm text-ink-muted">
           CSV files for the period above.
         </p>
-        <Exports instanceId={instanceId} from={from} to={to} />
+        <Exports
+          instanceId={instanceId}
+          from={from}
+          to={to}
+          brandId={brandId}
+        />
       </Card>
 
       <Card>
@@ -419,7 +460,7 @@ function Content({ instanceId }: { instanceId: string }) {
         </h2>
         <RelayErrorBoundary canRetry>
           <Suspense fallback={<LoadingIndicator />}>
-            <Receivables instanceId={instanceId} />
+            <Receivables instanceId={instanceId} brandId={brandId} />
           </Suspense>
         </RelayErrorBoundary>
       </Card>
@@ -430,7 +471,8 @@ function Content({ instanceId }: { instanceId: string }) {
 /**
  * `/app/reports` — the money side of an invoicing instance: the GST/BAS
  * figures for a period (cash or accrual), CSV exports for the same period,
- * and what clients owe now, aged by days past due.
+ * and what clients owe now, aged by days past due — for the whole business,
+ * or (once it has more than one) one brand.
  */
 export function ReportsPage() {
   return (
@@ -438,7 +480,11 @@ export function ReportsPage() {
       {(instance) => (
         <div className="flex flex-col gap-4">
           <h1 className="text-xl font-semibold text-ink-strong">Reports</h1>
-          <Content key={instance.id} instanceId={instance.id} />
+          <Content
+            key={instance.id}
+            instanceId={instance.id}
+            slug={instance.slug}
+          />
         </div>
       )}
     </RequireInvoicingInstance>

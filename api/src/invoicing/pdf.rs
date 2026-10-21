@@ -584,8 +584,9 @@ fn build_left_column_rows(
 
 /// Build the right column's rows top-to-bottom: the wrapped seller name/
 /// address, then (if present) a blank spacer + "Contact" + wrapped phone/
-/// email, then (if present) a blank spacer + "ABN" + wrapped ABN. Same
-/// wrapping/row-cadence reasoning as [`build_left_column_rows`].
+/// email, then (if present) a blank spacer + "ABN" + wrapped ABN, followed
+/// by "{legal name} trading as {name}" when the invoice went out under a
+/// brand. Same wrapping/row-cadence reasoning as [`build_left_column_rows`].
 fn build_right_column_rows(
     metrics: &Metrics,
     snap: &InvoiceSnapshot,
@@ -625,7 +626,24 @@ fn build_right_column_rows(
             rows.push(Some((line, false)));
         }
     }
+    if let Some(trading_as) = trading_as_line(snap) {
+        for line in wrap_text_lines(metrics, &trading_as, max_width, COLUMN_FONT_SIZE) {
+            rows.push(Some((line, false)));
+        }
+    }
     rows
+}
+
+/// "{legal name} trading as {name}", for a snapshot issued under a brand
+/// whose name isn't the seller's legal name.
+fn trading_as_line(snap: &InvoiceSnapshot) -> Option<String> {
+    let legal = snap
+        .seller
+        .legal_name
+        .as_deref()
+        .filter(|s| !s.is_empty())?;
+    let name = snap.seller.name.as_deref().filter(|s| !s.is_empty())?;
+    Some(format!("{legal} trading as {name}"))
 }
 
 /// Draw the title + two-column header block (invoice date/number/bill-to on
@@ -962,6 +980,7 @@ mod tests {
     fn seller() -> InvoiceSnapshotSeller {
         InvoiceSnapshotSeller {
             name: Some("Fictional Trades Pty Ltd".into()),
+            legal_name: None,
             abn: Some("11 222 333 444".into()),
             address: Some("1 Fictional St\nSomewhere NSW 2000".into()),
             phone: Some("0400 000 000".into()),
@@ -1262,6 +1281,25 @@ mod tests {
             lines.join(" "),
             details.split_whitespace().collect::<Vec<_>>().join(" ")
         );
+    }
+
+    #[test]
+    fn a_brand_prints_the_trading_as_line_under_the_abn() {
+        let metrics = Metrics::new().unwrap();
+        let mut snap = base_snapshot(true, vec![line("Consulting", 100, 10_000)]);
+        assert_eq!(trading_as_line(&snap), None);
+        snap.seller.name = Some("Positive Rate".into());
+        snap.seller.legal_name = Some("Samuel James Dunster".into());
+        let rows = build_right_column_rows(&metrics, &snap, 1000.0);
+        let texts: Vec<&str> = rows.iter().flatten().map(|(t, _)| t.as_str()).collect();
+        let abn_at = texts.iter().position(|t| *t == "ABN").expect("ABN heading");
+        assert_eq!(
+            texts.last().copied(),
+            Some("Samuel James Dunster trading as Positive Rate")
+        );
+        assert!(texts.len() > abn_at + 2);
+        let bytes = render_invoice_pdf(&snap).expect("render");
+        assert!(bytes.starts_with(b"%PDF"));
     }
 
     #[test]

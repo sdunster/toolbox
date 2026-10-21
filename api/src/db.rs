@@ -445,6 +445,68 @@ pub struct Instance {
     /// [`BroadcastSender`]. Stored as one JSON string attribute
     /// (`broadcast_senders`), absent when empty.
     pub broadcast_senders: Vec<BroadcastSender>,
+    /// Extra brands (invoicing instances only) — see [`Brand`]. Stored as one
+    /// JSON string attribute (`brands`), absent when empty. The instance's
+    /// own invoicing settings are the default brand and are not in here.
+    pub brands: Vec<Brand>,
+}
+
+/// The id the API gives the default brand — the instance's own invoicing
+/// settings. Never stored: a row with no `brand_id` belongs to it. A stored
+/// brand's id is a nanoid, which can't collide with this.
+pub const DEFAULT_BRAND_ID: &str = "default";
+
+/// Most extra brands one instance may have.
+pub const MAX_BRANDS: usize = 20;
+
+/// Another name the same seller invoices under — e.g. a registered business
+/// name alongside the owner's legal name. Same ABN, GST registration,
+/// currency and numbering as the instance; only the name and (optionally)
+/// contact and payment details differ, each falling back to the instance's
+/// when unset. See CLAUDE.md's "Brands" entry. `id` is a nanoid, unique
+/// within the instance. There is no delete: `archived` (only ever `true` in
+/// the JSON) hides it from pickers but keeps it in filters.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Brand {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_details: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+}
+
+/// Which brand a listing or report is narrowed to: the default brand (rows
+/// with no `brand_id`) or one stored brand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrandFilter<'a> {
+    Default,
+    Brand(&'a str),
+}
+
+impl<'a> BrandFilter<'a> {
+    /// `"default"` means [`Self::Default`]; anything else names a brand.
+    pub fn from_id(id: &'a str) -> Self {
+        if id == DEFAULT_BRAND_ID {
+            Self::Default
+        } else {
+            Self::Brand(id)
+        }
+    }
+
+    /// Whether a row whose `brand_id` is `row_brand` belongs to this brand.
+    pub fn matches(self, row_brand: Option<&str>) -> bool {
+        match self {
+            Self::Default => row_brand.is_none(),
+            Self::Brand(id) => row_brand == Some(id),
+        }
+    }
 }
 
 /// A saved From name + address an owner can pick when drafting a broadcast,
@@ -593,6 +655,9 @@ pub struct Project {
     /// The GST-exclusive rate a new billable item on this project gets when
     /// it doesn't name one.
     pub default_unit_price_cents: Option<i64>,
+    /// The [`Brand`] this project's invoices go out under; absent means the
+    /// default brand (the instance's own settings).
+    pub brand_id: Option<String>,
     /// Only ever written `true`; absent (`false`) is the default — same omit
     /// convention as `Instance::deleted`/`Instance::gst_registered`. Archiving
     /// hides a project from the default project list without deleting its
@@ -624,6 +689,7 @@ pub struct ProjectFields {
     pub reference: Option<String>,
     pub payment_terms_days: Option<u32>,
     pub default_unit_price_cents: Option<i64>,
+    pub brand_id: Option<String>,
 }
 
 impl HasID for Project {
@@ -904,6 +970,9 @@ pub struct ExpenseFields {
     /// a vehicle trip.
     pub description: Option<String>,
     pub detail: ExpenseDetail,
+    /// The [`Brand`] this expense counts toward; absent means the default
+    /// brand. Set directly, since an expense need not have a project.
+    pub brand_id: Option<String>,
 }
 
 /// An `expense` row — money an invoicing instance spent, optionally against
@@ -1100,6 +1169,10 @@ pub struct Invoice {
     /// When `sendInvoice` last mailed it, and to whom.
     pub sent_at: Option<u64>,
     pub sent_to: Vec<String>,
+    /// The [`Brand`] it goes out under, from its project: written when the
+    /// draft is created and again at finalization, after which it never
+    /// changes. Absent means the default brand.
+    pub brand_id: Option<String>,
 }
 
 impl HasID for Invoice {
@@ -1185,6 +1258,8 @@ pub struct CreditNote {
     pub pdf_s3_key: Option<String>,
     pub sent_at: Option<u64>,
     pub sent_to: Vec<String>,
+    /// Copied from its invoice's `brand_id`. Absent means the default brand.
+    pub brand_id: Option<String>,
 }
 
 impl HasID for CreditNote {
@@ -1215,6 +1290,8 @@ pub struct FinalizeInvoice<'a> {
     pub total_cents: i64,
     pub gst_cents: i64,
     pub finalized_by_user_id: &'a str,
+    /// `SET` when `Some`, `REMOVE`d when `None` (the default brand).
+    pub brand_id: Option<&'a str>,
 }
 
 // ── broadcast ─────────────────────────────────────────────────────────────
@@ -2569,6 +2646,7 @@ pub trait Handler: Sync {
         &self,
         scope: ExpenseScope<'_>,
         category: Option<ExpenseCategory>,
+        brand: Option<BrandFilter<'_>>,
         page: ListExpensesPage,
     ) -> impl Future<Output = Result<Vec<Expense>>> + Send;
     /// Total distance, in tenths of a km, of `user_id`'s vehicle trips in
@@ -2629,6 +2707,7 @@ pub trait Handler: Sync {
         project_id: &str,
         item_ids: &[String],
         created_by_user_id: &str,
+        brand_id: Option<&str>,
     ) -> impl Future<Output = Result<Option<Invoice>>> + Send;
     /// Add `item_ids` to a draft invoice: one `TransactWriteItems` that `ADD`s
     /// them to the invoice's `item_ids` set and bumps `version` (conditioned
@@ -2754,6 +2833,7 @@ pub trait Handler: Sync {
     fn list_credit_notes(
         &self,
         scope: CreditNoteScope<'_>,
+        brand: Option<BrandFilter<'_>>,
         page: ListCreditNotesPage,
     ) -> impl Future<Output = Result<Vec<CreditNote>>> + Send;
     /// Every credit note in an instance or against one invoice, unpaged.
@@ -2792,6 +2872,17 @@ pub trait Handler: Sync {
         &self,
         invoice_id: &str,
         key: &str,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Re-stamp a draft's `brand_id` (`SET`, or `REMOVE` for the default
+    /// brand) after its project moved to another brand, so
+    /// `invoices(brandId:)` lists it under the brand it now shows.
+    /// Conditioned on `status = draft`; doesn't bump `version`, which guards
+    /// the item list, not the brand. `Ok(false)` when it was finalized or
+    /// deleted in the meantime — finalization stamps the brand itself.
+    fn set_draft_invoice_brand(
+        &self,
+        invoice_id: &str,
+        brand_id: Option<&str>,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Atomically allocate the next invoice number via `UpdateItem ADD` on
     /// `counter` (`id = instance_id`, attribute `next_invoice_number`) —
@@ -2837,6 +2928,7 @@ pub trait Handler: Sync {
         &self,
         scope: InvoiceScope<'_>,
         filter: InvoiceListFilter,
+        brand: Option<BrandFilter<'_>>,
         page: ListInvoicesPage,
     ) -> impl Future<Output = Result<Vec<Invoice>>> + Send;
 
@@ -2947,6 +3039,17 @@ pub trait Handler: Sync {
         instance_id: &str,
         previous: &[BroadcastSender],
         senders: &[BroadcastSender],
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Replace an instance's extra brands (JSON; `REMOVE`d when empty),
+    /// conditioned on the stored list still being `previous` — the same
+    /// read-modify-write as [`Self::set_broadcast_senders`], behind
+    /// `addBrand`/`updateBrand`. `Ok(false)` when the instance is gone or
+    /// the list changed since it was read.
+    fn set_brands(
+        &self,
+        instance_id: &str,
+        previous: &[Brand],
+        brands: &[Brand],
     ) -> impl Future<Output = Result<bool>> + Send;
 
     // ── message_delivery ──────────────────────────────────────────────────
@@ -3445,6 +3548,7 @@ mod tests {
             currency: None,
             payment_terms_days: None,
             broadcast_senders: Vec::new(),
+            brands: Vec::new(),
         };
         assert!(require_instance_kind(&instance, InstanceKind::Invoicing).is_ok());
         assert!(require_instance_kind(&instance, InstanceKind::Support).is_err());
@@ -3472,6 +3576,7 @@ mod tests {
             currency: None,
             payment_terms_days: None,
             broadcast_senders: Vec::new(),
+            brands: Vec::new(),
         };
         assert_eq!(instance.currency_or_default(), "AUD");
         instance.currency = Some("USD".to_string());

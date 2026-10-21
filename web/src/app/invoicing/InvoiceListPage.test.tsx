@@ -12,7 +12,27 @@ import type { SelectedInstance } from "../selectedInstance";
 import { InvoiceListPage } from "./InvoiceListPage";
 
 const relayEndpoint = mswGraphql.link(getGraphQLEndpoint());
-const server = setupServer();
+
+const defaultBrand = {
+  brandId: "default",
+  name: "Ledger & Co",
+  archived: false,
+  isDefault: true,
+};
+
+/** The page's brand filter loads the instance's brands; by default it has
+ * only its default brand, so no filter shows. */
+function brandsHandler(brands: unknown[] = [defaultBrand]) {
+  return relayEndpoint.query("useInstanceBrandsQuery", () =>
+    HttpResponse.json({
+      data: {
+        instance: { __typename: "Instance", id: "inst-ledger", brands },
+      },
+    }),
+  );
+}
+
+const server = setupServer(brandsHandler());
 
 beforeAll(() => server.listen({ onUnhandledRequest: "error" }));
 afterEach(() => server.resetHandlers());
@@ -171,5 +191,52 @@ describe("InvoiceListPage", () => {
       "aria-pressed",
       "false",
     );
+  });
+
+  it("has no brand filter while the instance has one brand", async () => {
+    server.use(
+      relayEndpoint.query("InvoiceListPageQuery", () =>
+        HttpResponse.json({ data: { invoices: connection([invoiceNode()]) } }),
+      ),
+    );
+    renderPage();
+    await screen.findAllByRole("listitem");
+    expect(screen.queryByLabelText("Filter by brand")).not.toBeInTheDocument();
+  });
+
+  it("refetches one brand's invoices from the brand filter", async () => {
+    let refetchBrand: unknown;
+    server.use(
+      brandsHandler([
+        defaultBrand,
+        {
+          brandId: "b1",
+          name: "Positive Rate",
+          archived: false,
+          isDefault: false,
+        },
+      ]),
+      relayEndpoint.query("InvoiceListPageQuery", ({ variables }) => {
+        expect(variables.brandId).toBeNull();
+        return HttpResponse.json({
+          data: { invoices: connection([invoiceNode()]) },
+        });
+      }),
+      relayEndpoint.query("InvoiceListPaginationQuery", ({ variables }) => {
+        refetchBrand = variables.brandId;
+        return HttpResponse.json({ data: { invoices: connection([]) } });
+      }),
+    );
+    const user = UserEvent.setup();
+    renderPage();
+    await screen.findAllByRole("listitem");
+    await user.selectOptions(
+      await screen.findByLabelText("Filter by brand"),
+      "b1",
+    );
+    await waitFor(() => expect(refetchBrand).toBe("b1"));
+    expect(
+      await screen.findByText("No invoices for this brand."),
+    ).toBeInTheDocument();
   });
 });

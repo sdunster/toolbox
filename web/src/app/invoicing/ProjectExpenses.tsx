@@ -45,19 +45,21 @@ function Expenses({
 /**
  * The project page's "Expenses" section: this project's expenses and,
  * unless the project is archived, an "Add expense" form with the project
- * fixed. `instanceId` is the *project's* instance, same reasoning as
- * `ProjectBillableItems`.
+ * fixed — and the project's brand, `brandId`. `instanceId` is the
+ * *project's* instance, same reasoning as `ProjectBillableItems`.
  */
 export function ProjectExpenses({
   instanceId,
   projectId,
   currency,
   archived,
+  brandId,
 }: {
   instanceId: string;
   projectId: string;
   currency: string;
   archived: boolean;
+  brandId: string;
 }) {
   const [refreshKey, setRefreshKey] = useState(0);
   return (
@@ -91,6 +93,7 @@ export function ProjectExpenses({
             instanceId={instanceId}
             currency={currency}
             projectId={projectId}
+            brandId={brandId}
             onCreated={() => setRefreshKey((k) => k + 1)}
           />
         </div>

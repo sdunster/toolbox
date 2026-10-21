@@ -434,6 +434,11 @@ impl TryInto<db::Instance> for Item {
                     .map_err(|e| anyhow!("Instance has corrupt broadcast_senders: {e}"))?,
                 None => Vec::new(),
             },
+            brands: match self.string_field("brands")? {
+                Some(json) => serde_json::from_str(&json)
+                    .map_err(|e| anyhow!("Instance has corrupt brands: {e}"))?,
+                None => Vec::new(),
+            },
         })
     }
 }
@@ -528,6 +533,7 @@ impl TryInto<db::Project> for Item {
             client_email: self.string_field("client_email")?,
             payment_terms_days: self.i64_field("payment_terms_days")?.map(|d| d as u32),
             default_unit_price_cents: self.i64_field("default_unit_price_cents")?,
+            brand_id: self.string_field("brand_id")?,
             archived: self.bool_field("archived")?.unwrap_or(false),
             created_at: self
                 .i64_field("created_at")?
@@ -623,6 +629,7 @@ impl TryInto<db::Expense> for Item {
                 category,
                 description: self.string_field("description")?,
                 detail,
+                brand_id: self.string_field("brand_id")?,
             },
             billable_item_id: self.string_field("billable_item_id")?,
             receipt: match self.string_field("receipt_s3_key")? {
@@ -690,6 +697,7 @@ fn expense_attributes(fields: &db::ExpenseFields) -> Vec<(&'static str, Option<A
         ("gst_cents", gst),
         ("distance_tenths_km", distance),
         ("rate_cents_per_km", rate),
+        ("brand_id", fields.brand_id.as_deref().and_then(s)),
     ]
 }
 
@@ -744,6 +752,7 @@ impl TryInto<db::Invoice> for Item {
             credited_gst_cents: self.i64_field("credited_gst_cents")?.unwrap_or(0),
             sent_at: self.i64_field("sent_at")?.map(|t| t as u64),
             sent_to: self.string_set_field("sent_to")?,
+            brand_id: self.string_field("brand_id")?,
         })
     }
 }
@@ -778,6 +787,7 @@ impl TryInto<db::CreditNote> for Item {
             pdf_s3_key: self.string_field("pdf_s3_key")?,
             sent_at: self.i64_field("sent_at")?.map(|t| t as u64),
             sent_to: self.string_set_field("sent_to")?,
+            brand_id: self.string_field("brand_id")?,
         })
     }
 }
@@ -1153,7 +1163,42 @@ fn project_attributes(
             f.default_unit_price_cents
                 .map(|c| AttributeValue::N(c.to_string())),
         ),
+        ("brand_id", ":brand_id", s(&f.brand_id)),
     ]
+}
+
+/// The `FilterExpression` clause (and its `:brand_id` value, if any) that
+/// narrows a listing to one brand — `attribute_not_exists` for the default
+/// brand, whose rows carry no `brand_id`.
+fn brand_filter_clause(brand: db::BrandFilter<'_>) -> (&'static str, Option<AttributeValue>) {
+    match brand {
+        db::BrandFilter::Default => ("attribute_not_exists(brand_id)", None),
+        db::BrandFilter::Brand(id) => (
+            "brand_id = :brand_id",
+            Some(AttributeValue::S(id.to_string())),
+        ),
+    }
+}
+
+/// `existing` (if any) and the brand clause (if any), `AND`ed.
+fn and_brand_filter(
+    existing: Option<&str>,
+    brand: Option<db::BrandFilter<'_>>,
+) -> (Option<String>, Option<AttributeValue>) {
+    let (clause, value) = match brand {
+        Some(b) => {
+            let (c, v) = brand_filter_clause(b);
+            (Some(c), v)
+        }
+        None => (None, None),
+    };
+    let expr = match (existing, clause) {
+        (Some(e), Some(c)) => Some(format!("({e}) AND {c}")),
+        (Some(e), None) => Some(e.to_string()),
+        (None, Some(c)) => Some(c.to_string()),
+        (None, None) => None,
+    };
+    (expr, value)
 }
 
 impl TryInto<db::EphemeralState> for Item {
@@ -1981,6 +2026,7 @@ impl db::Handler for Handler {
             currency: None,
             payment_terms_days: None,
             broadcast_senders: Vec::new(),
+            brands: Vec::new(),
         })
     }
 
@@ -3145,6 +3191,7 @@ impl db::Handler for Handler {
             client_email: fields.client_email.clone(),
             payment_terms_days: fields.payment_terms_days,
             default_unit_price_cents: fields.default_unit_price_cents,
+            brand_id: fields.brand_id.clone(),
             archived: false,
             created_at: now,
             updated_at: now,
@@ -3787,6 +3834,7 @@ impl db::Handler for Handler {
         &self,
         scope: db::ExpenseScope<'_>,
         category: Option<db::ExpenseCategory>,
+        brand: Option<db::BrandFilter<'_>>,
         page: db::ListExpensesPage,
     ) -> db::Result<Vec<db::Expense>> {
         let fetch_limit = usize::try_from(page.limit).unwrap_or(0);
@@ -3824,15 +3872,19 @@ impl db::Handler for Handler {
                 .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
                 .scan_index_forward(false)
                 .return_consumed_capacity(ReturnConsumedCapacity::Total);
-            match category {
-                Some(c) => {
-                    builder = builder
-                        .filter_expression("category = :category")
-                        .expression_attribute_values(
-                            ":category",
-                            AttributeValue::S(c.as_str().to_string()),
-                        )
-                }
+            let (filter, brand_value) =
+                and_brand_filter(category.map(|_| "category = :category"), brand);
+            if let Some(c) = category {
+                builder = builder.expression_attribute_values(
+                    ":category",
+                    AttributeValue::S(c.as_str().to_string()),
+                );
+            }
+            if let Some(v) = brand_value {
+                builder = builder.expression_attribute_values(":brand_id", v);
+            }
+            match filter {
+                Some(f) => builder = builder.filter_expression(f),
                 None => builder = builder.limit(page.limit),
             }
             if let Some(esk) = exclusive_start_key.take() {
@@ -3931,6 +3983,7 @@ impl db::Handler for Handler {
         project_id: &str,
         item_ids: &[String],
         created_by_user_id: &str,
+        brand_id: Option<&str>,
     ) -> db::Result<Option<db::Invoice>> {
         self.ensure_writable()?;
         let id = new_id();
@@ -3960,6 +4013,9 @@ impl db::Handler for Handler {
                 "item_ids".to_string(),
                 AttributeValue::Ss(item_ids.to_vec()),
             );
+        }
+        if let Some(b) = brand_id {
+            invoice_item.insert("brand_id".to_string(), AttributeValue::S(b.to_string()));
         }
         let put_invoice = Put::builder()
             .table_name(self.table_name("invoice"))
@@ -4018,6 +4074,7 @@ impl db::Handler for Handler {
             credited_gst_cents: 0,
             sent_at: None,
             sent_to: Vec::new(),
+            brand_id: brand_id.map(str::to_string),
         }))
     }
 
@@ -4165,15 +4222,22 @@ impl db::Handler for Handler {
         f: &db::FinalizeInvoice<'_>,
     ) -> db::Result<bool> {
         let now = crate::clock::now_sec();
-        let update_invoice = Update::builder()
+        // The brand is stamped again here, from the project as it stands at
+        // finalization, so a finalized invoice's brand matches its snapshot.
+        let (brand_set, brand_remove) = match f.brand_id {
+            Some(_) => (", brand_id = :brand_id", ""),
+            None => ("", " REMOVE brand_id"),
+        };
+        let mut update_invoice = Update::builder()
             .table_name(self.table_name("invoice"))
             .key("id", AttributeValue::S(invoice_id.to_string()))
-            .update_expression(
+            .update_expression(format!(
                 "SET #status = :finalized, #num = :number, issue_date = :issue_date, \
                  due_date = :due_date, #snap = :snapshot, total_cents = :total_cents, \
                  gst_cents = :gst_cents, finalized_at = :now, \
-                 finalized_by_user_id = :finalized_by, updated_at = :now ADD #v :one",
-            )
+                 finalized_by_user_id = :finalized_by, updated_at = :now{brand_set} \
+                 ADD #v :one{brand_remove}",
+            ))
             .condition_expression(
                 "attribute_exists(id) AND #status = :draft AND #v = :expected_version",
             )
@@ -4205,7 +4269,12 @@ impl db::Handler for Handler {
             .expression_attribute_values(
                 ":finalized_by",
                 AttributeValue::S(f.finalized_by_user_id.to_string()),
-            )
+            );
+        if let Some(b) = f.brand_id {
+            update_invoice = update_invoice
+                .expression_attribute_values(":brand_id", AttributeValue::S(b.to_string()));
+        }
+        let update_invoice = update_invoice
             .build()
             .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
 
@@ -4373,6 +4442,52 @@ impl db::Handler for Handler {
         }
     }
 
+    async fn set_draft_invoice_brand(
+        &self,
+        invoice_id: &str,
+        brand_id: Option<&str>,
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let mut builder = self
+            .client
+            .update_item()
+            .table_name(self.table_name("invoice"))
+            .key("id", AttributeValue::S(invoice_id.to_string()))
+            .condition_expression("attribute_exists(id) AND #status = :draft")
+            .expression_attribute_names("#status", "status")
+            .expression_attribute_values(":draft", AttributeValue::S("draft".to_string()))
+            .expression_attribute_values(
+                ":now",
+                AttributeValue::N(crate::clock::now_sec().to_string()),
+            );
+        builder = match brand_id {
+            Some(b) => builder
+                .update_expression("SET brand_id = :brand_id, updated_at = :now")
+                .expression_attribute_values(":brand_id", AttributeValue::S(b.to_string())),
+            None => builder.update_expression("SET updated_at = :now REMOVE brand_id"),
+        };
+        let resp = builder
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        match resp {
+            Ok(r) => {
+                record_capacity(
+                    "set_draft_invoice_brand",
+                    r.consumed_capacity(),
+                    CapKind::Write,
+                );
+                Ok(true)
+            }
+            Err(SdkError::ServiceError(ref se))
+                if se.err().is_conditional_check_failed_exception() =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(db::Error::Infrastructure(sdk_err_msg(e))),
+        }
+    }
+
     async fn increment_invoice_counter(&self, instance_id: &str) -> db::Result<u64> {
         self.ensure_writable()?;
         let resp = self
@@ -4528,6 +4643,7 @@ impl db::Handler for Handler {
         &self,
         scope: db::InvoiceScope<'_>,
         filter: db::InvoiceListFilter,
+        brand: Option<db::BrandFilter<'_>>,
         page: db::ListInvoicesPage,
     ) -> db::Result<Vec<db::Invoice>> {
         let fetch_limit = usize::try_from(page.limit).unwrap_or(0);
@@ -4590,11 +4706,16 @@ impl db::Handler for Handler {
                 .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
                 .scan_index_forward(false)
                 .return_consumed_capacity(ReturnConsumedCapacity::Total);
-            match filter_expression {
+            let (filter, brand_value) = and_brand_filter(filter_expression, brand);
+            if let Some(v) = brand_value {
+                builder = builder.expression_attribute_values(":brand_id", v);
+            }
+            match filter {
                 Some(f) => {
-                    builder = builder
-                        .filter_expression(f)
-                        .expression_attribute_names("#status", "status");
+                    builder = builder.filter_expression(f);
+                    if filter_expression.is_some() {
+                        builder = builder.expression_attribute_names("#status", "status");
+                    }
                     if let Some(v) = status_value {
                         builder = builder.expression_attribute_values(
                             ":status_value",
@@ -4639,7 +4760,7 @@ impl db::Handler for Handler {
         self.ensure_writable()?;
         let s = |v: &str| AttributeValue::S(v.to_string());
         let n = |v: i64| AttributeValue::N(v.to_string());
-        let row: HashMap<String, AttributeValue> = HashMap::from([
+        let mut row: HashMap<String, AttributeValue> = HashMap::from([
             ("id".to_string(), s(&note.id)),
             ("instance_id".to_string(), s(&note.instance_id)),
             ("invoice_id".to_string(), s(&note.invoice_id)),
@@ -4657,6 +4778,9 @@ impl db::Handler for Handler {
             ),
             ("created_at".to_string(), n(note.created_at as i64)),
         ]);
+        if let Some(b) = &note.brand_id {
+            row.insert("brand_id".to_string(), s(b));
+        }
         let put_note = Put::builder()
             .table_name(self.table_name("credit_note"))
             .set_item(Some(row))
@@ -4717,13 +4841,15 @@ impl db::Handler for Handler {
     async fn list_credit_notes(
         &self,
         scope: db::CreditNoteScope<'_>,
+        brand: Option<db::BrandFilter<'_>>,
         page: db::ListCreditNotesPage,
     ) -> db::Result<Vec<db::CreditNote>> {
-        if page.limit <= 0 {
+        let fetch_limit = usize::try_from(page.limit).unwrap_or(0);
+        if fetch_limit == 0 {
             return Ok(Vec::new());
         }
         let (index_name, key_attr, key_value) = credit_note_index(scope);
-        let exclusive_start_key = page.after.map(|c| {
+        let mut exclusive_start_key = page.after.map(|c| {
             HashMap::from([
                 ("id".to_string(), AttributeValue::S(c.id)),
                 (
@@ -4736,22 +4862,43 @@ impl db::Handler for Handler {
                 ),
             ])
         });
-        let resp = self
-            .client
-            .query()
-            .table_name(self.table_name("credit_note"))
-            .index_name(index_name)
-            .key_condition_expression(format!("{key_attr} = :key_value"))
-            .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
-            .scan_index_forward(false)
-            .limit(page.limit)
-            .set_exclusive_start_key(exclusive_start_key)
-            .return_consumed_capacity(ReturnConsumedCapacity::Total)
-            .send()
-            .await
-            .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
-        record_capacity("list_credit_notes", resp.consumed_capacity(), CapKind::Read);
-        Ok(hydrate_items(resp.items)?)
+        // With a brand filter, `Limit` runs before it — keep going until the
+        // page is full or the index is exhausted, as `list_invoices` does.
+        let mut notes: Vec<db::CreditNote> = Vec::new();
+        loop {
+            let mut builder = self
+                .client
+                .query()
+                .table_name(self.table_name("credit_note"))
+                .index_name(index_name)
+                .key_condition_expression(format!("{key_attr} = :key_value"))
+                .expression_attribute_values(":key_value", AttributeValue::S(key_value.to_string()))
+                .scan_index_forward(false)
+                .set_exclusive_start_key(exclusive_start_key.take())
+                .return_consumed_capacity(ReturnConsumedCapacity::Total);
+            match brand {
+                Some(b) => {
+                    let (clause, value) = brand_filter_clause(b);
+                    builder = builder.filter_expression(clause);
+                    if let Some(v) = value {
+                        builder = builder.expression_attribute_values(":brand_id", v);
+                    }
+                }
+                None => builder = builder.limit(page.limit),
+            }
+            let resp = builder
+                .send()
+                .await
+                .map_err(|e| db::Error::Infrastructure(sdk_err_msg(e)))?;
+            record_capacity("list_credit_notes", resp.consumed_capacity(), CapKind::Read);
+            notes.extend(hydrate_items::<db::CreditNote>(resp.items)?);
+            exclusive_start_key = resp.last_evaluated_key;
+            if notes.len() >= fetch_limit || exclusive_start_key.is_none() {
+                break;
+            }
+        }
+        notes.truncate(fetch_limit);
+        Ok(notes)
     }
 
     async fn list_all_credit_notes(
@@ -5208,6 +5355,48 @@ impl db::Handler for Handler {
             .send()
             .await;
         conditional_write_result("set_broadcast_senders", resp)
+    }
+
+    async fn set_brands(
+        &self,
+        instance_id: &str,
+        previous: &[db::Brand],
+        brands: &[db::Brand],
+    ) -> db::Result<bool> {
+        self.ensure_writable()?;
+        let to_json = |list: &[db::Brand]| -> db::Result<Option<String>> {
+            if list.is_empty() {
+                return Ok(None);
+            }
+            serde_json::to_string(list)
+                .map(Some)
+                .map_err(|e| db::Error::Infrastructure(format!("serializing brands: {e}")))
+        };
+        let mut req = self
+            .client
+            .update_item()
+            .table_name(self.table_name("instance"))
+            .key("id", AttributeValue::S(instance_id.to_string()));
+        // Compared as strings, as in `set_broadcast_senders`.
+        req = match to_json(previous)? {
+            Some(old) => req
+                .condition_expression("attribute_exists(id) AND brands = :old")
+                .expression_attribute_values(":old", AttributeValue::S(old)),
+            None => {
+                req.condition_expression("attribute_exists(id) AND attribute_not_exists(brands)")
+            }
+        };
+        req = match to_json(brands)? {
+            Some(new) => req
+                .update_expression("SET brands = :new")
+                .expression_attribute_values(":new", AttributeValue::S(new)),
+            None => req.update_expression("REMOVE brands"),
+        };
+        let resp = req
+            .return_consumed_capacity(ReturnConsumedCapacity::Total)
+            .send()
+            .await;
+        conditional_write_result("set_brands", resp)
     }
 
     // ── message_delivery ──────────────────────────────────────────────────

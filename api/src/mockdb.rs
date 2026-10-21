@@ -408,6 +408,7 @@ impl db::Handler for Handler {
         &self,
         _scope: db::ExpenseScope<'_>,
         _category: Option<db::ExpenseCategory>,
+        _brand: Option<db::BrandFilter<'_>>,
         _page: db::ListExpensesPage,
     ) -> db::Result<Vec<db::Expense>> {
         Self::unsupported()
@@ -442,6 +443,7 @@ impl db::Handler for Handler {
         _project_id: &str,
         _item_ids: &[String],
         _created_by_user_id: &str,
+        _brand_id: Option<&str>,
     ) -> db::Result<Option<db::Invoice>> {
         Self::unsupported()
     }
@@ -514,6 +516,14 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    async fn set_draft_invoice_brand(
+        &self,
+        _invoice_id: &str,
+        _brand_id: Option<&str>,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
     async fn increment_invoice_counter(&self, _instance_id: &str) -> db::Result<u64> {
         Self::unsupported()
     }
@@ -538,6 +548,7 @@ impl db::Handler for Handler {
         &self,
         _scope: db::InvoiceScope<'_>,
         _filter: db::InvoiceListFilter,
+        _brand: Option<db::BrandFilter<'_>>,
         _page: db::ListInvoicesPage,
     ) -> db::Result<Vec<db::Invoice>> {
         Self::unsupported()
@@ -568,6 +579,7 @@ impl db::Handler for Handler {
     async fn list_credit_notes(
         &self,
         _scope: db::CreditNoteScope<'_>,
+        _brand: Option<db::BrandFilter<'_>>,
         _page: db::ListCreditNotesPage,
     ) -> db::Result<Vec<db::CreditNote>> {
         Self::unsupported()
@@ -682,6 +694,15 @@ impl db::Handler for Handler {
         _instance_id: &str,
         _previous: &[db::BroadcastSender],
         _senders: &[db::BroadcastSender],
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn set_brands(
+        &self,
+        _instance_id: &str,
+        _previous: &[db::Brand],
+        _brands: &[db::Brand],
     ) -> db::Result<bool> {
         Self::unsupported()
     }

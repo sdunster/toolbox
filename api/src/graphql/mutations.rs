@@ -33,9 +33,9 @@ use super::auth::{AuthGuard, AuthRequirement, is_member, is_owner};
 use super::error::ApiError;
 use super::finance::{CreditNote, CreditNoteInput, RecordPaymentInput, SendDocumentInput};
 use super::query::{
-    ApiTokenInfo, BillableItem, BillableItemInput, Broadcast, CreateProjectInput, CreatedApiToken,
-    Expense, ExpenseInput, InboundAddressInfo, Instance, InstanceKindType, Invoice,
-    InvoicingSettingsInput, MembershipInfo, MembershipRoleType, NotificationSettingsInput,
+    ApiTokenInfo, BillableItem, BillableItemInput, BrandInput, Broadcast, CreateProjectInput,
+    CreatedApiToken, Expense, ExpenseInput, InboundAddressInfo, Instance, InstanceKindType,
+    Invoice, InvoicingSettingsInput, MembershipInfo, MembershipRoleType, NotificationSettingsInput,
     PasskeyInfo, Project, SaveBroadcastDraftInput, SendBroadcastInput, Ticket, TicketMessage,
     TicketStatusType, UpdateProjectInput, User,
 };
@@ -325,18 +325,26 @@ async fn require_expense_member<A: App + HasDb + Send + Sync>(
     Ok(expense)
 }
 
-/// Validate an [`ExpenseInput`] for `instance_id`. A `projectId` must be a
+/// Validate an [`ExpenseInput`] for `instance`. A `projectId` must be a
 /// project in the same instance (`NOT_FOUND` otherwise, like
 /// `billableItems`' filter), and an archived project takes no new expenses
-/// — unless `current_project_id` (the expense's project before this
-/// update) is that same project, so editing an expense on a since-archived
-/// job still works.
+/// — unless `current` (the expense before this update) is on that same
+/// project, so editing an expense on a since-archived job still works. The
+/// same goes for an archived brand.
 async fn validate_expense<A: App + HasDb + Send + Sync>(
     app: &A,
-    instance_id: &str,
+    instance: &db::Instance,
     input: &ExpenseInput,
-    current_project_id: Option<&str>,
+    current: Option<&db::ExpenseFields>,
 ) -> Result<db::ExpenseFields> {
+    let instance_id = instance.id.as_str();
+    let current_project_id = current.and_then(|c| c.project_id.as_deref());
+    let brand_id = invoicing::brand::validate_choice(
+        instance,
+        input.brand_id.as_ref().map(|b| b.as_str()),
+        current.and_then(|c| c.brand_id.as_deref()),
+    )
+    .map_err(|e| anyhow!(e))?;
     if let Some(project_id) = &input.project_id {
         let project = app
             .db()
@@ -355,6 +363,7 @@ async fn validate_expense<A: App + HasDb + Send + Sync>(
     }
     invoicing::expense::validate_expense_input(invoicing::expense::ExpenseInput {
         project_id: input.project_id.as_ref().map(|p| p.to_string()),
+        brand_id,
         date: &input.date,
         category: Some(input.category.into()),
         description: input.description.as_deref(),
@@ -531,6 +540,11 @@ fn validate_billable_item_input(
 
 /// `createProject`/`updateProject`'s raw fields, before validation.
 struct ProjectFieldsInput<'a> {
+    instance: &'a db::Instance,
+    /// The project's brand before this update, which stays choosable even
+    /// once archived.
+    current_brand_id: Option<&'a str>,
+    brand_id: Option<&'a ID>,
     name: &'a str,
     client_name: &'a str,
     client_abn: Option<&'a str>,
@@ -569,6 +583,12 @@ fn validate_project_fields(input: ProjectFieldsInput<'_>) -> Result<db::ProjectF
             .map(invoicing::validate_unit_price_cents)
             .transpose()
             .map_err(|e| anyhow!(e))?,
+        brand_id: invoicing::brand::validate_choice(
+            input.instance,
+            input.brand_id.map(|b| b.as_str()),
+            input.current_brand_id,
+        )
+        .map_err(|e| anyhow!(e))?,
     })
 }
 
@@ -1151,6 +1171,81 @@ async fn save_broadcast_senders<A: App + HasDb + Send + Sync>(
         .into());
     }
     instance.broadcast_senders = senders;
+    Ok(Instance::new(instance))
+}
+
+/// Trim and validate a [`BrandInput`] into a brand with the given `id` and
+/// `archived` flag. Names must be unique (case-insensitively) among the
+/// instance's other brands.
+fn validate_brand(
+    instance: &db::Instance,
+    id: String,
+    input: &BrandInput,
+    archived: bool,
+) -> Result<db::Brand> {
+    let name = normalize_invoicing_field(&input.name, "name")?
+        .ok_or_else(|| anyhow!("Brand name is required"))?;
+    if instance
+        .brands
+        .iter()
+        .any(|b| b.id != id && b.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(anyhow!("There is already a brand called {name:?}"));
+    }
+    let opt = |v: &Option<String>, field: &str| {
+        normalize_invoicing_field(v.as_deref().unwrap_or(""), field)
+    };
+    let opt_long = |v: &Option<String>, field: &str| {
+        normalize_invoicing_long_field(v.as_deref().unwrap_or(""), field)
+    };
+    Ok(db::Brand {
+        id,
+        name,
+        email: opt(&input.email, "email")?,
+        phone: opt(&input.phone, "phone")?,
+        address: opt_long(&input.address, "address")?,
+        payment_details: opt_long(&input.payment_details, "paymentDetails")?,
+        archived,
+    })
+}
+
+/// Fetch an invoicing instance for brand management — `NOT_FOUND` when
+/// missing, a validation error for a support instance (like
+/// `updateInvoicingSettings`).
+async fn brand_instance<A: App + HasDb + Send + Sync>(
+    app: &A,
+    instance_id: &ID,
+) -> Result<db::Instance> {
+    let instance = app
+        .db()
+        .get_instances(&[instance_id.as_str()])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+    db::require_instance_kind(&instance, db::InstanceKind::Invoicing).map_err(|e| anyhow!(e))?;
+    Ok(instance)
+}
+
+/// Write `brands` over the list `instance` was read with — `CONFLICT` if it
+/// changed in between — and return the instance as it now stands.
+async fn save_brands<A: App + HasDb + Send + Sync>(
+    app: &A,
+    mut instance: db::Instance,
+    brands: Vec<db::Brand>,
+) -> Result<Instance<A>> {
+    if !app
+        .db()
+        .set_brands(&instance.id, &instance.brands, &brands)
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "Brands changed while you were editing them — reload and try again",
+        )
+        .into());
+    }
+    instance.brands = brands;
     Ok(Instance::new(instance))
 }
 
@@ -4181,6 +4276,64 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         }))
     }
 
+    /// Add a brand — another name this invoicing instance issues under
+    /// (e.g. a registered business name beside the owner's legal name).
+    /// Owner-or-superuser, like `updateInvoicingSettings`: brands are
+    /// instance settings. At most `db::MAX_BRANDS`. Returns the instance,
+    /// so a client's cached `brands` updates in place. See CLAUDE.md's
+    /// "Brands" entry.
+    #[graphql(
+        guard = "AuthGuard::new(AuthRequirement::InstanceOwnerOrSuperuser(instance_id.to_string()))"
+    )]
+    async fn add_brand(&self, instance_id: ID, input: BrandInput) -> Result<Instance<A>> {
+        let instance = brand_instance(&*self.app, &instance_id).await?;
+        if instance.brands.len() >= db::MAX_BRANDS {
+            return Err(anyhow!(
+                "An instance can have at most {} brands",
+                db::MAX_BRANDS
+            ));
+        }
+        let brand = validate_brand(&instance, crate::dynamodb::new_id(), &input, false)?;
+        let mut brands = instance.brands.clone();
+        brands.push(brand);
+        save_brands(&*self.app, instance, brands).await
+    }
+
+    /// Full-replace a brand, including `archived` (default `false`). An
+    /// archived brand can't be chosen for a new project or expense but
+    /// still appears in filters; there is no delete. The default brand
+    /// (`"default"`) is the instance's invoicing settings — change it with
+    /// `updateInvoicingSettings`. Changing a brand changes drafts and
+    /// future invoices, never a finalized one.
+    #[graphql(
+        guard = "AuthGuard::new(AuthRequirement::InstanceOwnerOrSuperuser(instance_id.to_string()))"
+    )]
+    async fn update_brand(
+        &self,
+        instance_id: ID,
+        brand_id: ID,
+        input: BrandInput,
+        #[graphql(default)] archived: bool,
+    ) -> Result<Instance<A>> {
+        let instance = brand_instance(&*self.app, &instance_id).await?;
+        if brand_id.as_str() == db::DEFAULT_BRAND_ID {
+            return Err(anyhow!(
+                "The default brand is the invoicing settings — edit those instead"
+            ));
+        }
+        let Some(index) = instance
+            .brands
+            .iter()
+            .position(|b| b.id == brand_id.as_str())
+        else {
+            return Err(ApiError::not_found("Brand", brand_id.as_str()).into());
+        };
+        let brand = validate_brand(&instance, brand_id.to_string(), &input, archived)?;
+        let mut brands = instance.brands.clone();
+        brands[index] = brand;
+        save_brands(&*self.app, instance, brands).await
+    }
+
     // ── Projects ──────────────────────────────────────────────────────────────
 
     /// Create a project in an invoicing instance. Member (owner or agent) —
@@ -4206,6 +4359,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .map_err(|e| anyhow!(e))?;
 
         let fields = validate_project_fields(ProjectFieldsInput {
+            instance: &instance,
+            current_brand_id: None,
+            brand_id: input.brand_id.as_ref(),
             name: &input.name,
             client_name: &input.client_name,
             client_abn: input.client_abn.as_deref(),
@@ -4236,7 +4392,19 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         input: UpdateProjectInput,
     ) -> Result<Project<A>> {
         let project = require_project_member(ctx, &*self.app, id.as_str()).await?;
+        let instance = self
+            .app
+            .db()
+            .get_instances(&[project.instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Project", id.as_str()))?;
         let fields = validate_project_fields(ProjectFieldsInput {
+            instance: &instance,
+            current_brand_id: project.brand_id.as_deref(),
+            brand_id: input.brand_id.as_ref(),
             name: &input.name,
             client_name: &input.client_name,
             client_abn: input.client_abn.as_deref(),
@@ -4256,6 +4424,29 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 },
             )
             .await?;
+        // A draft shows its project's brand; re-stamp the stored copy that
+        // `invoices(brandId:)` filters on to match.
+        if fields.brand_id != project.brand_id {
+            let drafts = self
+                .app
+                .db()
+                .list_invoices(
+                    db::InvoiceScope::Project(&project.id),
+                    db::InvoiceListFilter::Draft,
+                    None,
+                    db::ListInvoicesPage {
+                        after: None,
+                        limit: i32::MAX,
+                    },
+                )
+                .await?;
+            for draft in drafts {
+                self.app
+                    .db()
+                    .set_draft_invoice_brand(&draft.id, fields.brand_id.as_deref())
+                    .await?;
+            }
+        }
 
         Ok(Project::new(db::Project {
             name: fields.name,
@@ -4266,6 +4457,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             reference: fields.reference,
             payment_terms_days: fields.payment_terms_days,
             default_unit_price_cents: fields.default_unit_price_cents,
+            brand_id: fields.brand_id,
             archived: input.archived,
             updated_at: crate::clock::now_sec(),
             ..project
@@ -4450,7 +4642,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
         db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
             .map_err(|e| anyhow!(e))?;
-        let fields = validate_expense(&*self.app, &instance.id, &input, None).await?;
+        let fields = validate_expense(&*self.app, &instance, &input, None).await?;
         let created = self
             .app
             .db()
@@ -4470,13 +4662,16 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         input: ExpenseInput,
     ) -> Result<Expense<A>> {
         let expense = require_expense_member(ctx, &*self.app, id.as_str()).await?;
-        let fields = validate_expense(
-            &*self.app,
-            &expense.instance_id,
-            &input,
-            expense.fields.project_id.as_deref(),
-        )
-        .await?;
+        let instance = self
+            .app
+            .db()
+            .get_instances(&[expense.instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Expense", id.as_str()))?;
+        let fields = validate_expense(&*self.app, &instance, &input, Some(&expense.fields)).await?;
         if !self.app.db().update_expense(&expense.id, &fields).await? {
             return Err(ApiError::not_found("Expense", id.as_str()).into());
         }
@@ -4543,7 +4738,14 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         let created = self
             .app
             .db()
-            .create_invoice(&project.instance_id, &project.id, &ids, user_id)
+            .create_invoice(
+                &project.instance_id,
+                &project.id,
+                &ids,
+                user_id,
+                invoicing::brand::find(&instance, project.brand_id.as_deref())
+                    .map(|b| b.id.as_str()),
+            )
             .await?
             .ok_or_else(|| {
                 ApiError::conflict(
@@ -4850,6 +5052,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .map_err(|e| anyhow!(e))?;
         let snapshot_json = serde_json::to_string(&snapshot)
             .map_err(|e| anyhow!("Failed to serialize invoice snapshot: {e}"))?;
+        // Stamped on the row with the snapshot: the brand it was built with.
+        let brand_id =
+            invoicing::brand::find(&instance, project.brand_id.as_deref()).map(|b| b.id.clone());
 
         // Step 6: the conditional write, with the number's reservation. A
         // failure here leaves a counter-allocated `number` unused — a gap,
@@ -4870,6 +5075,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                     total_cents: snapshot.total_cents,
                     gst_cents: snapshot.gst_cents,
                     finalized_by_user_id: user_id,
+                    brand_id: brand_id.as_deref(),
                 },
             )
             .await?;
@@ -4901,6 +5107,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             finalized_at: Some(now),
             finalized_by_user_id: Some(user_id.clone()),
             updated_at: now,
+            brand_id,
             ..invoice
         }))
     }
@@ -5241,6 +5448,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             pdf_s3_key: None,
             sent_at: None,
             sent_to: Vec::new(),
+            brand_id: invoice.brand_id.clone(),
         };
         let settled = if invoice.paid_date.is_none() {
             invoicing::ledger::settled_date(

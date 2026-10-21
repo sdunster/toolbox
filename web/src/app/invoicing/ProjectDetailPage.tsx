@@ -22,6 +22,11 @@ const projectDetailPageQuery = graphql`
       clientName
       archived
       defaultUnitPriceCents
+      brand {
+        brandId
+        name
+        isDefault
+      }
       instance {
         id
         invoicingSettings {
@@ -74,7 +79,10 @@ function Content({ id }: { id: string }) {
             </span>
           )}
         </div>
-        <p className="mt-1 text-sm text-ink-muted">{project.clientName}</p>
+        <p className="mt-1 text-sm text-ink-muted">
+          {project.clientName}
+          {!project.brand.isDefault && <> · Invoiced as {project.brand.name}</>}
+        </p>
       </div>
       <ProjectFinancials
         projectId={project.id}
@@ -103,6 +111,7 @@ function Content({ id }: { id: string }) {
         projectId={project.id}
         currency={project.instance.invoicingSettings?.currency ?? "AUD"}
         archived={project.archived}
+        brandId={project.brand.brandId}
       />
     </div>
   );

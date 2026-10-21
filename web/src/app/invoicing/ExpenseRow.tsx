@@ -9,7 +9,8 @@ import { formatDate } from "../../lib/dates";
 import { tw } from "../../lib/tw";
 import { centsToInput, formatCents } from "../../lib/money";
 import { VEHICLE_KM, categoryLabel } from "../../lib/expenses";
-import { ExpenseForm } from "./ExpenseForm";
+import { ExpenseForm, type ExpenseProjectOption } from "./ExpenseForm";
+import type { BrandOption } from "../../lib/brands";
 import { ExpenseExtras } from "./ExpenseExtras";
 
 const expenseRowFragment = graphql`
@@ -26,6 +27,9 @@ const expenseRowFragment = graphql`
     project {
       id
       name
+    }
+    brand {
+      brandId
     }
     rebilledItem {
       id
@@ -77,20 +81,23 @@ export function ExpenseHeader({
  * {@link ExpenseExtras} handles the receipt and re-billing.
  *
  * `projects` feeds the edit form's project picker; on a project's own page
- * it's omitted and the expense keeps its project.
+ * it's omitted and the expense keeps its project. Likewise `brands` for the
+ * brand picker; without it the expense keeps its brand.
  */
 export function ExpenseRow({
   expense,
   showProject,
   currency,
   projects,
+  brands,
   connectionId,
   onChanged,
 }: {
   expense: ExpenseRow_expense$key;
   showProject: boolean;
   currency: string;
-  projects?: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  projects?: ReadonlyArray<ExpenseProjectOption>;
+  brands?: ReadonlyArray<BrandOption>;
   connectionId: string;
   onChanged: () => void;
 }) {
@@ -128,8 +135,10 @@ export function ExpenseRow({
           idPrefix={`edit-${data.id}`}
           currency={currency}
           projects={projects}
+          brands={brands}
           initial={{
             projectId: data.project?.id ?? null,
+            brandId: data.brand.brandId,
             date: data.date,
             category: data.category as never,
             description: data.description ?? "",

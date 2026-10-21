@@ -19,6 +19,13 @@
 //! instance — so an imported invoice keeps its original number and date in the
 //! same irreversible call.
 //!
+//! **Brands** (`list_brands`): an instance can issue under more than one name
+//! (see CLAUDE.md's "Brands" entry). A project's `brandId` picks the name its
+//! invoices print; an expense has its own. Every list and report takes an
+//! optional `brandId` filter, `"default"` meaning the default brand. Adding or
+//! changing a brand (`addBrand`/`updateBrand`) is owner-level instance
+//! settings and deliberately not a tool.
+//!
 //! **Deliberately not exposed:** `updateInvoicingSettings` and
 //! `setNextInvoiceNumber` (owner-level instance settings — change them in the
 //! web app; `finalize_invoice`'s `number` covers what an import needs) and the
@@ -35,17 +42,23 @@ use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 use super::tool::{ToolContext, ToolOutcome, missing_argument};
 
 const PROJECT_FIELDS: &str = "id name clientName clientAbn clientAddress clientEmail reference \
-     paymentTermsDays effectivePaymentTermsDays defaultUnitPriceCents archived createdAt updatedAt";
+     paymentTermsDays effectivePaymentTermsDays defaultUnitPriceCents archived createdAt updatedAt \
+     brand { brandId name }";
+
+const BRAND_FIELDS: &str = "brandId name email phone address paymentDetails archived isDefault";
+
+const BRAND_FILTER_DESCRIPTION: &str = "Only this brand's (an id from list_brands; \
+     \"default\" for the default brand).";
 
 const ITEM_FIELDS: &str = "id date description quantity unitPriceCents amountCents gstFree status \
      project { id name }";
 
 const EXPENSE_FIELDS: &str = "id date category description supplier amountCents gstCents \
-     distanceKm rateCentsPerKm project { id name } rebilledItem { id status } \
+     distanceKm rateCentsPerKm project { id name } brand { brandId name } rebilledItem { id status } \
      receipt { filename contentType size }";
 
 const CREDIT_NOTE_FIELDS: &str = "id displayNumber issueDate reason title subtotalCents gstCents \
-     totalCents currency createdAt sentAt sentTo invoice { id displayNumber } \
+     totalCents currency createdAt sentAt sentTo invoice { id displayNumber } brand { brandId name } \
      lines { description amountCents gstFree }";
 
 /// `ExpenseCategoryType`'s values, for the tools' input schemas.
@@ -86,13 +99,13 @@ const EXPENSE_WRITE_DESCRIPTION: &str = "Record an expense in an INVOICING insta
 const INVOICE_SUMMARY_FIELDS: &str = "id status number displayNumber issueDate dueDate paidDate \
      overdue daysOverdue title reference subtotalCents gstCents totalCents paidCents \
      creditedCents balanceCents currency createdAt finalizedAt sentAt \
-     project { id name clientName }";
+     project { id name clientName } brand { brandId name }";
 
 const INVOICE_DETAIL_FIELDS: &str = "id status number displayNumber issueDate dueDate paidDate \
      overdue daysOverdue title reference subtotalCents gstCents totalCents paidCents \
      creditedCents balanceCents currency gstRegistered paymentDetails createdAt finalizedAt \
-     sentAt sentTo project { id name clientName clientEmail } \
-     billTo { name abn address } seller { name abn address phone email } \
+     sentAt sentTo project { id name clientName clientEmail } brand { brandId name } \
+     billTo { name abn address } seller { name legalName abn address phone email } \
      lines { date description quantity unitPriceCents amountCents gstFree } \
      items { id date description quantity unitPriceCents amountCents gstFree status } \
      payments { id date amountCents note } \
@@ -118,6 +131,23 @@ fn project_schema() -> Value {
             "archived": { "type": "boolean" },
             "createdAt": { "type": "integer", "description": "Unix seconds." },
             "updatedAt": { "type": "integer", "description": "Unix seconds." },
+            "brand": { "type": "object", "description": "The brand its invoices go out under." },
+        },
+    })
+}
+
+fn brand_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "brandId": { "type": "string", "description": "\"default\" for the default brand." },
+            "name": { "type": "string" },
+            "email": { "type": ["string", "null"] },
+            "phone": { "type": ["string", "null"] },
+            "address": { "type": ["string", "null"] },
+            "paymentDetails": { "type": ["string", "null"] },
+            "archived": { "type": "boolean", "description": "Can't be chosen for new projects or expenses." },
+            "isDefault": { "type": "boolean", "description": "The instance's own invoicing settings." },
         },
     })
 }
@@ -165,6 +195,7 @@ fn invoice_schema() -> Value {
             "createdAt": { "type": "integer" },
             "finalizedAt": { "type": ["integer", "null"] },
             "project": { "type": "object" },
+            "brand": { "type": "object", "description": "The brand it goes out under." },
         },
     })
 }
@@ -204,6 +235,7 @@ pub fn catalogue() -> Vec<Value> {
     update_item_props["id"] = json!({ "type": "string" });
     let expense_props = json!({
         "projectId": { "type": "string", "description": "Optional — omit for an expense not tied to a project." },
+        "brandId": { "type": "string", "description": "The brand it counts toward (from list_brands); omit for the default brand. Usually its project's brand." },
         "date": { "type": "string", "description": "YYYY-MM-DD." },
         "category": { "type": "string", "enum": EXPENSE_CATEGORIES },
         "description": { "type": "string", "description": "Optional for a purchase; the business purpose of a VEHICLE_KM trip (required there)." },
@@ -218,6 +250,22 @@ pub fn catalogue() -> Vec<Value> {
     update_expense_props["id"] = json!({ "type": "string" });
 
     vec![
+        json!({
+            "name": "list_brands",
+            "title": "List brands",
+            "description": "List the brands (names the business invoices under — e.g. the \
+                owner's legal name and a registered business name, same ABN) of an INVOICING \
+                instance: the default brand (id \"default\", the instance's own invoicing \
+                settings) first, then the others. A project's brand decides the seller name \
+                its invoices print; reports and lists can be filtered by brand. Sends no email.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "instanceId": { "type": "string" } },
+                "required": ["instanceId"],
+            },
+            "outputSchema": wrap("brands", json!({ "type": "array", "items": brand_schema() })),
+            "annotations": { "title": "List brands", "readOnlyHint": true, "idempotentHint": true },
+        }),
         json!({
             "name": "list_projects",
             "title": "List projects",
@@ -254,6 +302,7 @@ pub fn catalogue() -> Vec<Value> {
                     "reference": { "type": "string", "description": "e.g. a client PO number; prints on the invoice." },
                     "paymentTermsDays": { "type": "integer", "description": "0-365. Overrides the instance's terms for this project's invoices." },
                     "defaultUnitPriceCents": { "type": "integer", "description": "GST-exclusive rate new items get when they name no price." },
+                    "brandId": { "type": "string", "description": "The brand its invoices go out under (from list_brands); omit for the default brand." },
                 },
                 "required": ["instanceId", "name", "clientName"],
             },
@@ -279,6 +328,7 @@ pub fn catalogue() -> Vec<Value> {
                     "clientEmail": { "type": "string", "description": "Empty string clears it." },
                     "paymentTermsDays": { "type": ["integer", "null"], "description": "null clears it (the instance's terms apply)." },
                     "defaultUnitPriceCents": { "type": ["integer", "null"], "description": "null clears it." },
+                    "brandId": { "type": "string", "description": "Move it to this brand (from list_brands; \"default\" for the default brand). Changes its drafts, never a finalized invoice." },
                     "archived": { "type": "boolean" },
                 },
                 "required": ["id"],
@@ -370,6 +420,7 @@ pub fn catalogue() -> Vec<Value> {
                     "instanceId": { "type": "string" },
                     "projectId": { "type": "string" },
                     "category": { "type": "string", "enum": EXPENSE_CATEGORIES },
+                    "brandId": { "type": "string", "description": BRAND_FILTER_DESCRIPTION },
                     "first": paging_props()["first"].clone(),
                     "after": paging_props()["after"].clone(),
                 },
@@ -395,7 +446,8 @@ pub fn catalogue() -> Vec<Value> {
             "title": "Update expense",
             "description": format!(
                 "Replace an expense (a full replace: pass every field it should keep — an \
-                 omitted projectId, gstCents or description is cleared). {EXPENSE_WRITE_DESCRIPTION}"
+                 omitted projectId, gstCents or description is cleared, and an omitted brandId \
+                 means the default brand). {EXPENSE_WRITE_DESCRIPTION}"
             ),
             "inputSchema": {
                 "type": "object",
@@ -460,6 +512,7 @@ pub fn catalogue() -> Vec<Value> {
                     "instanceId": { "type": "string" },
                     "projectId": { "type": "string" },
                     "filter": { "type": "string", "enum": ["ALL", "DRAFT", "UNPAID", "OVERDUE", "PAID"], "default": "ALL" },
+                    "brandId": { "type": "string", "description": BRAND_FILTER_DESCRIPTION },
                     "first": paging_props()["first"].clone(),
                     "after": paging_props()["after"].clone(),
                 },
@@ -717,6 +770,7 @@ pub fn catalogue() -> Vec<Value> {
                 "properties": {
                     "instanceId": { "type": "string" },
                     "invoiceId": { "type": "string" },
+                    "brandId": { "type": "string", "description": BRAND_FILTER_DESCRIPTION },
                     "first": paging_props()["first"].clone(),
                     "after": paging_props()["after"].clone(),
                 },
@@ -794,6 +848,7 @@ pub fn catalogue() -> Vec<Value> {
                     "from": { "type": "string" },
                     "to": { "type": "string" },
                     "basis": { "type": "string", "enum": ["CASH", "ACCRUAL"] },
+                    "brandId": { "type": "string", "description": BRAND_FILTER_DESCRIPTION },
                 },
                 "required": ["instanceId", "from", "to", "basis"],
             },
@@ -808,7 +863,10 @@ pub fn catalogue() -> Vec<Value> {
                 invoice with a balance, most overdue first.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "instanceId": { "type": "string" } },
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "brandId": { "type": "string", "description": BRAND_FILTER_DESCRIPTION },
+                },
                 "required": ["instanceId"],
             },
             "outputSchema": wrap("receivables", json!({ "type": "object" })),
@@ -827,6 +885,7 @@ pub fn catalogue() -> Vec<Value> {
                     "kind": { "type": "string", "enum": ["INVOICES", "CREDIT_NOTES", "PAYMENTS", "EXPENSES"] },
                     "from": { "type": "string" },
                     "to": { "type": "string" },
+                    "brandId": { "type": "string", "description": BRAND_FILTER_DESCRIPTION },
                 },
                 "required": ["instanceId", "kind", "from", "to"],
             },
@@ -903,6 +962,37 @@ where
     A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
     Some(match name {
+        "list_brands" => {
+            let Some(instance_id) = string_arg(arguments, "instanceId") else {
+                return Some(missing_argument("instanceId"));
+            };
+            // Reached through the caller's own memberships, so a non-member
+            // (a superuser included) finds nothing — the same boundary as
+            // every other tool.
+            let doc = format!(
+                "query McpBrands {{ me {{ memberships {{ instance {{ id kind \
+                 brands {{ {BRAND_FIELDS} }} }} }} }} }}"
+            );
+            match ctx.run(&doc, json!({})).await {
+                Err(e) => ToolOutcome::Error(e),
+                Ok(mut data) => {
+                    let found = data["me"]["memberships"].as_array_mut().and_then(|ms| {
+                        ms.iter_mut()
+                            .map(|m| m["instance"].take())
+                            .find(|i| i["id"] == instance_id)
+                    });
+                    match found {
+                        None => {
+                            ToolOutcome::error("Instance not found (or you are not a member of it)")
+                        }
+                        Some(i) if i["kind"] != "INVOICING" => {
+                            ToolOutcome::error("Brands apply to INVOICING instances only")
+                        }
+                        Some(mut i) => ToolOutcome::Ok(json!({ "brands": i["brands"].take() })),
+                    }
+                }
+            }
+        }
         "list_projects" => list_projects(ctx, arguments).await,
         "create_project" => create_project(ctx, arguments).await,
         "update_project" => update_project(ctx, arguments).await,
@@ -1197,8 +1287,9 @@ where
                 return Some(missing_argument("instanceId"));
             };
             let doc = format!(
-                "query McpCreditNotes($instanceId: ID!, $invoiceId: ID, $first: Int!, $after: String) {{ \
-                 creditNotes(instanceId: $instanceId, invoiceId: $invoiceId, first: $first, after: $after) {{ \
+                "query McpCreditNotes($instanceId: ID!, $invoiceId: ID, $brandId: ID, $first: Int!, \
+                 $after: String) {{ creditNotes(instanceId: $instanceId, invoiceId: $invoiceId, \
+                 brandId: $brandId, first: $first, after: $after) {{ \
                  edges {{ node {{ {CREDIT_NOTE_FIELDS} }} }} pageInfo {{ hasNextPage endCursor }} }} }}"
             );
             unwrap_connection(
@@ -1207,6 +1298,7 @@ where
                     json!({
                         "instanceId": instance_id,
                         "invoiceId": string_arg(arguments, "invoiceId"),
+                        "brandId": string_arg(arguments, "brandId"),
                         "first": page_size(arguments),
                         "after": string_arg(arguments, "after"),
                     }),
@@ -1270,12 +1362,16 @@ where
             };
             rename(
                 ctx.run(
-                    "query McpGst($i: ID!, $from: String!, $to: String!, $basis: ReportBasisType!) { \
-                     gstReport(instanceId: $i, from: $from, to: $to, basis: $basis) { from to basis \
+                    "query McpGst($i: ID!, $from: String!, $to: String!, $basis: ReportBasisType!, \
+                     $brandId: ID) { gstReport(instanceId: $i, from: $from, to: $to, basis: $basis, \
+                     brandId: $brandId) { from to basis \
                      gstRegistered currency salesCents gstOnSalesCents purchasesCents \
                      gstOnPurchasesCents netGstCents invoiceCount creditNoteCount paymentCount \
                      expenseCount } }",
-                    json!({ "i": instance_id, "from": from, "to": to, "basis": basis }),
+                    json!({
+                        "i": instance_id, "from": from, "to": to, "basis": basis,
+                        "brandId": string_arg(arguments, "brandId"),
+                    }),
                 )
                 .await,
                 "gstReport",
@@ -1288,11 +1384,12 @@ where
             };
             rename(
                 ctx.run(
-                    "query McpReceivables($i: ID!) { receivables(instanceId: $i) { asOf currency \
+                    "query McpReceivables($i: ID!, $brandId: ID) { \
+                     receivables(instanceId: $i, brandId: $brandId) { asOf currency \
                      totalCents currentCents days1To30Cents days31To60Cents days61To90Cents \
                      daysOver90Cents invoices { id displayNumber issueDate dueDate daysOverdue \
                      totalCents balanceCents project { id name clientName } } } }",
-                    json!({ "i": instance_id }),
+                    json!({ "i": instance_id, "brandId": string_arg(arguments, "brandId") }),
                 )
                 .await,
                 "receivables",
@@ -1310,9 +1407,13 @@ where
             };
             rename(
                 ctx.run(
-                    "query McpExport($i: ID!, $kind: CsvExportType!, $from: String!, $to: String!) { \
-                     invoicingExport(instanceId: $i, kind: $kind, from: $from, to: $to) }",
-                    json!({ "i": instance_id, "kind": kind, "from": from, "to": to }),
+                    "query McpExport($i: ID!, $kind: CsvExportType!, $from: String!, $to: String!, \
+                     $brandId: ID) { invoicingExport(instanceId: $i, kind: $kind, from: $from, \
+                     to: $to, brandId: $brandId) }",
+                    json!({
+                        "i": instance_id, "kind": kind, "from": from, "to": to,
+                        "brandId": string_arg(arguments, "brandId"),
+                    }),
                 )
                 .await,
                 "invoicingExport",
@@ -1373,6 +1474,7 @@ where
         "reference": string_arg(arguments, "reference"),
         "paymentTermsDays": arguments.get("paymentTermsDays").and_then(Value::as_i64),
         "defaultUnitPriceCents": arguments.get("defaultUnitPriceCents").and_then(Value::as_i64),
+        "brandId": string_arg(arguments, "brandId"),
     });
     rename(
         ctx.run(&doc, json!({ "instanceId": instance_id, "input": input }))
@@ -1425,6 +1527,9 @@ where
         "clientEmail": pick("clientEmail"),
         "paymentTermsDays": pick_number("paymentTermsDays"),
         "defaultUnitPriceCents": pick_number("defaultUnitPriceCents"),
+        "brandId": string_arg(arguments, "brandId")
+            .map(Value::from)
+            .unwrap_or_else(|| current["brand"]["brandId"].clone()),
         "archived": arguments.get("archived").and_then(Value::as_bool).unwrap_or_else(|| current["archived"].as_bool().unwrap_or(false)),
     });
     let doc = format!(
@@ -1534,8 +1639,9 @@ where
     };
     let doc = format!(
         "query McpInvoices($instanceId: ID!, $projectId: ID, $filter: InvoiceFilterType!, \
-         $first: Int!, $after: String) {{ invoices(instanceId: $instanceId, \
-         projectId: $projectId, filter: $filter, first: $first, after: $after) {{ \
+         $brandId: ID, $first: Int!, $after: String) {{ invoices(instanceId: $instanceId, \
+         projectId: $projectId, filter: $filter, brandId: $brandId, first: $first, \
+         after: $after) {{ \
          edges {{ node {{ {INVOICE_SUMMARY_FIELDS} }} }} pageInfo {{ hasNextPage endCursor }} }} }}"
     );
     unwrap_connection(
@@ -1545,6 +1651,7 @@ where
                 "instanceId": instance_id,
                 "projectId": string_arg(arguments, "projectId"),
                 "filter": string_arg(arguments, "filter").unwrap_or("ALL"),
+                "brandId": string_arg(arguments, "brandId"),
                 "first": page_size(arguments),
                 "after": string_arg(arguments, "after"),
             }),
@@ -1569,6 +1676,7 @@ fn expense_schema() -> Value {
             "distanceKm": { "type": ["string", "null"], "description": "A trip's km, e.g. \"12.5\"; null for a purchase." },
             "rateCentsPerKm": { "type": ["integer", "null"], "description": "The ATO rate the trip was claimed at." },
             "project": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
+            "brand": { "type": "object", "description": "The brand it counts toward." },
             "rebilledItem": { "type": ["object", "null"], "description": "The billable item rebill_expense made from it." },
             "receipt": { "type": ["object", "null"], "description": "The uploaded receipt's filename/contentType/size." },
         },
@@ -1604,6 +1712,7 @@ fn expense_input(arguments: &Value) -> Value {
     };
     json!({
         "projectId": string_arg(arguments, "projectId"),
+        "brandId": string_arg(arguments, "brandId"),
         "date": string_arg(arguments, "date"),
         "category": string_arg(arguments, "category"),
         "description": string_arg(arguments, "description"),
@@ -1623,8 +1732,9 @@ where
     };
     let doc = format!(
         "query McpExpenses($instanceId: ID!, $projectId: ID, $category: ExpenseCategoryType, \
-         $first: Int!, $after: String) {{ expenses(instanceId: $instanceId, \
-         projectId: $projectId, category: $category, first: $first, after: $after) {{ \
+         $brandId: ID, $first: Int!, $after: String) {{ expenses(instanceId: $instanceId, \
+         projectId: $projectId, category: $category, brandId: $brandId, first: $first, \
+         after: $after) {{ \
          edges {{ node {{ {EXPENSE_FIELDS} }} }} pageInfo {{ hasNextPage endCursor }} }} }}"
     );
     unwrap_connection(
@@ -1634,6 +1744,7 @@ where
                 "instanceId": instance_id,
                 "projectId": string_arg(arguments, "projectId"),
                 "category": string_arg(arguments, "category"),
+                "brandId": string_arg(arguments, "brandId"),
                 "first": page_size(arguments),
                 "after": string_arg(arguments, "after"),
             }),

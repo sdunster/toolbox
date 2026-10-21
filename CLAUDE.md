@@ -412,7 +412,7 @@ local setup, and `SCHEMA.md` for the data model.
     transactions in this codebase (`dynamodb.rs`'s `transact_write` helper). `finalizeInvoice`
     freezes everything the invoice prints (seller/bill-to/reference, sorted lines, totals, GST
     flag, currency, payment text, number, issue date) into a JSON `snapshot`
-    (`invoicing::snapshot::build_snapshot`, `schema_version: 2`) via one `TransactWriteItems` of
+    (`invoicing::snapshot::build_snapshot`, `schema_version: 3`) via one `TransactWriteItems` of
     two updates — the invoice itself, and the number's reservation row in `{prefix}_counter`
     (`{instance_id}#invoice#{number}`, `attribute_not_exists`, see below; the items need no write,
     every item's `invoice_id` already points here); later edits to the project
@@ -510,7 +510,7 @@ local setup, and `SCHEMA.md` for the data model.
   - **Payment terms** are `instance.payment_terms_days` (absent = 14,
     `db::DEFAULT_PAYMENT_TERMS_DAYS`) overridden per project (`project.payment_terms_days`).
     `finalizeInvoice` sets `due_date` = issue date + those terms unless given an explicit `dueDate`
-    (never before the issue date), and freezes it into the snapshot (`schema_version: 2`) and onto
+    (never before the issue date), and freezes it into the snapshot (`schema_version: 2`, now 3) and onto
     the row. A project's `default_unit_price_cents` fills an omitted `unitPriceCents` on
     `createBillableItem`; `updateBillableItem` keeps the item's own price when it's omitted.
   - **GST-free lines** (`billable_item.gst_free`, only ever written `true`): GST is 10% of the
@@ -556,6 +556,37 @@ local setup, and `SCHEMA.md` for the data model.
   invoice's GST (net of credits) pro rata. Expenses count by their own date on both bases (Toolbox
   doesn't record when an expense was paid). The figures are a guide, and the UI says so. CSV cells
   starting `=`/`+`/`-`/`@` are prefixed with `'` (CSV injection); amounts are plain decimals.
+
+- **Brands: one seller, several names (`api/src/invoicing/brand.rs`).** An invoicing instance can
+  issue under more than one name — e.g. a registered business name ("Positive Rate") beside the
+  owner's legal name. The instance's own invoicing settings **are the default brand** (API id
+  `"default"`, never stored); other brands are a JSON list on the instance row (`brands`,
+  `db::Brand`, at most `db::MAX_BRANDS`), added and edited by `addBrand`/`updateBrand` —
+  `InstanceOwnerOrSuperuser` like `updateInvoicingSettings`, a full replace, written by
+  `set_brands` conditioned on the list the caller read (`CONFLICT` otherwise, same as broadcast
+  senders). There is no delete: `archived` hides a brand from pickers (it can't be chosen for a
+  *new* project or expense; a row already on it keeps it through an edit) but keeps it in filters.
+  - **Only the name and contact/payment details vary.** A brand's unset email/phone/address/payment
+    details fall back to the settings' (`brand::resolve`); ABN, GST registration, currency, payment
+    terms and the invoice/credit-note number sequences are always the instance's — it's one legal
+    entity, so one ABN and one numbering. A branded invoice prints "{legal name} trading as
+    {brand}" under the seller (`InvoiceSnapshotSeller.legal_name`, snapshot `schema_version: 3`; omitted
+    when the names match).
+  - **What carries a brand:** a project (`brand_id`, whose invoices go out under it) and an expense
+    (`brand_id`, set directly — an expense needn't have a project; the web defaults it to its
+    project's). An invoice's brand is its project's: a draft *shows* its project's brand live and
+    stores a copy (`invoice.brand_id`) that `updateProject` re-stamps on every draft when the
+    project changes brand; `finalizeInvoice` stamps it from the project in the same write as the
+    snapshot, and from then on it never changes. A credit note copies its invoice's. Absent
+    `brand_id` everywhere means the default brand (omit-optional-attributes rule).
+  - **Every list and report takes an optional `brandId`** (`invoices`, `creditNotes`, `expenses`,
+    `gstReport`, `receivables`, `invoicingExport`; `"default"` = rows with no `brand_id`), applied as
+    a `FilterExpression`/in the report's row selection; an id the instance doesn't have is refused,
+    not an empty result. GST is still reported per ABN, so the unfiltered report is the BAS figure;
+    a per-brand one is a breakdown.
+  - **`Brand.brandId`, not `id`**: every instance's default brand is `"default"`, so an `id` field
+    would collide in Relay's normalized store across instances.
+  - The web hides every brand picker and filter until the instance has a second brand.
 
 - **OAuth tokens (`mtoa_`/`mtor_`) are for the MCP interface only and never reach GraphQL.**
   `api/src/oauth.rs` holds one `oauth_grant` row per client a user authorizes (access + refresh
