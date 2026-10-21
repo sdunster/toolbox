@@ -614,6 +614,16 @@ local setup, and `SCHEMA.md` for the data model.
   Every tool's description must say plainly if it sends customer email. `whoami` (memberships with
   role and instance kind) is the first tool; call it first to learn which instances apply.
 
+- **`api/.cargo/config.toml` raises `RUST_MIN_STACK` to 16 MiB for `cargo test`/`cargo run`.**
+  Debug builds only: async-graphql's `#[Object]` puts every mutation in one
+  `MutationRoot::resolve_field` poll frame, and unoptimised code gives each match arm its own
+  stack slots (~1.2 MB at 70 mutations, ~17 KB more per mutation). On the default 2 MB stack the
+  `*_dynamodb_local` tests aborted with "has overflowed its stack". Release builds (the Lambdas)
+  are fine. The `*_dynamodb_local` tests skip in `_check-api.yml` (no database), so
+  `_check-local.yml` runs them against DynamoDB Local on every `api/**` change. If they ever
+  overflow 16 MiB, box the resolver bodies (`Box::pin(async move { … }).await`) rather than
+  raising the limit again.
+
 - **Tests that touch environment variables must serialize on a `tokio::sync::Mutex` held across
   every `.await`.** The process environment is global and tests run in parallel, so a test that
   sets a var, releases its lock, and only then awaits leaves a window for another test to change
