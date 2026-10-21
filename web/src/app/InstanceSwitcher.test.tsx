@@ -55,13 +55,13 @@ const SUPPORT_MEMBERSHIPS = [
   },
 ];
 
-const INVOICING_MEMBERSHIP = {
+const FINANCE_MEMBERSHIP = {
   role: "OWNER",
   instance: {
     id: "inst-ledger",
-    name: "Ledger Invoicing",
+    name: "Ledger Finance",
     slug: "ledger",
-    kind: "INVOICING",
+    kind: "FINANCE",
   },
 };
 
@@ -150,16 +150,13 @@ describe("InstanceSwitcher", () => {
   });
 
   it("groups instances by kind when the user has both kinds", async () => {
-    mockMe([...SUPPORT_MEMBERSHIPS, INVOICING_MEMBERSHIP]);
+    mockMe([...SUPPORT_MEMBERSHIPS, FINANCE_MEMBERSHIP]);
     renderHarness();
 
     const select = await screen.findByRole("combobox", { name: "Instance" });
     await waitFor(() => expect(select).toHaveValue("inst-acme"));
     const groups = select.querySelectorAll("optgroup");
-    expect(Array.from(groups, (g) => g.label)).toEqual([
-      "Support",
-      "Invoicing",
-    ]);
+    expect(Array.from(groups, (g) => g.label)).toEqual(["Support", "Finance"]);
     expect(
       Array.from(groups[0].querySelectorAll("option"), (o) => o.value),
     ).toEqual(["inst-acme", "inst-ridge"]);
@@ -171,16 +168,16 @@ describe("InstanceSwitcher", () => {
   it("takes the kind from membership data, not storage", async () => {
     // Only the id was ever stored — including by builds that predate kinds.
     localStorage.setItem("mt_selected_instance_id", "inst-ledger");
-    mockMe([...SUPPORT_MEMBERSHIPS, INVOICING_MEMBERSHIP]);
+    mockMe([...SUPPORT_MEMBERSHIPS, FINANCE_MEMBERSHIP]);
     renderHarness("/app/projects");
 
     const select = await screen.findByRole("combobox", { name: "Instance" });
     await waitFor(() => expect(select).toHaveValue("inst-ledger"));
-    expect(screen.getByTestId("selected-kind")).toHaveTextContent("INVOICING");
+    expect(screen.getByTestId("selected-kind")).toHaveTextContent("FINANCE");
   });
 
   it("navigates to the other kind's home when switching kind", async () => {
-    mockMe([...SUPPORT_MEMBERSHIPS, INVOICING_MEMBERSHIP]);
+    mockMe([...SUPPORT_MEMBERSHIPS, FINANCE_MEMBERSHIP]);
     const user = UserEvent.setup();
     renderHarness("/app/tickets/all");
 
@@ -203,7 +200,7 @@ describe("InstanceSwitcher", () => {
   });
 
   it("stays on a kind-neutral page when switching kind", async () => {
-    mockMe([...SUPPORT_MEMBERSHIPS, INVOICING_MEMBERSHIP]);
+    mockMe([...SUPPORT_MEMBERSHIPS, FINANCE_MEMBERSHIP]);
     const user = UserEvent.setup();
     renderHarness("/app/settings");
 
@@ -211,7 +208,7 @@ describe("InstanceSwitcher", () => {
     await waitFor(() => expect(select).toHaveValue("inst-acme"));
 
     await user.selectOptions(select, "inst-ledger");
-    expect(screen.getByTestId("selected-kind")).toHaveTextContent("INVOICING");
+    expect(screen.getByTestId("selected-kind")).toHaveTextContent("FINANCE");
     expect(screen.getByTestId("location")).toHaveTextContent("/app/settings");
   });
 });

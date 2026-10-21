@@ -1,6 +1,6 @@
 /**
- * Money helpers for invoicing. Everything is integer cents / integer
- * hundredths, mirroring `api/src/invoicing/money.rs` — the server is the
+ * Money helpers for finance. Everything is integer cents / integer
+ * hundredths, mirroring `api/src/finance/money.rs` — the server is the
  * source of truth (it parses the quantity string itself and computes every
  * `amountCents`); these exist for input parsing and live previews.
  */

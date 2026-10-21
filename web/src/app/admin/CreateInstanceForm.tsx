@@ -19,13 +19,13 @@ import { inputBase } from "../../components/ui/inputStyles";
  * `adminInstances` is a plain list field, not a `@connection`, so appending
  * the new instance needs an explicit updater rather than Relay's connection
  * helpers. Navigates to the new instance's own page on success, where
- * members and inbound addresses (or, for an invoicing instance, business
+ * members and inbound addresses (or, for a finance instance, business
  * settings) get set up next.
  *
  * The kind is permanent once created. From name, signature and public
  * submission only mean anything for a support instance — the API rejects
- * `publicSubmissionEnabled` for an invoicing one — so they're hidden, and
- * not sent, when "Invoicing" is picked.
+ * `publicSubmissionEnabled` for a finance one — so they're hidden, and
+ * not sent, when "Finance" is picked.
  */
 export function CreateInstanceForm() {
   const navigate = useNavigate();
@@ -114,11 +114,11 @@ export function CreateInstanceForm() {
             onChange={(e) => setKind(e.target.value as InstanceKindType)}
           >
             <option value="SUPPORT">Support</option>
-            <option value="INVOICING">Invoicing</option>
+            <option value="FINANCE">Finance</option>
           </select>
           <p className="mt-1 text-xs text-ink-muted">
-            Support instances handle tickets; invoicing instances handle
-            projects and invoices. Can&apos;t be changed later.
+            Support instances handle tickets; finance instances handle projects
+            and invoices. Can&apos;t be changed later.
           </p>
         </FormField>
         <FormField label="Slug" htmlFor="new-instance-slug">

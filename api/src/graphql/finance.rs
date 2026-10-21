@@ -13,7 +13,7 @@ use async_graphql::{Context, Enum, ID, InputObject, Object, SimpleObject};
 use crate::app::{App, HasDb};
 use crate::db;
 use crate::db::Handler as _;
-use crate::invoicing::{self, report};
+use crate::finance::{self, report};
 
 use super::ProjectId;
 use super::dataloader::DatabaseLoader;
@@ -89,7 +89,7 @@ pub struct SendDocumentInput {
     pub message: Option<String>,
 }
 
-/// A `credit_note` row, exposed to its invoicing instance's members. Every
+/// A `credit_note` row, exposed to its finance instance's members. Every
 /// printable field reads the frozen snapshot.
 #[derive(Debug, PartialEq)]
 pub struct CreditNote<A: App + HasDb + Send + Sync> {
@@ -105,7 +105,7 @@ impl<A: App + HasDb + Send + Sync> CreditNote<A> {
         }
     }
 
-    fn snapshot(&self) -> Result<invoicing::snapshot::InvoiceSnapshot> {
+    fn snapshot(&self) -> Result<finance::snapshot::InvoiceSnapshot> {
         serde_json::from_str(&self.rec.snapshot)
             .map_err(|e| anyhow!("Credit note {} has a corrupt snapshot: {e}", self.rec.id))
     }
@@ -325,7 +325,7 @@ impl From<report::ProjectFinancials> for ProjectFinancialsInfo {
     }
 }
 
-/// `invoicingExport`'s kind.
+/// `financeExport`'s kind.
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum CsvExportType {
     Invoices,
@@ -334,7 +334,7 @@ pub enum CsvExportType {
     Expenses,
 }
 
-impl From<CsvExportType> for invoicing::csv::Export {
+impl From<CsvExportType> for finance::csv::Export {
     fn from(k: CsvExportType) -> Self {
         match k {
             CsvExportType::Invoices => Self::Invoices,

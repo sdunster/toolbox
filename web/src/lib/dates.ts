@@ -1,5 +1,5 @@
 /**
- * Calendar-date helpers for invoicing's `YYYY-MM-DD` strings. These are
+ * Calendar-date helpers for finance's `YYYY-MM-DD` strings. These are
  * dates, not instants — never round-tripped through `Date` parsing, which
  * would read `"2026-08-19"` as UTC midnight and shift it a day west of UTC.
  */

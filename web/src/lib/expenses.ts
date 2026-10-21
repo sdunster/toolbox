@@ -3,7 +3,7 @@
  * financial-year arithmetic behind the 5,000 km running total. The API is
  * the source of truth for every stored value — it parses `distanceKm`,
  * looks up the trip's rate, and computes `amountCents`; the rate table and
- * parsing here mirror `api/src/invoicing/vehicle.rs` for live previews only.
+ * parsing here mirror `api/src/finance/vehicle.rs` for live previews only.
  */
 
 /** `ExpenseCategoryType`, in the order the category picker lists them. */
@@ -50,7 +50,7 @@ export const ANNUAL_CAP_KM = 5_000;
 export const NEAR_CAP_KM = 4_500;
 
 /**
- * Mirrors `ATO_RATES` in `api/src/invoicing/vehicle.rs`: financial year
+ * Mirrors `ATO_RATES` in `api/src/finance/vehicle.rs`: financial year
  * (by the calendar year it starts in) → cents per km. Preview only.
  */
 const ATO_RATES: Record<number, number> = {

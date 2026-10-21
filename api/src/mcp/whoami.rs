@@ -7,7 +7,7 @@ use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 use super::tool::{ToolContext, ToolOutcome};
 
 /// `me`'s fields, as one literal. `role` is `OWNER`/`AGENT`; an instance's
-/// `kind` (`SUPPORT`/`INVOICING`) is what tells a client which tool families
+/// `kind` (`SUPPORT`/`FINANCE`) is what tells a client which tool families
 /// apply there. Deliberately excludes `notificationSettings` (not needed to
 /// act) and `passkeys`/`oauthGrants` (never something an AI client needs).
 const WHOAMI_QUERY: &str = "query McpWhoami { me { id email name enabled isSuperuser \
@@ -19,7 +19,7 @@ pub fn catalogue() -> Vec<Value> {
         "title": "Who am I",
         "description": "Look up the Toolbox user you are acting as: their id, email, name, \
             whether they are a superuser, and every instance they belong to with their role \
-            (OWNER or AGENT) and the instance's kind (SUPPORT for a ticket queue, INVOICING \
+            (OWNER or AGENT) and the instance's kind (SUPPORT for a ticket queue, FINANCE \
             for projects and invoices). Use this first to learn who you are acting as and \
             which instances you can work in. A superuser without a membership has no access \
             to any instance's tickets or invoices — only to admin functions.",
@@ -47,7 +47,7 @@ pub fn catalogue() -> Vec<Value> {
                                             "id": { "type": "string" },
                                             "name": { "type": "string" },
                                             "slug": { "type": "string" },
-                                            "kind": { "type": "string", "enum": ["SUPPORT", "INVOICING"] },
+                                            "kind": { "type": "string", "enum": ["SUPPORT", "FINANCE"] },
                                         },
                                     },
                                 },

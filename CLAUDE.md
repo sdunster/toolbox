@@ -153,7 +153,7 @@ local setup, and `SCHEMA.md` for the data model.
   (`broadcast::MAX_BROADCAST_RECIPIENTS` — bounded by the 400 KB `broadcast` item that holds every
   recipient's status) from any local part on one of the instance's inbound-address domains. Guard `InstanceOwner` — **not**
   superuser: it is customer mail whose replies become tickets, the ticket side of the superuser
-  boundary. An invoicing/deleted/missing instance is `NOT_FOUND` (kind isolation).
+  boundary. A finance/deleted/missing instance is `NOT_FOUND` (kind isolation).
   - **Each recipient gets their own copy** (`To:` that address only, no `Cc`), so a reply-all can't
     pull the rest of the list into a ticket.
   - **A reply must open a new ticket, one per reply — so a broadcast carries none of the three
@@ -202,7 +202,7 @@ local setup, and `SCHEMA.md` for the data model.
     recorded as soon as its send returns, so a timeout mid-batch leaves an accurate record.
   - **Saved senders (`addBroadcastSender`/`deleteBroadcastSender`, `Instance.broadcastSenders`)**
     are a pick-list of From name + address pairs (`SES Activity Updates <updates@…>`) stored as
-    a JSON attribute on the instance row, same `InstanceOwner` guard and `NOT_FOUND`-for-invoicing
+    a JSON attribute on the instance row, same `InstanceOwner` guard and `NOT_FOUND`-for-finance
     posture as `sendBroadcast`. A convenience only: the web form fills `fromAddress`/`fromName`
     from the chosen sender, and `sendBroadcast` re-validates them as it always has — a sender is
     checked on save by the same `broadcast::validate_from_address`, but never trusted at send time.
@@ -348,49 +348,49 @@ local setup, and `SCHEMA.md` for the data model.
   - No expiry: a long-lived integration credential, not a session. Revocation is
     `updateApiToken(enabled: false)` or `deleteApiToken`.
 
-- **Invoicing: a second, separate function from support, living in its own instances.**
-  `db::InstanceKind` (`Support`/`Invoicing`) is set once at `createInstance`/`instance create
+- **Finance: a second, separate function from support, living in its own instances.**
+  `db::InstanceKind` (`Support`/`Finance`) is set once at `createInstance`/`instance create
   --kind` time and is **immutable after creation** — no mutation, and no CLI command, changes it.
-  Per the omit-optional-attributes house rule, `kind` is written to the row only for `Invoicing`;
-  every instance created before invoicing existed is implicitly `Support`, no migration needed.
-  Invoicing instances reuse the existing instance/membership machinery (same instance switcher,
+  Per the omit-optional-attributes house rule, `kind` is written to the row only for `Finance`;
+  every instance created before finance existed is implicitly `Support`, no migration needed.
+  Finance instances reuse the existing instance/membership machinery (same instance switcher,
   same `Member`/`InstanceOwner` roles) — there is no separate tenant or membership concept.
   - **Kind isolation, enforced structurally, not just in the web UI.** A support-only operation
     (`addInboundAddress`, `createApiToken`, `submitTicket`/`submitVerifiedTicket`, the requester
     submit-code flow, `publicInstances`/the `/submit` list, and the inbound-mail pipeline's
-    instance resolution) rejects an invoicing instance **identically to how it already treats a
+    instance resolution) rejects a finance instance **identically to how it already treats a
     missing or deleted one** — `NOT_FOUND`/dropped mail/excluded from a list, never a distinct
     "wrong kind" error, so none of these can be used to probe an instance's kind. An
-    invoicing-only operation (projects, `updateInvoicingSettings`) rejects a support instance with
+    finance-only operation (projects, `updateFinanceSettings`) rejects a support instance with
     a plain `anyhow!` validation error instead — the caller is a real member of a real instance,
     just the wrong kind for what they're asking to do. Both directions go through the one shared
-    `db::require_instance_kind` helper, so a future invoicing operation can't independently drift
+    `db::require_instance_kind` helper, so a future finance operation can't independently drift
     on the check.
-  - **Invoicing settings are instance settings, not ticket-adjacent data.** The seller
+  - **Finance settings are instance settings, not ticket-adjacent data.** The seller
     details/payment footer an invoice prints (`business_name`, `business_abn`, `business_address`,
     `business_phone`, `business_email`, `payment_details`, `gst_registered`, `currency`) live as
     optional attributes on the `instance` row itself, guarded `InstanceOwnerOrSuperuser` to write
-    (`updateInvoicingSettings`) — the same posture as `addInboundAddress`/`createApiToken` — but
-    readable by any member, like every other plain `Instance` field. `updateInvoicingSettings` is a
+    (`updateFinanceSettings`) — the same posture as `addInboundAddress`/`createApiToken` — but
+    readable by any member, like every other plain `Instance` field. `updateFinanceSettings` is a
     **full replace**: every call writes every field, and a blank string `REMOVE`s the
     corresponding attribute rather than storing an empty one, per the omit-optional-attributes
     house rule. `gst_registered` follows `Instance::deleted`'s convention: only ever written
     `true`; absent means not registered. `currency` absent means `"AUD"`
     (`db::Instance::currency_or_default`); a non-blank value must pass `db::validate_currency_code`
     (3 uppercase ASCII letters).
-  - **Projects (`{prefix}_project`) are the first invoicing-only table.** A project belongs to one
-    invoicing instance and holds a client/job's billing identity (name, client name, optional ABN/
+  - **Projects (`{prefix}_project`) are the first finance-only table.** A project belongs to one
+    finance instance and holds a client/job's billing identity (name, client name, optional ABN/
     address/reference) plus an `archived` flag (same only-ever-`true` convention as
     `Instance::deleted`/`gst_registered` — there is no delete in v1). Any member — owner or agent —
     can create/update a project; this is day-to-day work, not an owner-only setting, unlike
-    invoicing settings above.
+    finance settings above.
   - **Billable items (`{prefix}_billable_item`): money is integers, never floats.** Quantity is a
     decimal with ≤ 2 dp, `0 < q ≤ 1,000,000`, stored as integer hundredths
     (`quantity_hundredths`) and exchanged over GraphQL as a **string** (`"1.5"`) that only the
-    server parses (`invoicing::money::parse_quantity`; the web's `lib/money.ts` mirrors it for
+    server parses (`finance::money::parse_quantity`; the web's `lib/money.ts` mirrors it for
     live previews only). Unit price is integer cents, GST-exclusive, `0 ≤ p ≤ 1,000,000,000`. The
     line amount is never stored: `amountCents` = round-half-up(`quantity_hundredths ×
-    unit_price_cents / 100`) (`invoicing::money::line_amount_cents`), so it can't drift from its
+    unit_price_cents / 100`) (`finance::money::line_amount_cents`), so it can't drift from its
     inputs. An item is authorised through its project (`createBillableItem`) or its own
     `instance_id` (id-only update/delete) — `NOT_FOUND` for missing and not-yours alike, like
     `updateProject`. An archived project takes no new items. `invoice_id` (absent = unbilled) is
@@ -412,7 +412,7 @@ local setup, and `SCHEMA.md` for the data model.
     transactions in this codebase (`dynamodb.rs`'s `transact_write` helper). `finalizeInvoice`
     freezes everything the invoice prints (seller/bill-to/reference, sorted lines, totals, GST
     flag, currency, payment text, number, issue date) into a JSON `snapshot`
-    (`invoicing::snapshot::build_snapshot`, `schema_version: 3`) via one `TransactWriteItems` of
+    (`finance::snapshot::build_snapshot`, `schema_version: 3`) via one `TransactWriteItems` of
     two updates — the invoice itself, and the number's reservation row in `{prefix}_counter`
     (`{instance_id}#invoice#{number}`, `attribute_not_exists`, see below; the items need no write,
     every item's `invoice_id` already points here); later edits to the project
@@ -432,7 +432,7 @@ local setup, and `SCHEMA.md` for the data model.
     condition inside the finalize transaction, which every finalize — automatic or explicit — writes.
     `issueDate` (and billable-item `date`, `paidDate`) may be any past date, which is
     the other half of an import. `finalizeInvoice` additionally requires `businessName` to already be
-    set ("Complete the invoicing settings first" otherwise). A draft's live preview and a finalized
+    set ("Complete the finance settings first" otherwise). A draft's live preview and a finalized
     invoice's frozen content are built by the exact same `build_snapshot` function — the web
     preview and the printed invoice can't diverge in how a value is computed, only in *when* the
     inputs were read. `status`, `number`, `version`, and `snapshot` are all DynamoDB reserved
@@ -443,13 +443,13 @@ local setup, and `SCHEMA.md` for the data model.
     friends all reject one exactly as they would any other non-member; only a real membership row
     grants access, mirroring the existing "superuser is admin + instance settings, never ticket
     access" boundary this project has had since the superuser feature landed. `setNextInvoiceNumber`
-    (like `updateInvoicingSettings`/`createApiToken`) is the one exception, by design —
+    (like `updateFinanceSettings`/`createApiToken`) is the one exception, by design —
     `InstanceOwnerOrSuperuser`, not `Member`. Don't add any other superuser carve-out here without a
     matching, explicit reason — see the "Superuser boundary" entry above.
   - **The PDF is rendered from the frozen `snapshot`, nothing else.** `downloadInvoicePdf`
     (`Member`, `NOT_FOUND` posture like every other invoice mutation, `CONFLICT` on a draft — there
-    is nothing frozen yet to print) parses `invoice.snapshot` and calls `invoicing::pdf::render_invoice_pdf`,
-    a pure function (`api/src/invoicing/pdf.rs`) that reads no project/instance state of its own —
+    is nothing frozen yet to print) parses `invoice.snapshot` and calls `finance::pdf::render_invoice_pdf`,
+    a pure function (`api/src/finance/pdf.rs`) that reads no project/instance state of its own —
     the same "can't diverge from what was frozen" guarantee finalization gives the web preview
     extends to the PDF. The rendered bytes are cached once, at
     `invoices/{instance_id}/{invoice_id}/Invoice-{displayNumber}.pdf` (`db::Invoice.pdf_s3_key`,
@@ -459,7 +459,7 @@ local setup, and `SCHEMA.md` for the data model.
     just overwrite each other with an equally correct rendering of the same invoice: not a race the
     code needs to guard against. The two renders' *bytes* aren't quite identical, though: printpdf
     0.7 has no public way to make the PDF trailer's `/ID` deterministic (a fresh random id on every
-    save, unconditionally — see `api/src/invoicing/pdf.rs`'s doc comment), so that's the one thing
+    save, unconditionally — see `api/src/finance/pdf.rs`'s doc comment), so that's the one thing
     that differs. The download URL forces
     `Content-Disposition: attachment; filename="Invoice-{displayNumber}.pdf"`
     (`storage::Handler::presign_get_download`, `storage::sanitize_download_filename` keeping only
@@ -469,7 +469,7 @@ local setup, and `SCHEMA.md` for the data model.
     TTF for Unicode text and both the crate and the font are pure Rust/no native deps, so the
     renderer builds standalone for `cargo lambda`.
 
-- **Expenses (`{prefix}_expense`): what an invoicing instance spends, never invoiced.** Optionally
+- **Expenses (`{prefix}_expense`): what a finance instance spends, never invoiced.** Optionally
   linked to one of the instance's projects (`project_id` omitted when unset, so the sparse
   `project_id-date-index` drops it). Same guards and kind check as billable items (`Member`,
   `db::require_instance_kind`, superusers get nothing, `NOT_FOUND` for missing and not-yours alike),
@@ -477,7 +477,7 @@ local setup, and `SCHEMA.md` for the data model.
   unless it has been re-billed (below).
   - **Re-billing (`rebillExpense`) passes an expense on to its project's client** as a new UNBILLED
     billable item: its GST-exclusive cost (`Expense::amount_ex_gst_cents`) plus an optional markup
-    (basis points, `invoicing::parse_markup_basis_points`), dated like the expense. The item's
+    (basis points, `finance::parse_markup_basis_points`), dated like the expense. The item's
     `source_expense_id` and the expense's `billable_item_id` are written together in one
     transaction (`db::Handler::rebill_expense`), conditioned on the expense not already being
     re-billed, and cleared together when the item is deleted (`delete_billable_item` with its
@@ -495,7 +495,7 @@ local setup, and `SCHEMA.md` for the data model.
     API only checks `0 ≤ gst ≤ amount`.
   - **`VEHICLE_KM` is a cents-per-km trip, not a purchase**: `distanceKm` (≤ 1 dp, ≤ 5,000) plus a
     required business-purpose `description`; supplier/amount/GST are refused. The rate is **never
-    taken from the caller** — `invoicing::vehicle::ATO_RATES` maps a financial year (1 July start)
+    taken from the caller** — `finance::vehicle::ATO_RATES` maps a financial year (1 July start)
     to the ATO's published cents-per-km rate, looked up from the trip's date on every write and
     stored on the row; the amount is derived on read. A date in a financial year the table doesn't
     cover yet is refused, never priced at a guess. **Each July, add the new year's rate** to
@@ -503,7 +503,7 @@ local setup, and `SCHEMA.md` for the data model.
   - **The ATO's 5,000 km cap is shown, never enforced**: `vehicleKmSummary` sums the *caller's
     own* trips (`created_by_user_id`) in one financial year — the cap is per person and per car,
     which Toolbox can't fully know — and the web turns amber past 4,500 km and red past 5,000.
-  - `invoicing::expense::validate_expense_input` is the one place an `ExpenseFields` is built from
+  - `finance::expense::validate_expense_input` is the one place an `ExpenseFields` is built from
     input, so the category ↔ shape rule can't drift between create and update.
 
 - **Due dates, payments and credit notes: what happens after an invoice is issued.**
@@ -514,19 +514,19 @@ local setup, and `SCHEMA.md` for the data model.
     the row. A project's `default_unit_price_cents` fills an omitted `unitPriceCents` on
     `createBillableItem`; `updateBillableItem` keeps the item's own price when it's omitted.
   - **GST-free lines** (`billable_item.gst_free`, only ever written `true`): GST is 10% of the
-    *taxable* subtotal only (`invoicing::snapshot::totals`); the line prints "(GST-free)" on a tax
+    *taxable* subtotal only (`finance::snapshot::totals`); the line prints "(GST-free)" on a tax
     invoice.
   - **Balance = total − credited − paid.** Payments are a JSON list on the invoice row
     (`payments`, absent when empty — `db::InvoicePayment`); credit totals are denormalised
     `credited_cents`/`credited_gst_cents`. **`paid_date` means "settled"**: set exactly when the
     balance reaches zero (by payments, credit notes or both), to the date of whatever settled it
-    (`invoicing::ledger::settled_date`), and removed when a deleted payment un-settles it. Every
+    (`finance::ledger::settled_date`), and removed when a deleted payment un-settles it. Every
     UNPAID/PAID/OVERDUE filter reads it, so it must only ever be written by a path that recomputes
     it — `set_invoice_payments` (conditioned on `version`, which every payment write bumps) or
     `create_credit_note`. `setInvoicePaid(date)` is now "record one payment of the whole balance";
     `setInvoicePaid(null)` removes every payment. A payment can't exceed the balance.
   - **OVERDUE** = finalized, no `paid_date`, `due_date` before **today's UTC date**
-    (`invoicing::today_utc`) — up to a day later than local midnight in Australia. Deliberate:
+    (`finance::today_utc`) — up to a day later than local midnight in Australia. Deliberate:
     there's no per-instance timezone, and a day's slack on "overdue" is harmless.
   - **Credit notes (`{prefix}_credit_note`) are how a finalized invoice is corrected — finality is
     unchanged.** `issueCreditNote` is strictly one-way like `finalizeInvoice`: no draft, no edit,
@@ -539,17 +539,17 @@ local setup, and `SCHEMA.md` for the data model.
     credited_cents` (plus `paid_date` when it settles it) are one transaction conditioned on the
     invoice's `version`. Any member may issue one; superusers can't (no `Member`).
 - **Sending invoices and credit notes (`sendInvoice`/`sendCreditNote`) — customer mail from an
-  invoicing instance.** Explicit only (never a side effect of finalizing or crediting), to the
+  finance instance.** Explicit only (never a side effect of finalizing or crediting), to the
   given `to`/`cc` or else the project's `client_email`, at most 10 recipients, PDF attached
-  (rendered and cached exactly as `downloadInvoicePdf` does). An invoicing instance has no
+  (rendered and cached exactly as `downloadInvoicePdf` does). A finance instance has no
   inbound address, so this is the one kind of instance mail **not** sent from one: `From` is
   `mail::system_from()` under the seller's business name, `Reply-To` the seller's business email
   (else the system reply-to), and the subject carries no `[#slug-n]` tag — a client's reply goes
-  to the business, never into the inbound pipeline (`invoicing::send`). Sending *is* the
+  to the business, never into the inbound pipeline (`finance::send`). Sending *is* the
   mutation's whole effect, so a send failure fails it (like `replyToTicket`); success records
   `sent_at`/`sent_to`. The MCP tools say they send email.
-- **Reports (`gstReport`, `receivables`, `invoicingExport`, `Project.financials`) are pure functions
-  over rows read whole** (`invoicing::report`, `invoicing::csv`): every finalized invoice and credit
+- **Reports (`gstReport`, `receivables`, `financeExport`, `Project.financials`) are pure functions
+  over rows read whole** (`finance::report`, `finance::csv`): every finalized invoice and credit
   note of the instance (`list_all_finalized_invoices`/`list_all_credit_notes`) and expenses by date
   range — fine at one small business's scale; a range is capped at two years. **Accrual** counts
   invoices and credit notes by issue date; **cash** counts payments by date, each carrying the
@@ -557,12 +557,12 @@ local setup, and `SCHEMA.md` for the data model.
   doesn't record when an expense was paid). The figures are a guide, and the UI says so. CSV cells
   starting `=`/`+`/`-`/`@` are prefixed with `'` (CSV injection); amounts are plain decimals.
 
-- **Brands: one seller, several names (`api/src/invoicing/brand.rs`).** An invoicing instance can
+- **Brands: one seller, several names (`api/src/finance/brand.rs`).** A finance instance can
   issue under more than one name — e.g. a registered business name ("Positive Rate") beside the
-  owner's legal name. The instance's own invoicing settings **are the default brand** (API id
+  owner's legal name. The instance's own finance settings **are the default brand** (API id
   `"default"`, never stored); other brands are a JSON list on the instance row (`brands`,
   `db::Brand`, at most `db::MAX_BRANDS`), added and edited by `addBrand`/`updateBrand` —
-  `InstanceOwnerOrSuperuser` like `updateInvoicingSettings`, a full replace, written by
+  `InstanceOwnerOrSuperuser` like `updateFinanceSettings`, a full replace, written by
   `set_brands` conditioned on the list the caller read (`CONFLICT` otherwise, same as broadcast
   senders). There is no delete: `archived` hides a brand from pickers (it can't be chosen for a
   *new* project or expense; a row already on it keeps it through an edit) but keeps it in filters.
@@ -580,7 +580,7 @@ local setup, and `SCHEMA.md` for the data model.
     snapshot, and from then on it never changes. A credit note copies its invoice's. Absent
     `brand_id` everywhere means the default brand (omit-optional-attributes rule).
   - **Every list and report takes an optional `brandId`** (`invoices`, `creditNotes`, `expenses`,
-    `gstReport`, `receivables`, `invoicingExport`; `"default"` = rows with no `brand_id`), applied as
+    `gstReport`, `receivables`, `financeExport`; `"default"` = rows with no `brand_id`), applied as
     a `FilterExpression`/in the report's row selection; an id the instance doesn't have is refused,
     not an empty result. GST is still reported per ABN, so the unfiltered report is the BAS figure;
     a per-brand one is a breakdown.
@@ -635,11 +635,11 @@ local setup, and `SCHEMA.md` for the data model.
   The ticket tools (`mcp/tickets.rs`) send customer mail exactly as the same GraphQL mutation does —
   see the "Outbound mail" rule above — and say so in their descriptions (`reply_to_ticket` always,
   `set_ticket_status` on a close or reopen). Attachments are deliberately not exposed.
-  The invoicing tools (`mcp/invoicing.rs`) are refused for a support instance by the resolvers'
+  The finance tools (`mcp/finance.rs`) are refused for a support instance by the resolvers'
   own kind check; only `send_invoice`/`send_credit_note` send email, and say so in capitals.
   `finalize_invoice` and `issue_credit_note` are strictly irreversible, so their descriptions say
   so, they are annotated destructive, and they require an explicit date (no default); the
-  owner-level `updateInvoicingSettings`/`setNextInvoiceNumber` are deliberately not tools —
+  owner-level `updateFinanceSettings`/`setNextInvoiceNumber` are deliberately not tools —
   `finalize_invoice`'s optional owner-only `number` (plus a past `issueDate`) is what importing an
   existing invoice under its original number and date needs, in the one irreversible call.
   Every tool's description must say plainly if it sends customer email. `whoami` (memberships with

@@ -163,8 +163,8 @@ where
         .into_iter()
         .next()
         .flatten();
-    // Kind isolation (CLAUDE.md): mail routed to an invoicing instance is
-    // dropped exactly like mail to a deleted one — invoicing has no inbound
+    // Kind isolation (CLAUDE.md): mail routed to a finance instance is
+    // dropped exactly like mail to a deleted one — finance has no inbound
     // mail concept at all, so there is nothing legitimate for this message
     // to become.
     if instance.is_none_or(|i| i.deleted || i.kind != db::InstanceKind::Support) {

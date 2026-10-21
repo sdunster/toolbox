@@ -166,22 +166,22 @@ describe("NotificationSettingsSection", () => {
     expect(await screen.findByText("boom")).toBeInTheDocument();
   });
 
-  it("leaves out invoicing instances", async () => {
+  it("leaves out finance instances", async () => {
     const [support] = oneMembership.memberships;
-    const invoicing = {
+    const finance = {
       ...support,
       instance: {
         __typename: "Instance",
         id: "inst-2",
         name: "Ledger",
-        kind: "INVOICING",
+        kind: "FINANCE",
       },
     };
     server.use(
       relayEndpoint.query("NotificationSettingsSectionHarnessQuery", () =>
         HttpResponse.json({
           data: {
-            me: { ...oneMembership, memberships: [support, invoicing] },
+            me: { ...oneMembership, memberships: [support, finance] },
           },
         }),
       ),
@@ -196,7 +196,7 @@ describe("NotificationSettingsSection", () => {
     ).toHaveLength(1);
   });
 
-  it("explains itself when every membership is an invoicing one", async () => {
+  it("explains itself when every membership is a finance one", async () => {
     const [support] = oneMembership.memberships;
     server.use(
       relayEndpoint.query("NotificationSettingsSectionHarnessQuery", () =>
@@ -207,7 +207,7 @@ describe("NotificationSettingsSection", () => {
               memberships: [
                 {
                   ...support,
-                  instance: { ...support.instance, kind: "INVOICING" },
+                  instance: { ...support.instance, kind: "FINANCE" },
                 },
               ],
             },

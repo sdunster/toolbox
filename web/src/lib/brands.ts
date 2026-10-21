@@ -1,4 +1,4 @@
-/** The default brand's id — the instance's own invoicing settings. Mirrors
+/** The default brand's id — the instance's own finance settings. Mirrors
  * `db::DEFAULT_BRAND_ID`; the API takes it wherever a `brandId` goes. */
 export const DEFAULT_BRAND_ID = "default";
 

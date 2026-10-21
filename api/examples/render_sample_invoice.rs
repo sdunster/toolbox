@@ -1,5 +1,5 @@
 //! Renders a fictional sample invoice PDF for visual review — see
-//! CLAUDE.md's "Invoicing" house rule ("PDF") and the design doc's "PDF (PR
+//! CLAUDE.md's "Finance" house rule ("PDF") and the design doc's "PDF (PR
 //! 4)" section. Mirrors the structure of the product's original sample
 //! invoice: a multi-line item with two `"* "` bullets, quantity 2 × 400.00,
 //! no GST, and a bank-style payment-details block — all fictional.
@@ -15,9 +15,9 @@
 //!   its documented maximum — for visually confirming the wrapping/
 //!   pagination fix.
 
-use toolbox::invoicing::money;
-use toolbox::invoicing::pdf::render_invoice_pdf;
-use toolbox::invoicing::snapshot::{
+use toolbox::finance::money;
+use toolbox::finance::pdf::render_invoice_pdf;
+use toolbox::finance::snapshot::{
     InvoiceSnapshot, InvoiceSnapshotBillTo, InvoiceSnapshotLine, InvoiceSnapshotSeller,
 };
 
@@ -57,7 +57,7 @@ fn build_snapshot(gst_registered: bool, lines: Vec<InvoiceSnapshotLine>) -> Invo
         0
     };
     InvoiceSnapshot {
-        schema_version: toolbox::invoicing::snapshot::SCHEMA_VERSION,
+        schema_version: toolbox::finance::snapshot::SCHEMA_VERSION,
         title: if gst_registered {
             "Tax Invoice"
         } else {
@@ -122,7 +122,7 @@ fn multipage_sample() -> InvoiceSnapshot {
 }
 
 /// A stress test for the header-block wrapping/pagination fix (CLAUDE.md's
-/// "Invoicing" house rule, "PDF (PR 4)"): every field that can carry
+/// "Finance" house rule, "PDF (PR 4)"): every field that can carry
 /// long user-entered text pushed to (or near) its documented maximum —
 /// a ~200-char client name, a 60-line address, a ~2000-char payment-details
 /// block, and a long unbroken token (a fake overlong email) with no spaces

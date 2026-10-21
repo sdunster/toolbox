@@ -20,24 +20,24 @@ export interface SelectedInstance {
   /** The signed-in user's role in this instance — drives owner-only UI
    * (the Deleted list, the full assignee picker) without a separate query. */
   role: "OWNER" | "AGENT";
-  /** Support (tickets) or invoicing (projects/invoices) — decides which nav
+  /** Support (tickets) or finance (projects/invoices) — decides which nav
    * and which home page the shell shows. Always taken from the fresh
    * membership data, never from `localStorage` (only the id is stored), so a
    * selection saved before `kind` existed still resolves correctly. */
   kind: InstanceKind;
 }
 
-export type InstanceKind = "SUPPORT" | "INVOICING";
+export type InstanceKind = "SUPPORT" | "FINANCE";
 
 /** Narrows the generated Relay enum (which also admits
  * `"%future added value"`) to the two kinds this build knows about —
  * anything unrecognised is treated as support, today's only other kind. */
 export function toInstanceKind(kind: string): InstanceKind {
-  return kind === "INVOICING" ? "INVOICING" : "SUPPORT";
+  return kind === "FINANCE" ? "FINANCE" : "SUPPORT";
 }
 
 /** Where a kind's section of the app starts: the switcher navigates here
  * when the selection changes kind, and `/app`'s index redirects here. */
 export function homePathForKind(kind: InstanceKind): string {
-  return kind === "INVOICING" ? "/app/invoices" : "/app/tickets/open";
+  return kind === "FINANCE" ? "/app/invoices" : "/app/tickets/open";
 }

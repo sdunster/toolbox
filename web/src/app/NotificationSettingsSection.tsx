@@ -81,7 +81,7 @@ function patchFor(key: SettingKey, value: boolean): NotificationSettingsInput {
 
 /**
  * Email notification preferences — one block per *support* instance the
- * caller belongs to, five checkboxes each (invoicing instances have no
+ * caller belongs to, five checkboxes each (finance instances have no
  * tickets to notify about, so they're left out).
  * `MembershipInfo.notificationSettings` is self-only server-side (see its
  * doc comment), which this only ever reads via `me`, so that guard is never
@@ -153,11 +153,11 @@ export function NotificationSettingsSection({
     });
   }
 
-  // Staff notifications are about ticket activity, which an invoicing
+  // Staff notifications are about ticket activity, which a finance
   // instance never has — its memberships would only be five toggles that
   // can never fire.
   const supportMemberships = data.memberships.filter(
-    (m) => m.instance.kind !== "INVOICING",
+    (m) => m.instance.kind !== "FINANCE",
   );
 
   if (data.memberships.length === 0) {

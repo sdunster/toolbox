@@ -26,7 +26,7 @@ use super::finance::{
 };
 use super::pagination::{build_connection, pagination_args};
 use super::{InstanceId, InvoiceId, ProjectId, TicketDeliveriesKey, UserId};
-use crate::invoicing::{self, money, report, vehicle};
+use crate::finance::{self, money, report, vehicle};
 
 /// Metadata for a stored passkey credential — never the credential itself (no
 /// private key material, no raw `passkey_json`).
@@ -54,14 +54,14 @@ impl From<db::WebauthnCredential> for PasskeyInfo {
 #[derive(Enum, Copy, Clone, Eq, PartialEq, Debug)]
 pub enum InstanceKindType {
     Support,
-    Invoicing,
+    Finance,
 }
 
 impl From<db::InstanceKind> for InstanceKindType {
     fn from(kind: db::InstanceKind) -> Self {
         match kind {
             db::InstanceKind::Support => Self::Support,
-            db::InstanceKind::Invoicing => Self::Invoicing,
+            db::InstanceKind::Finance => Self::Finance,
         }
     }
 }
@@ -70,7 +70,7 @@ impl From<InstanceKindType> for db::InstanceKind {
     fn from(kind: InstanceKindType) -> Self {
         match kind {
             InstanceKindType::Support => Self::Support,
-            InstanceKindType::Invoicing => Self::Invoicing,
+            InstanceKindType::Finance => Self::Finance,
         }
     }
 }
@@ -204,24 +204,24 @@ impl From<db::Instance> for PublicInstance {
     }
 }
 
-/// An invoicing instance's seller settings and payment footer — the printed
-/// "Invoice to"/seller block and payment text, per CLAUDE.md's "Invoicing"
+/// A finance instance's seller settings and payment footer — the printed
+/// "Invoice to"/seller block and payment text, per CLAUDE.md's "Finance"
 /// house rule. `null` for a support instance (see
-/// [`Instance::invoicing_settings`]). Owner-or-superuser to *write*
-/// (`updateInvoicingSettings`/`setNextInvoiceNumber`), but readable by any
+/// [`Instance::finance_settings`]). Owner-or-superuser to *write*
+/// (`updateFinanceSettings`/`setNextInvoiceNumber`), but readable by any
 /// member — the same posture as every other plain `Instance` field.
 ///
 /// Generic over `A` (unlike a plain `SimpleObject`) so
 /// [`Self::next_invoice_number`] can read the `counter` row lazily, through
 /// `ctx` — a DB read this field alone needs, so it must not run on every
-/// plain `Instance`/`invoicingSettings` fetch that doesn't ask for it.
+/// plain `Instance`/`financeSettings` fetch that doesn't ask for it.
 #[derive(Debug, PartialEq)]
-pub struct InvoicingSettingsInfo<A: App + HasDb + Send + Sync> {
+pub struct FinanceSettingsInfo<A: App + HasDb + Send + Sync> {
     _marker: PhantomData<A>,
     rec: db::Instance,
 }
 
-impl<A: App + HasDb + Send + Sync> InvoicingSettingsInfo<A> {
+impl<A: App + HasDb + Send + Sync> FinanceSettingsInfo<A> {
     pub fn new(rec: db::Instance) -> Self {
         Self {
             _marker: PhantomData,
@@ -230,7 +230,7 @@ impl<A: App + HasDb + Send + Sync> InvoicingSettingsInfo<A> {
     }
 }
 
-impl<A: App + HasDb + Send + Sync> Clone for InvoicingSettingsInfo<A> {
+impl<A: App + HasDb + Send + Sync> Clone for FinanceSettingsInfo<A> {
     fn clone(&self) -> Self {
         Self {
             _marker: PhantomData,
@@ -240,7 +240,7 @@ impl<A: App + HasDb + Send + Sync> Clone for InvoicingSettingsInfo<A> {
 }
 
 #[Object]
-impl<A: App + HasDb + Send + Sync + 'static> InvoicingSettingsInfo<A> {
+impl<A: App + HasDb + Send + Sync + 'static> FinanceSettingsInfo<A> {
     async fn business_name(&self) -> Option<&str> {
         self.rec.business_name.as_deref()
     }
@@ -274,7 +274,7 @@ impl<A: App + HasDb + Send + Sync + 'static> InvoicingSettingsInfo<A> {
     /// `(counter value, or 0 if never finalized) + 1` — the number
     /// `finalizeInvoice` will assign next, and `setNextInvoiceNumber`'s
     /// argument shape. Read lazily here (a `counter` `GetItem`), not
-    /// carried on `db::Instance`, so a plain `Instance`/`invoicingSettings`
+    /// carried on `db::Instance`, so a plain `Instance`/`financeSettings`
     /// fetch that doesn't ask for this field costs nothing extra.
     async fn next_invoice_number(&self, ctx: &Context<'_>) -> Result<i32> {
         let app = ctx.data_unchecked::<Arc<A>>();
@@ -283,14 +283,14 @@ impl<A: App + HasDb + Send + Sync + 'static> InvoicingSettingsInfo<A> {
     }
 }
 
-/// `updateInvoicingSettings`'s argument — full-replace, unlike
+/// `updateFinanceSettings`'s argument — full-replace, unlike
 /// [`NotificationSettingsInput`]'s per-field patch: every call writes every
 /// field. Every string field is required by the schema but treated as
 /// "unset" when blank after trimming — see
-/// `graphql::mutations::update_invoicing_settings`'s doc comment for the
+/// `graphql::mutations::update_finance_settings`'s doc comment for the
 /// REMOVE-on-blank rule this input drives.
 #[derive(InputObject, Clone, Debug)]
-pub struct InvoicingSettingsInput {
+pub struct FinanceSettingsInput {
     pub business_name: String,
     pub business_abn: String,
     pub business_address: String,
@@ -305,7 +305,7 @@ pub struct InvoicingSettingsInput {
 
 /// `addBrand`/`updateBrand`'s argument — full replace. `name` is required;
 /// every other field is optional, blank meaning "use the default brand's"
-/// (the instance's invoicing settings) when an invoice is printed.
+/// (the instance's finance settings) when an invoice is printed.
 #[derive(InputObject, Clone, Debug)]
 pub struct BrandInput {
     pub name: String,
@@ -396,20 +396,20 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
     async fn kind(&self) -> InstanceKindType {
         self.rec.kind.into()
     }
-    /// This instance's invoicing settings, or `null` for a support instance.
-    /// See [`InvoicingSettingsInfo`]'s doc comment.
-    async fn invoicing_settings(&self) -> Option<InvoicingSettingsInfo<A>> {
-        if self.rec.kind != db::InstanceKind::Invoicing {
+    /// This instance's finance settings, or `null` for a support instance.
+    /// See [`FinanceSettingsInfo`]'s doc comment.
+    async fn finance_settings(&self) -> Option<FinanceSettingsInfo<A>> {
+        if self.rec.kind != db::InstanceKind::Finance {
             return None;
         }
-        Some(InvoicingSettingsInfo::new(self.rec.clone()))
+        Some(FinanceSettingsInfo::new(self.rec.clone()))
     }
-    /// The names this invoicing instance issues under: the default brand
-    /// (its own invoicing settings, id `"default"`) first, then every
+    /// The names this finance instance issues under: the default brand
+    /// (its own finance settings, id `"default"`) first, then every
     /// other brand in the order they were added, archived ones included.
     /// Empty for a support instance. See CLAUDE.md's "Brands" entry.
     async fn brands(&self) -> Vec<Brand> {
-        if self.rec.kind != db::InstanceKind::Invoicing {
+        if self.rec.kind != db::InstanceKind::Finance {
             return Vec::new();
         }
         all_brands(&self.rec)
@@ -517,7 +517,7 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
     /// This instance's broadcasts, newest first (at most `first`, default
     /// 25, max 100). Owner-only — **not** superuser: a broadcast is
     /// customer communication, the ticket side of the superuser boundary in
-    /// CLAUDE.md. `null`-free empty list for an invoicing instance, which
+    /// CLAUDE.md. `null`-free empty list for a finance instance, which
     /// can't send one.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(self.rec.id.clone()))")]
     async fn broadcasts(
@@ -549,7 +549,7 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
 
     /// The domains a broadcast from this instance may be sent from — the
     /// domains of its inbound addresses (`broadcast::instance_mail_domains`).
-    /// Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+    /// Owner-only, like [`Self::broadcasts`]; empty for a finance
     /// instance.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(self.rec.id.clone()))")]
     async fn broadcast_from_domains(&self, ctx: &Context<'_>) -> Result<Vec<String>> {
@@ -566,7 +566,7 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
 
     /// Saved From name + address pairs to pick from when drafting a
     /// broadcast, in the order they were added (`addBroadcastSender`).
-    /// Owner-only, like [`Self::broadcasts`]; empty for an invoicing
+    /// Owner-only, like [`Self::broadcasts`]; empty for a finance
     /// instance.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::InstanceOwner(self.rec.id.clone()))")]
     async fn broadcast_senders(&self) -> Vec<BroadcastSender> {
@@ -582,9 +582,9 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
     }
 }
 
-/// A name an invoicing instance issues invoices under — see `db::Brand`.
+/// A name a finance instance issues invoices under — see `db::Brand`.
 /// The default brand (`isDefault`, id `"default"`) is the instance's own
-/// invoicing settings, edited through `updateInvoicingSettings`; any other
+/// finance settings, edited through `updateFinanceSettings`; any other
 /// brand's unset `email`/`phone`/`address`/`paymentDetails` fall back to
 /// those settings when an invoice is printed.
 ///
@@ -619,7 +619,7 @@ impl From<db::Brand> for Brand {
     }
 }
 
-/// The default brand, built from the instance's invoicing settings.
+/// The default brand, built from the instance's finance settings.
 pub(crate) fn default_brand(instance: &db::Instance) -> Brand {
     Brand {
         brand_id: ID(db::DEFAULT_BRAND_ID.to_string()),
@@ -643,7 +643,7 @@ pub(crate) fn all_brands(instance: &db::Instance) -> Vec<Brand> {
 /// The brand `brand_id` names on `instance` — the default brand for `None`
 /// (and for an id the instance doesn't have).
 pub(crate) fn brand_for(instance: &db::Instance, brand_id: Option<&str>) -> Brand {
-    invoicing::brand::find(instance, brand_id)
+    finance::brand::find(instance, brand_id)
         .cloned()
         .map(Brand::from)
         .unwrap_or_else(|| default_brand(instance))
@@ -670,7 +670,7 @@ pub(crate) fn brand_filter_arg<'a>(
     brand_id: Option<&'a ID>,
 ) -> Result<Option<db::BrandFilter<'a>>> {
     brand_id
-        .map(|id| invoicing::brand::validate_filter(instance, id.as_str()))
+        .map(|id| finance::brand::validate_filter(instance, id.as_str()))
         .transpose()
         .map_err(|e| anyhow!(e))
 }
@@ -790,7 +790,7 @@ pub struct SendBroadcastInput {
 }
 
 /// `saveBroadcastDraft`'s argument: the whole draft, every time (a full
-/// replace, like `updateInvoicingSettings`). `id` absent creates a new
+/// replace, like `updateFinanceSettings`). `id` absent creates a new
 /// draft. `html` absent makes it a plain-text broadcast; with `html`,
 /// `body` is the optional plain-text version (blank derives one). See
 /// `broadcast::validate` and `broadcast_html::process`.
@@ -1856,8 +1856,8 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> Ticket<A> {
     }
 }
 
-/// A `project` row, exposed over GraphQL to its invoicing instance's
-/// members. Invoicing-only — see `db::Project`'s doc comment.
+/// A `project` row, exposed over GraphQL to its finance instance's
+/// members. Finance-only — see `db::Project`'s doc comment.
 #[derive(Debug, PartialEq)]
 pub struct Project<A: App + HasDb + Send + Sync> {
     _marker: PhantomData<A>,
@@ -1973,8 +1973,8 @@ impl<A: App + HasDb + Send + Sync + 'static> Project<A> {
     }
 }
 
-/// Where a billable item stands relative to invoicing. Every item is
-/// `UNBILLED` until invoices exist (the next PR of the invoicing stack); from
+/// Where a billable item stands relative to finance. Every item is
+/// `UNBILLED` until invoices exist (the next PR of the finance stack); from
 /// then on, an item on a draft invoice is `DRAFT` and one on a finalized
 /// invoice is `INVOICED`. Defined in full now so the web client's handling
 /// doesn't have to change shape when the other two start appearing.
@@ -2011,7 +2011,7 @@ impl From<BillableItemFilterType> for db::BillableItemFilter {
 /// - `description`: trimmed, non-empty, ≤ 2000 chars, multi-line allowed.
 /// - `quantity`: a decimal **string** with at most 2 dp, `0 < q ≤ 1,000,000`
 ///   (`"2"`, `"1.5"`, `"0.25"`) — a string so no client float ever gets
-///   near it; the server is the one parser (`invoicing::money::parse_quantity`).
+///   near it; the server is the one parser (`finance::money::parse_quantity`).
 /// - `unitPriceCents`: integer cents, GST-exclusive, `0 ≤ p ≤ 1,000,000,000`.
 ///   Optional: omitted, a new item takes its project's
 ///   `defaultUnitPriceCents` (an error if the project has none), and an
@@ -2028,7 +2028,7 @@ pub struct BillableItemInput {
     pub gst_free: bool,
 }
 
-/// A `billable_item` row, exposed over GraphQL to its invoicing instance's
+/// A `billable_item` row, exposed over GraphQL to its finance instance's
 /// members. See `db::BillableItem`.
 #[derive(Debug, PartialEq)]
 pub struct BillableItem<A: App + HasDb + Send + Sync> {
@@ -2239,7 +2239,7 @@ impl InvoiceFilterType {
 }
 
 /// The printed "Invoice to" block — from the project's client fields, per
-/// `invoicing::snapshot::InvoiceSnapshotBillTo`.
+/// `finance::snapshot::InvoiceSnapshotBillTo`.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct InvoiceBillToInfo {
     pub name: String,
@@ -2247,8 +2247,8 @@ pub struct InvoiceBillToInfo {
     pub address: Option<String>,
 }
 
-impl From<invoicing::snapshot::InvoiceSnapshotBillTo> for InvoiceBillToInfo {
-    fn from(b: invoicing::snapshot::InvoiceSnapshotBillTo) -> Self {
+impl From<finance::snapshot::InvoiceSnapshotBillTo> for InvoiceBillToInfo {
+    fn from(b: finance::snapshot::InvoiceSnapshotBillTo) -> Self {
         Self {
             name: b.name,
             abn: b.abn,
@@ -2258,7 +2258,7 @@ impl From<invoicing::snapshot::InvoiceSnapshotBillTo> for InvoiceBillToInfo {
 }
 
 /// The printed seller block — from the instance's business settings, per
-/// `invoicing::snapshot::InvoiceSnapshotSeller`.
+/// `finance::snapshot::InvoiceSnapshotSeller`.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct InvoiceSellerInfo {
     pub name: Option<String>,
@@ -2271,8 +2271,8 @@ pub struct InvoiceSellerInfo {
     pub email: Option<String>,
 }
 
-impl From<invoicing::snapshot::InvoiceSnapshotSeller> for InvoiceSellerInfo {
-    fn from(s: invoicing::snapshot::InvoiceSnapshotSeller) -> Self {
+impl From<finance::snapshot::InvoiceSnapshotSeller> for InvoiceSellerInfo {
+    fn from(s: finance::snapshot::InvoiceSnapshotSeller) -> Self {
         Self {
             name: s.name,
             legal_name: s.legal_name,
@@ -2284,7 +2284,7 @@ impl From<invoicing::snapshot::InvoiceSnapshotSeller> for InvoiceSellerInfo {
     }
 }
 
-/// One printed line — per `invoicing::snapshot::InvoiceSnapshotLine`.
+/// One printed line — per `finance::snapshot::InvoiceSnapshotLine`.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct InvoiceLineInfo {
     pub date: String,
@@ -2296,8 +2296,8 @@ pub struct InvoiceLineInfo {
     pub gst_free: bool,
 }
 
-impl From<invoicing::snapshot::InvoiceSnapshotLine> for InvoiceLineInfo {
-    fn from(l: invoicing::snapshot::InvoiceSnapshotLine) -> Self {
+impl From<finance::snapshot::InvoiceSnapshotLine> for InvoiceLineInfo {
+    fn from(l: finance::snapshot::InvoiceSnapshotLine) -> Self {
         Self {
             date: l.date,
             description: l.description,
@@ -2309,11 +2309,11 @@ impl From<invoicing::snapshot::InvoiceSnapshotLine> for InvoiceLineInfo {
     }
 }
 
-/// An `invoice` row, exposed over GraphQL to its invoicing instance's
+/// An `invoice` row, exposed over GraphQL to its finance instance's
 /// members. Every printable field (`title`, `billTo`, `seller`, `lines`,
 /// the totals, `currency`, `gstRegistered`, `paymentDetails`) reads from the
 /// frozen `snapshot` when [`db::Invoice::status`] is `Finalized`, or builds
-/// one live (`invoicing::snapshot::build_snapshot`, `number: None`) when
+/// one live (`finance::snapshot::build_snapshot`, `number: None`) when
 /// it's a `Draft` — see [`Self::effective`].
 #[derive(Debug, PartialEq)]
 pub struct Invoice<A: App + HasDb + Send + Sync> {
@@ -2342,13 +2342,13 @@ impl<A: App + HasDb + Send + Sync> Clone for Invoice<A> {
 impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
     /// This invoice's printable content: the frozen snapshot for a
     /// finalized invoice (a JSON parse, no I/O), or a live
-    /// `invoicing::snapshot::build_snapshot` for a draft (fetches the
+    /// `finance::snapshot::build_snapshot` for a draft (fetches the
     /// project, instance, and current items). Called independently by each
     /// content-bearing field below — for a draft, that means each such
     /// field re-fetches/rebuilds rather than sharing one result, which is
     /// simple and correct but not the cheapest possible query plan; fine at
-    /// this feature's v1 scale (see CLAUDE.md's "Invoicing" house rule).
-    async fn effective(&self, ctx: &Context<'_>) -> Result<invoicing::snapshot::InvoiceSnapshot> {
+    /// this feature's v1 scale (see CLAUDE.md's "Finance" house rule).
+    async fn effective(&self, ctx: &Context<'_>) -> Result<finance::snapshot::InvoiceSnapshot> {
         match self.rec.status {
             db::InvoiceStatus::Finalized => {
                 let json = self.rec.snapshot.as_deref().ok_or_else(|| {
@@ -2385,7 +2385,7 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
                         .flatten()
                         .collect()
                 };
-                Ok(invoicing::snapshot::build_snapshot(
+                Ok(finance::snapshot::build_snapshot(
                     &instance, &project, &items, None, None, None,
                 ))
             }
@@ -2405,7 +2405,7 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
         self.rec.number.map(|n| n as i32)
     }
     /// Zero-padded to 3 digits (`"008"`); `null` for a draft. Mirrors
-    /// `invoicing::snapshot::InvoiceSnapshot::display_number` exactly.
+    /// `finance::snapshot::InvoiceSnapshot::display_number` exactly.
     async fn display_number(&self) -> Option<String> {
         self.rec.number.map(|n| format!("{n:03}"))
     }
@@ -2441,12 +2441,12 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
     }
     /// Unpaid and past its due date, by today's UTC date.
     async fn overdue(&self) -> bool {
-        self.rec.is_overdue(&invoicing::today_utc())
+        self.rec.is_overdue(&finance::today_utc())
     }
     /// Whole days past due (by today's UTC date) while unpaid; `null` when
     /// it isn't overdue.
     async fn days_overdue(&self) -> Option<i32> {
-        let today = invoicing::today_utc();
+        let today = finance::today_utc();
         if !self.rec.is_overdue(&today) {
             return None;
         }
@@ -2578,11 +2578,11 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
     }
 }
 
-/// Fetch `instance_id` and require it to be an invoicing instance —
+/// Fetch `instance_id` and require it to be a finance instance —
 /// `NOT_FOUND` when missing, a plain validation error for a support
 /// instance (the caller is a real member of a real instance, just the
 /// wrong kind), like `projects`.
-async fn require_invoicing_instance<A: App + HasDb + Send + Sync>(
+async fn require_finance_instance<A: App + HasDb + Send + Sync>(
     app: &A,
     instance_id: &ID,
 ) -> Result<db::Instance> {
@@ -2594,7 +2594,7 @@ async fn require_invoicing_instance<A: App + HasDb + Send + Sync>(
         .next()
         .flatten()
         .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-    db::require_instance_kind(&instance, db::InstanceKind::Invoicing).map_err(|e| anyhow!(e))?;
+    db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
     Ok(instance)
 }
 
@@ -2605,8 +2605,8 @@ const MAX_REPORT_RANGE_DAYS: i64 = 731;
 /// Validate a report's `from..=to` (`YYYY-MM-DD`, `from ≤ to`, at most
 /// [`MAX_REPORT_RANGE_DAYS`] apart).
 fn validate_report_range(from: &str, to: &str) -> Result<(String, String)> {
-    let from = invoicing::validate_item_date(from).map_err(|e| anyhow!(e))?;
-    let to = invoicing::validate_item_date(to).map_err(|e| anyhow!(e))?;
+    let from = finance::validate_item_date(from).map_err(|e| anyhow!(e))?;
+    let to = finance::validate_item_date(to).map_err(|e| anyhow!(e))?;
     let days = report::days_between(&from, &to);
     if days < 0 {
         return Err(anyhow!("from must be on or before to"));
@@ -2631,7 +2631,7 @@ fn decode_billable_item_cursor(cursor: &str) -> Result<db::BillableItemCursor> {
     let (date, id) = cursor
         .split_once(':')
         .ok_or_else(|| anyhow!("Invalid cursor"))?;
-    let date = invoicing::validate_item_date(date).map_err(|_| anyhow!("Invalid cursor"))?;
+    let date = finance::validate_item_date(date).map_err(|_| anyhow!("Invalid cursor"))?;
     if id.is_empty() {
         return Err(anyhow!("Invalid cursor"));
     }
@@ -2722,7 +2722,7 @@ impl From<db::ExpenseCategory> for ExpenseCategoryType {
 
 /// `createExpense`/`updateExpense`'s argument (update is a full replace).
 /// Which fields apply depends on `category` — see
-/// `invoicing::expense::validate_expense_input`:
+/// `finance::expense::validate_expense_input`:
 ///
 /// - A purchase (every category but `VEHICLE_KM`): `supplier` and
 ///   `amountCents` (integer cents, **GST-inclusive** — what was paid) are
@@ -2750,7 +2750,7 @@ pub struct ExpenseInput {
     pub distance_km: Option<String>,
 }
 
-/// An `expense` row, exposed to its invoicing instance's members. See
+/// An `expense` row, exposed to its finance instance's members. See
 /// `db::Expense`.
 #[derive(Debug, PartialEq)]
 pub struct Expense<A: App + HasDb + Send + Sync> {
@@ -3310,7 +3310,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         Ok(Some(Ticket::new(rec)))
     }
 
-    /// Every project for an invoicing instance, sorted by name
+    /// Every project for a finance instance, sorted by name
     /// case-insensitively — the projects list page's data source.
     /// Unpaginated, like `Instance.inboundAddresses` (see
     /// `db::Handler::list_projects_by_instance`'s doc comment for why).
@@ -3334,8 +3334,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
         let mut projects = app
             .db()
             .list_projects_by_instance(instance_id.as_str())
@@ -3348,7 +3347,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
     }
 
     /// Fetch a single project by id. Reachable only by a member of its
-    /// (invoicing) instance — a project that doesn't exist, belongs to an
+    /// (finance) instance — a project that doesn't exist, belongs to an
     /// instance the caller isn't a member of, or belongs to a support
     /// instance, is reported identically — `null` — mirroring
     /// [`Self::ticket`]'s no-probing posture.
@@ -3371,21 +3370,21 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         if !is_member(memberships, &rec.instance_id) {
             return Ok(None);
         }
-        let is_invoicing = app
+        let is_finance = app
             .db()
             .get_instances(&[rec.instance_id.as_str()])
             .await?
             .into_iter()
             .next()
             .flatten()
-            .is_some_and(|i| i.kind == db::InstanceKind::Invoicing);
-        if !is_invoicing {
+            .is_some_and(|i| i.kind == db::InstanceKind::Finance);
+        if !is_finance {
             return Ok(None);
         }
         Ok(Some(Project::new(rec)))
     }
 
-    /// Billable items in an invoicing instance — every project's, or one
+    /// Billable items in a finance instance — every project's, or one
     /// project's when `projectId` is given — as a Relay connection, newest
     /// `date` first (see `db::Handler::list_billable_items`). Forward-only
     /// (`first`/`after`). Member of `instanceId`; a support instance is
@@ -3412,8 +3411,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
         if let Some(project_id) = &project_id {
             app.db()
                 .get_projects(&[project_id.as_str()])
@@ -3464,7 +3462,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         ))
     }
 
-    /// Expenses in an invoicing instance — all of them, or one project's
+    /// Expenses in a finance instance — all of them, or one project's
     /// when `projectId` is given — as a Relay connection, newest `date`
     /// first. Same posture as [`Self::billable_items`]: member of
     /// `instanceId`, support instance rejected with a plain validation
@@ -3492,8 +3490,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
         if let Some(project_id) = &project_id {
             app.db()
                 .get_projects(&[project_id.as_str()])
@@ -3567,8 +3564,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
         let financial_year = match financial_year {
             Some(y) if (2000..=9998).contains(&y) => y,
             Some(_) => return Err(anyhow!("financialYear is out of range")),
@@ -3593,7 +3589,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         })
     }
 
-    /// Invoices in an invoicing instance — every project's, or one
+    /// Invoices in a finance instance — every project's, or one
     /// project's when `projectId` is given — as a Relay connection, newest
     /// `createdAt` first (see `db::Handler::list_invoices`). Same posture as
     /// [`Self::billable_items`]: member of `instanceId`, support instance
@@ -3621,8 +3617,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
-        db::require_instance_kind(&instance, db::InstanceKind::Invoicing)
-            .map_err(|e| anyhow!(e))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
         if let Some(project_id) = &project_id {
             app.db()
                 .get_projects(&[project_id.as_str()])
@@ -3652,7 +3647,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .db()
             .list_invoices(
                 scope,
-                filter.to_db(&invoicing::today_utc()),
+                filter.to_db(&finance::today_utc()),
                 brand_filter_arg(&instance, brand_id.as_ref())?,
                 db::ListInvoicesPage {
                     after: after_cursor,
@@ -3672,7 +3667,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
     }
 
     /// Fetch a single invoice by id. Reachable only by a member of its
-    /// (invoicing) instance — missing, wrong instance, and belonging to a
+    /// (finance) instance — missing, wrong instance, and belonging to a
     /// support instance are all reported identically — `null` — mirroring
     /// [`Self::project`]'s no-probing posture. A strongly consistent
     /// `GetItem` (`get_invoice_consistent`), not the dataloader path: the web
@@ -3691,21 +3686,21 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         if !is_member(memberships, &rec.instance_id) {
             return Ok(None);
         }
-        let is_invoicing = app
+        let is_finance = app
             .db()
             .get_instances(&[rec.instance_id.as_str()])
             .await?
             .into_iter()
             .next()
             .flatten()
-            .is_some_and(|i| i.kind == db::InstanceKind::Invoicing);
-        if !is_invoicing {
+            .is_some_and(|i| i.kind == db::InstanceKind::Finance);
+        if !is_finance {
             return Ok(None);
         }
         Ok(Some(Invoice::new(rec)))
     }
 
-    /// Credit notes in an invoicing instance — all of them, or one
+    /// Credit notes in a finance instance — all of them, or one
     /// invoice's when `invoiceId` is given — as a Relay connection, newest
     /// first. Same posture as [`Self::invoices`].
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
@@ -3720,7 +3715,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         after: Option<String>,
     ) -> Result<Connection<String, CreditNote<A>, EmptyFields, EmptyFields>> {
         let app = ctx.data_unchecked::<Arc<A>>();
-        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        let instance = require_finance_instance(&**app, &instance_id).await?;
         if let Some(invoice_id) = &invoice_id {
             app.db()
                 .get_invoices(&[invoice_id.as_str()])
@@ -3799,7 +3794,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
     /// apart): sales and GST on sales (G1/1A) from finalized invoices,
     /// credit notes and payments on the chosen `basis`, and purchases and
     /// GST on purchases (1B) from expenses by their date. See
-    /// `invoicing::report::gst_summary` for exactly how each basis counts.
+    /// `finance::report::gst_summary` for exactly how each basis counts.
     /// Member; a support instance is rejected.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
     async fn gst_report(
@@ -3813,7 +3808,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         brand_id: Option<ID>,
     ) -> Result<GstReport> {
         let app = ctx.data_unchecked::<Arc<A>>();
-        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        let instance = require_finance_instance(&**app, &instance_id).await?;
         let (from, to) = validate_report_range(&from, &to)?;
         let brand = brand_filter_arg(&instance, brand_id.as_ref())?;
         let mut invoices = app
@@ -3871,7 +3866,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         brand_id: Option<ID>,
     ) -> Result<ReceivablesReport<A>> {
         let app = ctx.data_unchecked::<Arc<A>>();
-        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        let instance = require_finance_instance(&**app, &instance_id).await?;
         let brand = brand_filter_arg(&instance, brand_id.as_ref())?;
         let mut invoices = app
             .db()
@@ -3880,7 +3875,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         if let Some(brand) = brand {
             invoices.retain(|i| brand.matches(i.brand_id.as_deref()));
         }
-        let today = invoicing::today_utc();
+        let today = finance::today_utc();
         let (aging, outstanding) = report::aging(&invoices, &today);
         Ok(ReceivablesReport {
             invoices: outstanding.into_iter().cloned().collect(),
@@ -3895,9 +3890,9 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
     /// finalized invoices by issue date, credit notes by issue date,
     /// payments by payment date, or expenses by date. Returned as the CSV
     /// text itself; the web app saves it as a file. Member; a support
-    /// instance is rejected. See `invoicing::csv`.
+    /// instance is rejected. See `finance::csv`.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
-    async fn invoicing_export(
+    async fn finance_export(
         &self,
         ctx: &Context<'_>,
         instance_id: ID,
@@ -3908,7 +3903,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         brand_id: Option<ID>,
     ) -> Result<String> {
         let app = ctx.data_unchecked::<Arc<A>>();
-        let instance = require_invoicing_instance(&**app, &instance_id).await?;
+        let instance = require_finance_instance(&**app, &instance_id).await?;
         let (from, to) = validate_report_range(&from, &to)?;
         let brand = brand_filter_arg(&instance, brand_id.as_ref())?;
         let in_brand = |row_brand: Option<&str>| brand.is_none_or(|b| b.matches(row_brand));
@@ -3919,14 +3914,14 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .into_iter()
             .map(|p| (p.id.clone(), p))
             .collect();
-        Ok(match invoicing::csv::Export::from(kind) {
-            invoicing::csv::Export::Expenses => {
+        Ok(match finance::csv::Export::from(kind) {
+            finance::csv::Export::Expenses => {
                 let mut expenses = app
                     .db()
                     .list_expenses_in_range(&instance.id, &from, &to)
                     .await?;
                 expenses.retain(|e| in_brand(e.fields.brand_id.as_deref()));
-                invoicing::csv::expenses(&expenses, &projects, &from, &to)
+                finance::csv::expenses(&expenses, &projects, &from, &to)
             }
             export => {
                 let invoices = app
@@ -3939,11 +3934,11 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
                     .cloned()
                     .collect();
                 match export {
-                    invoicing::csv::Export::Invoices => {
-                        invoicing::csv::invoices(&branded, &projects, &from, &to)
+                    finance::csv::Export::Invoices => {
+                        finance::csv::invoices(&branded, &projects, &from, &to)
                     }
-                    invoicing::csv::Export::Payments => {
-                        invoicing::csv::payments(&branded, &projects, &from, &to)
+                    finance::csv::Export::Payments => {
+                        finance::csv::payments(&branded, &projects, &from, &to)
                     }
                     _ => {
                         let mut notes = app
@@ -3955,7 +3950,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
                             .iter()
                             .filter_map(|i| i.number.map(|n| (i.id.clone(), format!("{n:03}"))))
                             .collect();
-                        invoicing::csv::credit_notes(&notes, &numbers, &projects, &from, &to)
+                        finance::csv::credit_notes(&notes, &numbers, &projects, &from, &to)
                     }
                 }
             }

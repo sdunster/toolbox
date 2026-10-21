@@ -1,4 +1,4 @@
-//! Integration tests for PR 3 of the invoicing feature — the `invoice`
+//! Integration tests for PR 3 of the finance feature — the `invoice`
 //! table, its transactional attach/detach/finalize machinery, and its
 //! GraphQL surface — against **DynamoDB Local**, following
 //! `billable_items_dynamodb_local.rs`'s helper pattern. Covers:
@@ -206,7 +206,7 @@ fn build_schema(db: dynamodb::Handler) -> TestSchema {
     }
 }
 
-/// An invoicing instance, with `businessName` already set (so
+/// A finance instance, with `businessName` already set (so
 /// `finalizeInvoice` doesn't need its own setup in every test), one owner,
 /// one agent, and one project. Returns `(instance_id, owner_id, agent_id,
 /// project_id)`.
@@ -218,13 +218,13 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String, 
             label,
             "",
             false,
-            db::InstanceKind::Invoicing,
+            db::InstanceKind::Finance,
         )
         .await
         .expect("create_instance");
     db.update_instance(
         &instance.id,
-        db::InstanceUpdateShape::SetInvoicingSettings {
+        db::InstanceUpdateShape::SetFinanceSettings {
             business_name: Some("Fictional Trades Pty Ltd"),
             business_abn: Some("11 222 333 444"),
             business_address: None,
@@ -237,7 +237,7 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String, 
         },
     )
     .await
-    .expect("set invoicing settings");
+    .expect("set finance settings");
     let owner = db
         .create_user(&unique_email(&format!("{label}-owner")), "Owner")
         .await
@@ -358,7 +358,7 @@ async fn download_invoice_pdf(schema: &TestSchema, invoice_id: &str, auth: AuthI
 
 const SET_NEXT_INVOICE_NUMBER_MUTATION: &str = "mutation($instanceId: ID!, $next: Int!) {
     setNextInvoiceNumber(instanceId: $instanceId, next: $next) {
-        invoicingSettings { nextInvoiceNumber }
+        financeSettings { nextInvoiceNumber }
     }
 }";
 
@@ -381,10 +381,10 @@ const UPDATE_PROJECT_MUTATION: &str = "
     }
 ";
 
-const UPDATE_INVOICING_SETTINGS_MUTATION: &str = "
-    mutation($instanceId: ID!, $input: InvoicingSettingsInput!) {
-        updateInvoicingSettings(instanceId: $instanceId, input: $input) {
-            invoicingSettings { businessName }
+const UPDATE_FINANCE_SETTINGS_MUTATION: &str = "
+    mutation($instanceId: ID!, $input: FinanceSettingsInput!) {
+        updateFinanceSettings(instanceId: $instanceId, input: $input) {
+            financeSettings { businessName }
         }
     }
 ";
@@ -842,7 +842,7 @@ async fn finalize_assigns_sequential_numbers_and_freezes_the_snapshot() {
 
     let update_settings = schema
         .execute(
-            Request::new(UPDATE_INVOICING_SETTINGS_MUTATION)
+            Request::new(UPDATE_FINANCE_SETTINGS_MUTATION)
                 .variables(Variables::from_json(json!({
                     "instanceId": instance_id,
                     "input": {
@@ -1110,7 +1110,7 @@ async fn next_invoice_number_is_forward_only() {
         )
         .await;
     let next = expect_data(&set9, "setNextInvoiceNumber");
-    assert_eq!(next["invoicingSettings"]["nextInvoiceNumber"], 9);
+    assert_eq!(next["financeSettings"]["nextInvoiceNumber"], 9);
 
     let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
     let created = create_invoice(
@@ -1320,7 +1320,7 @@ async fn finalize_requires_business_name_to_be_set_first() {
             "nobiz",
             "",
             false,
-            db::InstanceKind::Invoicing,
+            db::InstanceKind::Finance,
         )
         .await
         .expect("create_instance");
@@ -1355,7 +1355,7 @@ async fn finalize_requires_business_name_to_be_set_first() {
 
     let finalized = finalize(&schema, &invoice_id, "2026-08-19", auth()).await;
     assert!(
-        expect_error_message(&finalized).contains("Complete the invoicing settings first"),
+        expect_error_message(&finalized).contains("Complete the finance settings first"),
         "{:?}",
         finalized.errors
     );

@@ -1655,7 +1655,7 @@ impl Handler {
 
     /// Run a `TransactWriteItems` call — Update/Put/Delete items only (no
     /// `ConditionCheck`, so no extra `dynamodb:ConditionCheckItem` IAM
-    /// permission is needed; see CLAUDE.md's "Invoicing" house rule and the
+    /// permission is needed; see CLAUDE.md's "Finance" house rule and the
     /// doc comment on `infra/iam.tf`'s `dynamodb:TransactWriteItems` grant).
     /// This is the first use of DynamoDB transactions in this codebase, so
     /// every invoice mutation that needs one goes through this one helper.
@@ -1997,7 +1997,7 @@ impl db::Handler for Handler {
         if public_submission_enabled {
             req = req.item("public_submission_enabled", AttributeValue::Bool(true));
         }
-        if kind == db::InstanceKind::Invoicing {
+        if kind == db::InstanceKind::Finance {
             req = req.item("kind", AttributeValue::S(kind.as_str().to_string()));
         }
         let resp = req
@@ -2100,7 +2100,7 @@ impl db::Handler for Handler {
                     CapKind::Write,
                 );
             }
-            db::InstanceUpdateShape::SetInvoicingSettings {
+            db::InstanceUpdateShape::SetFinanceSettings {
                 business_name,
                 business_abn,
                 business_address,
@@ -2186,7 +2186,7 @@ impl db::Handler for Handler {
                     .await
                     .map_err(|e| map_update_err(e, format!("Instance {id}")))?;
                 record_capacity(
-                    "update_instance_invoicing_settings",
+                    "update_instance_finance_settings",
                     resp.consumed_capacity(),
                     CapKind::Write,
                 );

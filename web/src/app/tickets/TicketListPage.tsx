@@ -96,14 +96,14 @@ export function TicketListPage({
     );
   }
 
-  // A deep link (or a bookmark) to a ticket queue while an invoicing
+  // A deep link (or a bookmark) to a ticket queue while a finance
   // instance is selected — `tickets` would just come back empty, which
   // reads like "the queue is clear" rather than "wrong kind of instance".
-  if (instance.kind === "INVOICING") {
+  if (instance.kind === "FINANCE") {
     return (
       <div className="rounded-lg border border-dashed border-line p-10 text-center text-ink-muted">
         <p className="font-medium text-ink">
-          {instance.name} is an invoicing instance
+          {instance.name} is a finance instance
         </p>
         <p className="mt-1 text-sm">
           It has no tickets — pick a support instance to see a ticket queue.

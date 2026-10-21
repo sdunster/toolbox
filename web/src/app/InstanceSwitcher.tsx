@@ -66,7 +66,7 @@ function Option({ membership }: { membership: Membership }) {
  *
  * Only the instance *id* is persisted; its kind and role always come from
  * the membership data just fetched, so a selection stored before `kind`
- * existed keeps working. A user who belongs to both support and invoicing
+ * existed keeps working. A user who belongs to both support and finance
  * instances sees them grouped under two `<optgroup>`s; anyone with only one
  * kind gets the plain flat list. Picking an instance of a *different* kind
  * than the current one navigates to that kind's home page — the page being
@@ -124,10 +124,10 @@ export function InstanceSwitcher({
   const support = memberships.filter(
     (m) => toInstanceKind(m.instance.kind) === "SUPPORT",
   );
-  const invoicing = memberships.filter(
-    (m) => toInstanceKind(m.instance.kind) === "INVOICING",
+  const finance = memberships.filter(
+    (m) => toInstanceKind(m.instance.kind) === "FINANCE",
   );
-  const grouped = support.length > 0 && invoicing.length > 0;
+  const grouped = support.length > 0 && finance.length > 0;
 
   return (
     <label className="flex items-center gap-2 text-sm">
@@ -145,8 +145,8 @@ export function InstanceSwitcher({
                 <Option key={m.instance.id} membership={m} />
               ))}
             </optgroup>
-            <optgroup label="Invoicing">
-              {invoicing.map((m) => (
+            <optgroup label="Finance">
+              {finance.map((m) => (
                 <Option key={m.instance.id} membership={m} />
               ))}
             </optgroup>

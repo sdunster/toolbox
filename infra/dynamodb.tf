@@ -511,8 +511,8 @@ resource "aws_dynamodb_table" "api_token" {
 }
 
 # ── project ──────────────────────────────────────────────────────────────────
-# A client/job an invoicing instance bills against — see CLAUDE.md's
-# "Invoicing" house rule. Invoicing-only: every write path rejects a support
+# A client/job a finance instance bills against — see CLAUDE.md's
+# "Finance" house rule. Finance-only: every write path rejects a support
 # instance.
 
 resource "aws_dynamodb_table" "project" {
@@ -551,7 +551,7 @@ resource "aws_dynamodb_table" "project" {
 
 # ── billable_item ────────────────────────────────────────────────────────────
 # One line of work recorded against a project, later collected onto an
-# invoice — see CLAUDE.md's "Invoicing" house rule. `date` (YYYY-MM-DD) is
+# invoice — see CLAUDE.md's "Finance" house rule. `date` (YYYY-MM-DD) is
 # the sort key of both listing GSIs, newest first; it is also a DynamoDB
 # reserved word, so every expression that names it aliases it (`#d`).
 
@@ -616,7 +616,7 @@ resource "aws_dynamodb_table" "billable_item" {
 }
 
 # ── expense ──────────────────────────────────────────────────────────────────
-# Money an invoicing instance spent — a purchase, or a cents-per-km vehicle
+# Money a finance instance spent — a purchase, or a cents-per-km vehicle
 # trip — optionally against one of its projects; see CLAUDE.md's "Expenses"
 # house rule. Same key shape as billable_item: `date` (YYYY-MM-DD, a reserved
 # word, aliased `#d`) sorts both listing GSIs, newest first.
@@ -684,7 +684,7 @@ resource "aws_dynamodb_table" "expense" {
 
 # ── invoice ──────────────────────────────────────────────────────────────────
 # A project's billable items collected for billing — see CLAUDE.md's
-# "Invoicing" house rule. `created_at` (N) is the sort key of both listing
+# "Finance" house rule. `created_at` (N) is the sort key of both listing
 # GSIs, newest first. `status`, `number`, and `version` are DynamoDB
 # reserved words, so every expression that names one aliases it.
 # Attach/detach/finalize use TransactWriteItems (Update/Put/Delete items

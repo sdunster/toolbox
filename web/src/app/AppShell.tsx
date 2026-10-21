@@ -30,19 +30,19 @@ const BROADCAST_NAV_ITEM = { to: "/app/broadcast", label: "Broadcast" };
 // a non-superuser who navigates to `/app/admin/*` directly still gets
 // FORBIDDEN from the server on every field it would try to read.
 const ADMIN_NAV_ITEM = { to: "/app/admin", label: "Admin" };
-// Invoicing instances get their own nav.
-const INVOICING_NAV_ITEMS = [
+// Finance instances get their own nav.
+const FINANCE_NAV_ITEMS = [
   { to: "/app/invoices", label: "Invoices" },
   { to: "/app/projects", label: "Projects" },
   { to: "/app/billable-items", label: "Billable items" },
   { to: "/app/expenses", label: "Expenses" },
   { to: "/app/reports", label: "Reports" },
 ];
-// `updateInvoicingSettings` is owner-or-superuser in the API — hidden from an
+// `updateFinanceSettings` is owner-or-superuser in the API — hidden from an
 // agent as a convenience only, like `DELETED_NAV_ITEM`; the page itself also
 // explains that only an owner can change these.
 const BUSINESS_SETTINGS_NAV_ITEM = {
-  to: "/app/invoicing-settings",
+  to: "/app/finance-settings",
   label: "Business settings",
 };
 
@@ -58,7 +58,7 @@ const navLinkClass = ({ isActive }: { isActive: boolean }) =>
  * The authenticated shell: header (instance switcher, current user, log
  * out) plus a nav that depends on the selected instance's kind — the
  * Open/Closed/All/Mine ticket queues for a support instance, Invoices,
- * Projects and Business settings for an invoicing one (Settings and Admin
+ * Projects and Business settings for a finance one (Settings and Admin
  * in both).
  * Child routes render into the `<Outlet/>`.
  */
@@ -68,9 +68,9 @@ export default function AppShell() {
   const [selected, setSelected] = useState<SelectedInstance | null>(null);
   const isOwner = selected?.role === "OWNER";
   const navItems =
-    selected?.kind === "INVOICING"
+    selected?.kind === "FINANCE"
       ? [
-          ...INVOICING_NAV_ITEMS,
+          ...FINANCE_NAV_ITEMS,
           SETTINGS_NAV_ITEM,
           ...(isOwner ? [BUSINESS_SETTINGS_NAV_ITEM] : []),
           ...(user.isSuperuser ? [ADMIN_NAV_ITEM] : []),
