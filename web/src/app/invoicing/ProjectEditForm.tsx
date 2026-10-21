@@ -10,6 +10,7 @@ import TextInput from "../../components/ui/TextInput";
 import { inputBase } from "../../components/ui/inputStyles";
 import { ProjectBillingFields } from "./ProjectBillingFields";
 import { billingInput, initialBillingValues } from "../../lib/projectBilling";
+import { InstanceBrandSelect } from "./BrandSelect";
 
 const projectEditFormFragment = graphql`
   fragment ProjectEditForm_project on Project {
@@ -23,6 +24,12 @@ const projectEditFormFragment = graphql`
     paymentTermsDays
     defaultUnitPriceCents
     archived
+    brand {
+      brandId
+    }
+    instance {
+      slug
+    }
   }
 `;
 
@@ -45,6 +52,7 @@ export function ProjectEditForm({
   const [clientAddress, setClientAddress] = useState(data.clientAddress ?? "");
   const [reference, setReference] = useState(data.reference ?? "");
   const [archived, setArchived] = useState(data.archived);
+  const [brandId, setBrandId] = useState(data.brand.brandId);
   const [billing, setBilling] = useState(() =>
     initialBillingValues({
       clientEmail: data.clientEmail,
@@ -83,6 +91,7 @@ export function ProjectEditForm({
           clientAddress: clientAddress.trim(),
           reference: reference.trim(),
           ...parsed.input,
+          brandId,
           archived,
         },
       },
@@ -143,6 +152,14 @@ export function ProjectEditForm({
             placeholder="e.g. the site address"
           />
         </FormField>
+        <InstanceBrandSelect
+          slug={data.instance.slug}
+          id="project-brand"
+          value={brandId}
+          current={data.brand.brandId}
+          onChange={setBrandId}
+          help="The name its invoices are issued under. Finalized invoices keep the brand they were issued with."
+        />
         <ProjectBillingFields
           idPrefix="project"
           values={billing}

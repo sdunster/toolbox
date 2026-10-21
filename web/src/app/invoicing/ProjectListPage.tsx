@@ -83,7 +83,7 @@ function ProjectList({
   );
 }
 
-function Content({ instanceId }: { instanceId: string }) {
+function Content({ instanceId, slug }: { instanceId: string; slug: string }) {
   const [includeArchived, setIncludeArchived] = useState(false);
   // Deferred, so flipping the toggle updates the checkbox immediately but
   // keeps showing the current list (dimmed) while the other variant loads,
@@ -115,7 +115,7 @@ function Content({ instanceId }: { instanceId: string }) {
         </Suspense>
       </div>
 
-      <CreateProjectForm instanceId={instanceId} />
+      <CreateProjectForm instanceId={instanceId} slug={slug} />
     </div>
   );
 }
@@ -132,7 +132,11 @@ export function ProjectListPage() {
       {(instance) => (
         <RelayErrorBoundary canRetry>
           <Suspense fallback={<LoadingIndicator />}>
-            <Content key={instance.id} instanceId={instance.id} />
+            <Content
+              key={instance.id}
+              instanceId={instance.id}
+              slug={instance.slug}
+            />
           </Suspense>
         </RelayErrorBoundary>
       )}

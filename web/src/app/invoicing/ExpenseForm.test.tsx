@@ -35,6 +35,7 @@ describe("ExpenseForm", () => {
     await user.click(screen.getByRole("button", { name: "Add expense" }));
     expect(onSubmit).toHaveBeenLastCalledWith({
       projectId: null,
+      brandId: "default",
       date: "2026-07-15",
       category: "MATERIALS",
       description: null,
@@ -99,6 +100,7 @@ describe("ExpenseForm", () => {
     await user.click(screen.getByRole("button", { name: "Add expense" }));
     expect(onSubmit).toHaveBeenLastCalledWith({
       projectId: null,
+      brandId: "default",
       date: "2026-07-15",
       category: "VEHICLE_KM",
       description: "Site visit",
@@ -107,5 +109,58 @@ describe("ExpenseForm", () => {
       gstCents: null,
       distanceKm: "12.5",
     });
+  });
+
+  it("shows a brand picker only with a second brand, following the project", async () => {
+    const user = UserEvent.setup();
+    const onSubmit = vi.fn();
+    const brands = [
+      {
+        brandId: "default",
+        name: "Legal Name",
+        archived: false,
+        isDefault: true,
+      },
+      {
+        brandId: "b1",
+        name: "Trading Name",
+        archived: false,
+        isDefault: false,
+      },
+    ];
+    render(
+      <ExpenseForm
+        idPrefix="t"
+        currency="AUD"
+        initial={blankExpense("2026-07-15", null)}
+        projects={[
+          { id: "p1", name: "Fictional Job", brand: { brandId: "b1" } },
+          { id: "p2", name: "Other Job", brand: { brandId: "default" } },
+        ]}
+        brands={brands}
+        submitLabel="Add expense"
+        savingLabel="Adding…"
+        isSaving={false}
+        error={null}
+        onSubmit={onSubmit}
+      />,
+    );
+    expect(screen.getByLabelText("Brand")).toHaveValue("default");
+    await user.selectOptions(screen.getByLabelText("Project"), "p1");
+    expect(screen.getByLabelText("Brand")).toHaveValue("b1");
+    await user.selectOptions(screen.getByLabelText("Project"), "p2");
+    expect(screen.getByLabelText("Brand")).toHaveValue("default");
+    await user.selectOptions(screen.getByLabelText("Brand"), "b1");
+    await user.type(screen.getByLabelText("Supplier"), "Fictional Hardware");
+    await user.type(screen.getByLabelText("Amount incl. GST (AUD)"), "110");
+    await user.click(screen.getByRole("button", { name: "Add expense" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ projectId: "p2", brandId: "b1" }),
+    );
+  });
+
+  it("has no brand picker while the instance has one brand", () => {
+    renderForm();
+    expect(screen.queryByLabelText("Brand")).not.toBeInTheDocument();
   });
 });

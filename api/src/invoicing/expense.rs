@@ -20,6 +20,8 @@ pub const MAX_AMOUNT_CENTS: i64 = invoicing::money::MAX_UNIT_PRICE_CENTS;
 #[derive(Clone, Debug, Default)]
 pub struct ExpenseInput<'a> {
     pub project_id: Option<String>,
+    /// Already checked against the instance (`invoicing::brand::validate_choice`).
+    pub brand_id: Option<String>,
     pub date: &'a str,
     pub category: Option<db::ExpenseCategory>,
     pub description: Option<&'a str>,
@@ -111,6 +113,7 @@ pub fn validate_expense_input(input: ExpenseInput<'_>) -> Result<db::ExpenseFiel
         category,
         description,
         detail,
+        brand_id: input.brand_id,
     })
 }
 

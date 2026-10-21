@@ -213,6 +213,7 @@ mod tests {
             issue_date: Some("2026-08-19".into()),
             seller: InvoiceSnapshotSeller {
                 name: Some("Fictional Trades".into()),
+                legal_name: None,
                 abn: None,
                 address: None,
                 phone: None,

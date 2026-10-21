@@ -24,6 +24,7 @@ use toolbox::invoicing::snapshot::{
 fn fictional_seller() -> InvoiceSnapshotSeller {
     InvoiceSnapshotSeller {
         name: Some("Fictional Trades Pty Ltd".into()),
+        legal_name: None,
         abn: Some("11 222 333 444".into()),
         address: Some("1 Fictional Street\nSomewhere NSW 2000".into()),
         phone: Some("0400 000 000".into()),

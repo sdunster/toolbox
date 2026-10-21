@@ -303,6 +303,18 @@ pub struct InvoicingSettingsInput {
     pub payment_terms_days: Option<i32>,
 }
 
+/// `addBrand`/`updateBrand`'s argument — full replace. `name` is required;
+/// every other field is optional, blank meaning "use the default brand's"
+/// (the instance's invoicing settings) when an invoice is printed.
+#[derive(InputObject, Clone, Debug)]
+pub struct BrandInput {
+    pub name: String,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub payment_details: Option<String>,
+}
+
 /// `createProject`'s argument.
 ///
 /// - `clientEmail`: where `sendInvoice` mails by default.
@@ -312,6 +324,9 @@ pub struct InvoicingSettingsInput {
 ///   this project gets when it doesn't name one.
 #[derive(InputObject, Clone, Debug)]
 pub struct CreateProjectInput {
+    /// The brand its invoices go out under; omitted or `"default"` means
+    /// the default brand.
+    pub brand_id: Option<ID>,
     pub name: String,
     pub client_name: String,
     pub client_abn: Option<String>,
@@ -326,6 +341,9 @@ pub struct CreateProjectInput {
 /// omitted optional field is cleared.
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateProjectInput {
+    /// Omitted or `"default"` means the default brand. Moving a project to
+    /// another brand changes its drafts, never a finalized invoice.
+    pub brand_id: Option<ID>,
     pub name: String,
     pub client_name: String,
     pub client_abn: Option<String>,
@@ -385,6 +403,16 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
             return None;
         }
         Some(InvoicingSettingsInfo::new(self.rec.clone()))
+    }
+    /// The names this invoicing instance issues under: the default brand
+    /// (its own invoicing settings, id `"default"`) first, then every
+    /// other brand in the order they were added, archived ones included.
+    /// Empty for a support instance. See CLAUDE.md's "Brands" entry.
+    async fn brands(&self) -> Vec<Brand> {
+        if self.rec.kind != db::InstanceKind::Invoicing {
+            return Vec::new();
+        }
+        all_brands(&self.rec)
     }
     async fn public_submission_enabled(&self) -> bool {
         self.rec.public_submission_enabled
@@ -552,6 +580,99 @@ impl<A: App + HasDb + Send + Sync + 'static> Instance<A> {
             .map(BroadcastSender::from)
             .collect()
     }
+}
+
+/// A name an invoicing instance issues invoices under — see `db::Brand`.
+/// The default brand (`isDefault`, id `"default"`) is the instance's own
+/// invoicing settings, edited through `updateInvoicingSettings`; any other
+/// brand's unset `email`/`phone`/`address`/`paymentDetails` fall back to
+/// those settings when an invoice is printed.
+///
+/// Its id is `brandId`, not `id`: the default brand's id is `"default"` in
+/// every instance, so it must not be a client-cache key.
+#[derive(SimpleObject, Clone, Debug, PartialEq, Eq)]
+pub struct Brand {
+    /// What `brandId` arguments take; `"default"` for the default brand.
+    pub brand_id: ID,
+    /// For the default brand, the business name (empty when not set yet).
+    pub name: String,
+    pub email: Option<String>,
+    pub phone: Option<String>,
+    pub address: Option<String>,
+    pub payment_details: Option<String>,
+    pub archived: bool,
+    pub is_default: bool,
+}
+
+impl From<db::Brand> for Brand {
+    fn from(b: db::Brand) -> Self {
+        Self {
+            brand_id: ID(b.id),
+            name: b.name,
+            email: b.email,
+            phone: b.phone,
+            address: b.address,
+            payment_details: b.payment_details,
+            archived: b.archived,
+            is_default: false,
+        }
+    }
+}
+
+/// The default brand, built from the instance's invoicing settings.
+pub(crate) fn default_brand(instance: &db::Instance) -> Brand {
+    Brand {
+        brand_id: ID(db::DEFAULT_BRAND_ID.to_string()),
+        name: instance.business_name.clone().unwrap_or_default(),
+        email: instance.business_email.clone(),
+        phone: instance.business_phone.clone(),
+        address: instance.business_address.clone(),
+        payment_details: instance.payment_details.clone(),
+        archived: false,
+        is_default: true,
+    }
+}
+
+/// The default brand, then every stored one.
+pub(crate) fn all_brands(instance: &db::Instance) -> Vec<Brand> {
+    std::iter::once(default_brand(instance))
+        .chain(instance.brands.iter().cloned().map(Brand::from))
+        .collect()
+}
+
+/// The brand `brand_id` names on `instance` — the default brand for `None`
+/// (and for an id the instance doesn't have).
+pub(crate) fn brand_for(instance: &db::Instance, brand_id: Option<&str>) -> Brand {
+    invoicing::brand::find(instance, brand_id)
+        .cloned()
+        .map(Brand::from)
+        .unwrap_or_else(|| default_brand(instance))
+}
+
+/// Resolve a row's brand through the dataloaded instance.
+pub(crate) async fn load_brand<A: App + HasDb + Send + Sync + 'static>(
+    ctx: &Context<'_>,
+    instance_id: &str,
+    brand_id: Option<&str>,
+) -> Result<Brand> {
+    let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+    let instance = loader
+        .load_one(InstanceId(ID(instance_id.to_string())))
+        .await
+        .map_err(|e| anyhow!("Failed to load instance via DataLoader: {}", e))?
+        .ok_or_else(|| anyhow!("Instance with ID {instance_id} missing"))?;
+    Ok(brand_for(&instance, brand_id))
+}
+
+/// Validate an optional `brandId` filter argument against `instance`.
+pub(crate) fn brand_filter_arg<'a>(
+    instance: &db::Instance,
+    brand_id: Option<&'a ID>,
+) -> Result<Option<db::BrandFilter<'a>>> {
+    brand_id
+        .map(|id| invoicing::brand::validate_filter(instance, id.as_str()))
+        .transpose()
+        .map_err(|e| anyhow!(e))
 }
 
 /// A saved broadcast sender — see `db::BroadcastSender`.
@@ -1814,6 +1935,10 @@ impl<A: App + HasDb + Send + Sync + 'static> Project<A> {
     async fn default_unit_price_cents(&self) -> Option<i64> {
         self.rec.default_unit_price_cents
     }
+    /// The brand this project's invoices go out under.
+    async fn brand(&self, ctx: &Context<'_>) -> Result<Brand> {
+        load_brand::<A>(ctx, &self.rec.instance_id, self.rec.brand_id.as_deref()).await
+    }
     /// What this project has invoiced, been paid, and cost — computed from
     /// every finalized invoice, expense and unbilled item on it. Reads all
     /// of them, so ask for it on one project at a time, not on a list.
@@ -2137,6 +2262,9 @@ impl From<invoicing::snapshot::InvoiceSnapshotBillTo> for InvoiceBillToInfo {
 #[derive(SimpleObject, Clone, Debug)]
 pub struct InvoiceSellerInfo {
     pub name: Option<String>,
+    /// The legal name, when the invoice went out under a brand with a
+    /// different name — printed "{legalName} trading as {name}".
+    pub legal_name: Option<String>,
     pub abn: Option<String>,
     pub address: Option<String>,
     pub phone: Option<String>,
@@ -2147,6 +2275,7 @@ impl From<invoicing::snapshot::InvoiceSnapshotSeller> for InvoiceSellerInfo {
     fn from(s: invoicing::snapshot::InvoiceSnapshotSeller) -> Self {
         Self {
             name: s.name,
+            legal_name: s.legal_name,
             abn: s.abn,
             address: s.address,
             phone: s.phone,
@@ -2293,6 +2422,22 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
     /// `YYYY-MM-DD`; `null` for a draft. Frozen at finalization.
     async fn due_date(&self) -> Option<&str> {
         self.rec.due_date.as_deref()
+    }
+    /// The brand it goes out under: its project's current brand while a
+    /// draft, fixed at finalization.
+    async fn brand(&self, ctx: &Context<'_>) -> Result<Brand> {
+        let brand_id = match self.rec.status {
+            db::InvoiceStatus::Finalized => self.rec.brand_id.clone(),
+            db::InvoiceStatus::Draft => {
+                let loader = ctx.data_unchecked::<DataLoader<DatabaseLoader<A>>>();
+                loader
+                    .load_one(ProjectId(ID(self.rec.project_id.clone())))
+                    .await
+                    .map_err(|e| anyhow!("Failed to load project via DataLoader: {}", e))?
+                    .and_then(|p| p.brand_id)
+            }
+        };
+        load_brand::<A>(ctx, &self.rec.instance_id, brand_id.as_deref()).await
     }
     /// Unpaid and past its due date, by today's UTC date.
     async fn overdue(&self) -> bool {
@@ -2593,6 +2738,9 @@ impl From<db::ExpenseCategory> for ExpenseCategoryType {
 #[derive(InputObject, Clone, Debug)]
 pub struct ExpenseInput {
     pub project_id: Option<ID>,
+    /// The brand this expense counts toward; omitted or `"default"` means
+    /// the default brand.
+    pub brand_id: Option<ID>,
     pub date: String,
     pub category: ExpenseCategoryType,
     pub description: Option<String>,
@@ -2645,6 +2793,15 @@ impl<A: App + HasDb + Send + Sync + 'static> Expense<A> {
     /// `YYYY-MM-DD`.
     async fn date(&self) -> &str {
         &self.rec.fields.date
+    }
+    /// The brand this expense counts toward.
+    async fn brand(&self, ctx: &Context<'_>) -> Result<Brand> {
+        load_brand::<A>(
+            ctx,
+            &self.rec.instance_id,
+            self.rec.fields.brand_id.as_deref(),
+        )
+        .await
     }
     async fn category(&self) -> ExpenseCategoryType {
         self.rec.fields.category.into()
@@ -3314,12 +3471,15 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
     /// error, `projectId` from another instance is `NOT_FOUND`, superusers
     /// get nothing. `category` narrows to one category.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    #[allow(clippy::too_many_arguments)]
     async fn expenses(
         &self,
         ctx: &Context<'_>,
         instance_id: ID,
         project_id: Option<ID>,
         category: Option<ExpenseCategoryType>,
+        #[graphql(desc = "Only this brand's (`\"default\"` for the default brand).")]
+        brand_id: Option<ID>,
         first: Option<i32>,
         after: Option<String>,
     ) -> Result<Connection<String, Expense<A>, EmptyFields, EmptyFields>> {
@@ -3364,6 +3524,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .list_expenses(
                 scope,
                 category.map(Into::into),
+                brand_filter_arg(&instance, brand_id.as_ref())?,
                 db::ListExpensesPage {
                     after: after_cursor,
                     limit: fetch_limit,
@@ -3439,12 +3600,15 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
     /// rejected with a plain validation error, `projectId` from another
     /// instance is `NOT_FOUND`, superusers get nothing.
     #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    #[allow(clippy::too_many_arguments)]
     async fn invoices(
         &self,
         ctx: &Context<'_>,
         instance_id: ID,
         project_id: Option<ID>,
         #[graphql(default_with = "InvoiceFilterType::All")] filter: InvoiceFilterType,
+        #[graphql(desc = "Only this brand's (`\"default\"` for the default brand).")]
+        brand_id: Option<ID>,
         first: Option<i32>,
         after: Option<String>,
     ) -> Result<Connection<String, Invoice<A>, EmptyFields, EmptyFields>> {
@@ -3489,6 +3653,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .list_invoices(
                 scope,
                 filter.to_db(&invoicing::today_utc()),
+                brand_filter_arg(&instance, brand_id.as_ref())?,
                 db::ListInvoicesPage {
                     after: after_cursor,
                     limit: fetch_limit,
@@ -3549,6 +3714,8 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         ctx: &Context<'_>,
         instance_id: ID,
         invoice_id: Option<ID>,
+        #[graphql(desc = "Only this brand's (`\"default\"` for the default brand).")]
+        brand_id: Option<ID>,
         first: Option<i32>,
         after: Option<String>,
     ) -> Result<Connection<String, CreditNote<A>, EmptyFields, EmptyFields>> {
@@ -3589,6 +3756,7 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .db()
             .list_credit_notes(
                 scope,
+                brand_filter_arg(&instance, brand_id.as_ref())?,
                 db::ListCreditNotesPage {
                     after: after_cursor,
                     limit: fetch_limit,
@@ -3641,22 +3809,30 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         from: String,
         to: String,
         basis: ReportBasisType,
+        #[graphql(desc = "Only this brand's (`\"default\"` for the default brand).")]
+        brand_id: Option<ID>,
     ) -> Result<GstReport> {
         let app = ctx.data_unchecked::<Arc<A>>();
         let instance = require_invoicing_instance(&**app, &instance_id).await?;
         let (from, to) = validate_report_range(&from, &to)?;
-        let invoices = app
+        let brand = brand_filter_arg(&instance, brand_id.as_ref())?;
+        let mut invoices = app
             .db()
             .list_all_finalized_invoices(db::InvoiceScope::Instance(&instance.id))
             .await?;
-        let credit_notes = app
+        let mut credit_notes = app
             .db()
             .list_all_credit_notes(db::CreditNoteScope::Instance(&instance.id))
             .await?;
-        let expenses = app
+        let mut expenses = app
             .db()
             .list_expenses_in_range(&instance.id, &from, &to)
             .await?;
+        if let Some(brand) = brand {
+            invoices.retain(|i| brand.matches(i.brand_id.as_deref()));
+            credit_notes.retain(|n| brand.matches(n.brand_id.as_deref()));
+            expenses.retain(|e| brand.matches(e.fields.brand_id.as_deref()));
+        }
         let summary = report::gst_summary(
             basis.into(),
             &from,
@@ -3691,13 +3867,19 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         &self,
         ctx: &Context<'_>,
         instance_id: ID,
+        #[graphql(desc = "Only this brand's (`\"default\"` for the default brand).")]
+        brand_id: Option<ID>,
     ) -> Result<ReceivablesReport<A>> {
         let app = ctx.data_unchecked::<Arc<A>>();
         let instance = require_invoicing_instance(&**app, &instance_id).await?;
-        let invoices = app
+        let brand = brand_filter_arg(&instance, brand_id.as_ref())?;
+        let mut invoices = app
             .db()
             .list_all_finalized_invoices(db::InvoiceScope::Instance(&instance.id))
             .await?;
+        if let Some(brand) = brand {
+            invoices.retain(|i| brand.matches(i.brand_id.as_deref()));
+        }
         let today = invoicing::today_utc();
         let (aging, outstanding) = report::aging(&invoices, &today);
         Ok(ReceivablesReport {
@@ -3722,10 +3904,14 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
         kind: CsvExportType,
         from: String,
         to: String,
+        #[graphql(desc = "Only this brand's (`\"default\"` for the default brand).")]
+        brand_id: Option<ID>,
     ) -> Result<String> {
         let app = ctx.data_unchecked::<Arc<A>>();
         let instance = require_invoicing_instance(&**app, &instance_id).await?;
         let (from, to) = validate_report_range(&from, &to)?;
+        let brand = brand_filter_arg(&instance, brand_id.as_ref())?;
+        let in_brand = |row_brand: Option<&str>| brand.is_none_or(|b| b.matches(row_brand));
         let projects: std::collections::HashMap<String, db::Project> = app
             .db()
             .list_projects_by_instance(&instance.id)
@@ -3735,10 +3921,11 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
             .collect();
         Ok(match invoicing::csv::Export::from(kind) {
             invoicing::csv::Export::Expenses => {
-                let expenses = app
+                let mut expenses = app
                     .db()
                     .list_expenses_in_range(&instance.id, &from, &to)
                     .await?;
+                expenses.retain(|e| in_brand(e.fields.brand_id.as_deref()));
                 invoicing::csv::expenses(&expenses, &projects, &from, &to)
             }
             export => {
@@ -3746,18 +3933,24 @@ impl<A: App + HasDb + HasStorage + Send + Sync + 'static> QueryRoot<A> {
                     .db()
                     .list_all_finalized_invoices(db::InvoiceScope::Instance(&instance.id))
                     .await?;
+                let branded: Vec<db::Invoice> = invoices
+                    .iter()
+                    .filter(|i| in_brand(i.brand_id.as_deref()))
+                    .cloned()
+                    .collect();
                 match export {
                     invoicing::csv::Export::Invoices => {
-                        invoicing::csv::invoices(&invoices, &projects, &from, &to)
+                        invoicing::csv::invoices(&branded, &projects, &from, &to)
                     }
                     invoicing::csv::Export::Payments => {
-                        invoicing::csv::payments(&invoices, &projects, &from, &to)
+                        invoicing::csv::payments(&branded, &projects, &from, &to)
                     }
                     _ => {
-                        let notes = app
+                        let mut notes = app
                             .db()
                             .list_all_credit_notes(db::CreditNoteScope::Instance(&instance.id))
                             .await?;
+                        notes.retain(|n| in_brand(n.brand_id.as_deref()));
                         let numbers = invoices
                             .iter()
                             .filter_map(|i| i.number.map(|n| (i.id.clone(), format!("{n:03}"))))

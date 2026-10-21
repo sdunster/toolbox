@@ -1373,7 +1373,7 @@ async fn invoice_list_filters_and_paginates() {
     for _ in 0..2 {
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
         let inv = db
-            .create_invoice(&instance_id, &project_id, &items, &agent_id)
+            .create_invoice(&instance_id, &project_id, &items, &agent_id, None)
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1382,7 +1382,7 @@ async fn invoice_list_filters_and_paginates() {
     for _ in 0..3 {
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
         let inv = db
-            .create_invoice(&instance_id, &project_id, &items, &agent_id)
+            .create_invoice(&instance_id, &project_id, &items, &agent_id, None)
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1400,6 +1400,7 @@ async fn invoice_list_filters_and_paginates() {
                     total_cents: 0,
                     gst_cents: 0,
                     finalized_by_user_id: &agent_id,
+                    brand_id: None,
                 },
             )
             .await
@@ -1625,7 +1626,7 @@ mod db_level_conflicts {
         let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "staleversion").await;
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
         let invoice = db
-            .create_invoice(&instance_id, &project_id, &items, &agent_id)
+            .create_invoice(&instance_id, &project_id, &items, &agent_id, None)
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1671,6 +1672,7 @@ mod db_level_conflicts {
                     total_cents: 0,
                     gst_cents: 0,
                     finalized_by_user_id: &agent_id,
+                    brand_id: None,
                 },
             )
             .await
@@ -1697,6 +1699,7 @@ mod db_level_conflicts {
                     total_cents: 0,
                     gst_cents: 0,
                     finalized_by_user_id: &agent_id,
+                    brand_id: None,
                 },
             )
             .await
@@ -1711,7 +1714,13 @@ mod db_level_conflicts {
         let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "staleversion2").await;
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 2).await;
         let invoice = db
-            .create_invoice(&instance_id, &project_id, &[items[0].clone()], &agent_id)
+            .create_invoice(
+                &instance_id,
+                &project_id,
+                &[items[0].clone()],
+                &agent_id,
+                None,
+            )
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1745,6 +1754,7 @@ mod db_level_conflicts {
                     total_cents: 0,
                     gst_cents: 0,
                     finalized_by_user_id: &agent_id,
+                    brand_id: None,
                 },
             )
             .await

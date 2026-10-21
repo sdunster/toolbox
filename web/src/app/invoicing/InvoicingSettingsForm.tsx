@@ -76,6 +76,15 @@ export function InvoicingSettingsForm({
     ) {
       updateInvoicingSettings(instanceId: $instanceId, input: $input) {
         ...InvoicingSettingsForm_instance
+        # The business details are the default brand.
+        brands {
+          brandId
+          name
+          email
+          phone
+          address
+          paymentDetails
+        }
       }
     }
   `);

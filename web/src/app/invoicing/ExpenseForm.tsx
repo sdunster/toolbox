@@ -15,11 +15,15 @@ import {
   rateForDate,
   tripAmountCents,
 } from "../../lib/expenses";
+import { type BrandOption, DEFAULT_BRAND_ID } from "../../lib/brands";
+import { BrandSelect } from "./BrandSelect";
 
 /** What `createExpense`/`updateExpense` take as `input` — the fields the
  * chosen category doesn't use are sent as `null`. */
 export interface ExpenseFormValues {
   projectId: string | null;
+  /** `"default"` for the default brand. */
+  brandId: string;
   date: string;
   category: ExpenseCategory;
   description: string | null;
@@ -30,8 +34,16 @@ export interface ExpenseFormValues {
   distanceKm: string | null;
 }
 
+/** A project the expense form can pick, with the brand it brings along. */
+export interface ExpenseProjectOption {
+  readonly id: string;
+  readonly name: string;
+  readonly brand?: { readonly brandId: string } | null;
+}
+
 export interface ExpenseFormInitial {
   projectId: string | null;
+  brandId: string;
   date: string;
   category: ExpenseCategory;
   description: string;
@@ -57,13 +69,16 @@ export interface ExpenseFormInitial {
  *   counts.
  *
  * `projects` is the instance's project list for the "Project" picker; omit
- * it on a project's own page, where `initial.projectId` is fixed.
+ * it on a project's own page, where `initial.projectId` is fixed. `brands`
+ * feeds the "Brand" picker (hidden unless the instance has more than one);
+ * picking a project switches the brand to that project's.
  */
 export function ExpenseForm({
   idPrefix,
   currency,
   initial,
   projects,
+  brands,
   submitLabel,
   savingLabel,
   isSaving,
@@ -74,7 +89,8 @@ export function ExpenseForm({
   idPrefix: string;
   currency: string;
   initial: ExpenseFormInitial;
-  projects?: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  projects?: ReadonlyArray<ExpenseProjectOption>;
+  brands?: ReadonlyArray<BrandOption>;
   submitLabel: string;
   savingLabel: string;
   isSaving: boolean;
@@ -83,6 +99,7 @@ export function ExpenseForm({
   onCancel?: () => void;
 }) {
   const [projectId, setProjectId] = useState(initial.projectId);
+  const [brandId, setBrandId] = useState(initial.brandId);
   const [date, setDate] = useState(initial.date);
   const [category, setCategory] = useState<ExpenseCategory>(initial.category);
   const [description, setDescription] = useState(initial.description);
@@ -119,6 +136,7 @@ export function ExpenseForm({
       setFieldError(null);
       onSubmit({
         projectId,
+        brandId,
         date,
         category,
         description: trimmedDescription,
@@ -145,6 +163,7 @@ export function ExpenseForm({
     setFieldError(null);
     onSubmit({
       projectId,
+      brandId,
       date,
       category,
       description: trimmedDescription,
@@ -189,7 +208,14 @@ export function ExpenseForm({
               id={id("project")}
               className={inputBase}
               value={projectId ?? ""}
-              onChange={(e) => setProjectId(e.target.value || null)}
+              onChange={(e) => {
+                const next = e.target.value || null;
+                setProjectId(next);
+                const project = projects.find((p) => p.id === next);
+                if (project) {
+                  setBrandId(project.brand?.brandId ?? DEFAULT_BRAND_ID);
+                }
+              }}
             >
               <option value="">No project</option>
               {projects.map((p) => (
@@ -201,6 +227,14 @@ export function ExpenseForm({
           </FormField>
         )}
       </div>
+
+      <BrandSelect
+        id={id("brand")}
+        brands={brands}
+        value={brandId}
+        current={initial.brandId}
+        onChange={setBrandId}
+      />
 
       {isTrip ? (
         <>

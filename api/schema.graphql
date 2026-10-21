@@ -173,6 +173,46 @@ enum BillableItemStatusType {
 	INVOICED
 }
 
+"""
+A name an invoicing instance issues invoices under — see `db::Brand`.
+The default brand (`isDefault`, id `"default"`) is the instance's own
+invoicing settings, edited through `updateInvoicingSettings`; any other
+brand's unset `email`/`phone`/`address`/`paymentDetails` fall back to
+those settings when an invoice is printed.
+
+Its id is `brandId`, not `id`: the default brand's id is `"default"` in
+every instance, so it must not be a client-cache key.
+"""
+type Brand {
+	"""
+	What `brandId` arguments take; `"default"` for the default brand.
+	"""
+	brandId: ID!
+	"""
+	For the default brand, the business name (empty when not set yet).
+	"""
+	name: String!
+	email: String
+	phone: String
+	address: String
+	paymentDetails: String
+	archived: Boolean!
+	isDefault: Boolean!
+}
+
+"""
+`addBrand`/`updateBrand`'s argument — full replace. `name` is required;
+every other field is optional, blank meaning "use the default brand's"
+(the instance's invoicing settings) when an invoice is printed.
+"""
+input BrandInput {
+	name: String!
+	email: String
+	phone: String
+	address: String
+	paymentDetails: String
+}
+
 type Broadcast {
 	id: ID!
 	fromAddress: String!
@@ -329,6 +369,11 @@ this project's invoices; `null` uses the instance's.
 this project gets when it doesn't name one.
 """
 input CreateProjectInput {
+	"""
+	The brand its invoices go out under; omitted or `"default"` means
+	the default brand.
+	"""
+	brandId: ID
 	name: String!
 	clientName: String!
 	clientAbn: String
@@ -363,6 +408,10 @@ type CreditNote {
 	"""
 	invoice: Invoice!
 	project: Project!
+	"""
+	The brand it was issued under — its invoice's.
+	"""
+	brand: Brand!
 	"""
 	"Adjustment Note" or "Credit Note".
 	"""
@@ -474,6 +523,10 @@ type Expense {
 	`YYYY-MM-DD`.
 	"""
 	date: String!
+	"""
+	The brand this expense counts toward.
+	"""
+	brand: Brand!
 	category: ExpenseCategoryType!
 	"""
 	Optional for a purchase; a trip's business purpose for `VEHICLE_KM`.
@@ -596,6 +649,11 @@ particular job.
 """
 input ExpenseInput {
 	projectId: ID
+	"""
+	The brand this expense counts toward; omitted or `"default"` means
+	the default brand.
+	"""
+	brandId: ID
 	date: String!
 	category: ExpenseCategoryType!
 	description: String
@@ -682,6 +740,13 @@ type Instance {
 	See [`InvoicingSettingsInfo`]'s doc comment.
 	"""
 	invoicingSettings: InvoicingSettingsInfo
+	"""
+	The names this invoicing instance issues under: the default brand
+	(its own invoicing settings, id `"default"`) first, then every
+	other brand in the order they were added, archived ones included.
+	Empty for a support instance. See CLAUDE.md's "Brands" entry.
+	"""
+	brands: [Brand!]!
 	publicSubmissionEnabled: Boolean!
 	fromName: String!
 	signature: String!
@@ -793,6 +858,11 @@ type Invoice {
 	`YYYY-MM-DD`; `null` for a draft. Frozen at finalization.
 	"""
 	dueDate: String
+	"""
+	The brand it goes out under: its project's current brand while a
+	draft, fixed at finalization.
+	"""
+	brand: Brand!
 	"""
 	Unpaid and past its due date, by today's UTC date.
 	"""
@@ -956,6 +1026,11 @@ The printed seller block — from the instance's business settings, per
 """
 type InvoiceSellerInfo {
 	name: String
+	"""
+	The legal name, when the invoice went out under a brand with a
+	different name — printed "{legalName} trading as {name}".
+	"""
+	legalName: String
 	abn: String
 	address: String
 	phone: String
@@ -1652,6 +1727,24 @@ type MutationRoot {
 	"""
 	updateInvoicingSettings(instanceId: ID!, input: InvoicingSettingsInput!): Instance!
 	"""
+	Add a brand — another name this invoicing instance issues under
+	(e.g. a registered business name beside the owner's legal name).
+	Owner-or-superuser, like `updateInvoicingSettings`: brands are
+	instance settings. At most `db::MAX_BRANDS`. Returns the instance,
+	so a client's cached `brands` updates in place. See CLAUDE.md's
+	"Brands" entry.
+	"""
+	addBrand(instanceId: ID!, input: BrandInput!): Instance!
+	"""
+	Full-replace a brand, including `archived` (default `false`). An
+	archived brand can't be chosen for a new project or expense but
+	still appears in filters; there is no delete. The default brand
+	(`"default"`) is the instance's invoicing settings — change it with
+	`updateInvoicingSettings`. Changing a brand changes drafts and
+	future invoices, never a finalized one.
+	"""
+	updateBrand(instanceId: ID!, brandId: ID!, input: BrandInput!, archived: Boolean! = false): Instance!
+	"""
 	Create a project in an invoicing instance. Member (owner or agent) —
 	managing projects/items/draft invoices is day-to-day work, not an
 	owner-only setting, per CLAUDE.md's "Invoicing" house rule. Rejects a
@@ -2019,6 +2112,10 @@ type Project {
 	"""
 	defaultUnitPriceCents: Int
 	"""
+	The brand this project's invoices go out under.
+	"""
+	brand: Brand!
+	"""
 	What this project has invoiced, been paid, and cost — computed from
 	every finalized invoice, expense and unbilled item on it. Reads all
 	of them, so ask for it on one project at a time, not on a list.
@@ -2169,7 +2266,12 @@ type QueryRoot {
 	error, `projectId` from another instance is `NOT_FOUND`, superusers
 	get nothing. `category` narrows to one category.
 	"""
-	expenses(instanceId: ID!, projectId: ID, category: ExpenseCategoryType, first: Int, after: String): ExpenseConnection!
+	expenses(		instanceId: ID!,		projectId: ID,		category: ExpenseCategoryType,
+		"""
+		Only this brand's (`"default"` for the default brand).
+		"""
+		brandId: ID,		first: Int,		after: String
+	): ExpenseConnection!
 	"""
 	The caller's own cents-per-km trips in `instanceId` for one
 	financial year (`financialYear` is the year it starts in; defaults to
@@ -2187,7 +2289,12 @@ type QueryRoot {
 	rejected with a plain validation error, `projectId` from another
 	instance is `NOT_FOUND`, superusers get nothing.
 	"""
-	invoices(instanceId: ID!, projectId: ID, filter: InvoiceFilterType! = ALL, first: Int, after: String): InvoiceConnection!
+	invoices(		instanceId: ID!,		projectId: ID,		filter: InvoiceFilterType! = ALL,
+		"""
+		Only this brand's (`"default"` for the default brand).
+		"""
+		brandId: ID,		first: Int,		after: String
+	): InvoiceConnection!
 	"""
 	Fetch a single invoice by id. Reachable only by a member of its
 	(invoicing) instance — missing, wrong instance, and belonging to a
@@ -2204,7 +2311,12 @@ type QueryRoot {
 	invoice's when `invoiceId` is given — as a Relay connection, newest
 	first. Same posture as [`Self::invoices`].
 	"""
-	creditNotes(instanceId: ID!, invoiceId: ID, first: Int, after: String): CreditNoteConnection!
+	creditNotes(		instanceId: ID!,		invoiceId: ID,
+		"""
+		Only this brand's (`"default"` for the default brand).
+		"""
+		brandId: ID,		first: Int,		after: String
+	): CreditNoteConnection!
 	"""
 	One credit note by id — `null` for missing, not-yours and a support
 	instance alike, like [`Self::invoice`].
@@ -2218,13 +2330,23 @@ type QueryRoot {
 	`invoicing::report::gst_summary` for exactly how each basis counts.
 	Member; a support instance is rejected.
 	"""
-	gstReport(instanceId: ID!, from: String!, to: String!, basis: ReportBasisType!): GstReport!
+	gstReport(		instanceId: ID!,		from: String!,		to: String!,		basis: ReportBasisType!,
+		"""
+		Only this brand's (`"default"` for the default brand).
+		"""
+		brandId: ID
+	): GstReport!
 	"""
 	Aged receivables: every finalized invoice with a balance owing,
 	bucketed by days past due as of today (UTC). Member; a support
 	instance is rejected.
 	"""
-	receivables(instanceId: ID!): ReceivablesReport!
+	receivables(		instanceId: ID!,
+		"""
+		Only this brand's (`"default"` for the default brand).
+		"""
+		brandId: ID
+	): ReceivablesReport!
 	"""
 	A CSV export for `from..=to` (`YYYY-MM-DD`, at most 2 years apart):
 	finalized invoices by issue date, credit notes by issue date,
@@ -2232,7 +2354,12 @@ type QueryRoot {
 	text itself; the web app saves it as a file. Member; a support
 	instance is rejected. See `invoicing::csv`.
 	"""
-	invoicingExport(instanceId: ID!, kind: CsvExportType!, from: String!, to: String!): String!
+	invoicingExport(		instanceId: ID!,		kind: CsvExportType!,		from: String!,		to: String!,
+		"""
+		Only this brand's (`"default"` for the default brand).
+		"""
+		brandId: ID
+	): String!
 	"""
 	Every instance, **including soft-deleted ones**, sorted by name — the
 	admin instance list. Superuser-only; unlike every other way an
@@ -2570,6 +2697,11 @@ type UndeliverableEmail {
 omitted optional field is cleared.
 """
 input UpdateProjectInput {
+	"""
+	Omitted or `"default"` means the default brand. Moving a project to
+	another brand changes its drafts, never a finalized invoice.
+	"""
+	brandId: ID
 	name: String!
 	clientName: String!
 	clientAbn: String

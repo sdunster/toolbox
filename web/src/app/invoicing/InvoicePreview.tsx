@@ -17,6 +17,7 @@ const invoicePreviewFragment = graphql`
     reference
     seller {
       name
+      legalName
       abn
       address
       phone
@@ -145,6 +146,11 @@ export function InvoicePreview({
             <div>
               <p className="font-bold">ABN</p>
               <p>{data.seller.abn}</p>
+              {data.seller.legalName && data.seller.name && (
+                <p>
+                  {data.seller.legalName} trading as {data.seller.name}
+                </p>
+              )}
             </div>
           )}
         </div>

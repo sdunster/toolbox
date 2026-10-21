@@ -17,7 +17,9 @@ use crate::invoicing::{self, report};
 
 use super::ProjectId;
 use super::dataloader::DatabaseLoader;
-use super::query::{Invoice, InvoiceBillToInfo, InvoiceLineInfo, InvoiceSellerInfo, Project};
+use super::query::{
+    Brand, Invoice, InvoiceBillToInfo, InvoiceLineInfo, InvoiceSellerInfo, Project, load_brand,
+};
 
 /// One payment received against an invoice.
 #[derive(SimpleObject, Clone, Debug)]
@@ -153,6 +155,10 @@ impl<A: App + HasDb + Send + Sync + 'static> CreditNote<A> {
             .map_err(|e| anyhow!("Failed to load project via DataLoader: {}", e))?
             .map(Project::new)
             .ok_or_else(|| anyhow!("Project with ID {} missing", self.rec.project_id))
+    }
+    /// The brand it was issued under — its invoice's.
+    async fn brand(&self, ctx: &Context<'_>) -> Result<Brand> {
+        load_brand::<A>(ctx, &self.rec.instance_id, self.rec.brand_id.as_deref()).await
     }
     /// "Adjustment Note" or "Credit Note".
     async fn title(&self) -> Result<String> {

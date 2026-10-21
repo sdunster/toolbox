@@ -282,6 +282,7 @@ mod tests {
             credited_gst_cents: 0,
             sent_at: None,
             sent_to: vec![],
+            brand_id: None,
         }
     }
 
@@ -314,6 +315,7 @@ mod tests {
             pdf_s3_key: None,
             sent_at: None,
             sent_to: vec![],
+            brand_id: None,
         }
     }
 
@@ -323,6 +325,7 @@ mod tests {
             instance_id: "i".into(),
             fields: db::ExpenseFields {
                 project_id: None,
+                brand_id: None,
                 date: date.into(),
                 category: db::ExpenseCategory::Materials,
                 description: None,

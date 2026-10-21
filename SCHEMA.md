@@ -77,6 +77,11 @@ instance record, so projecting more into the index would just be wasted storage.
   (`db::BroadcastSender` — `{id, name, address}`), at most 20, absent when empty. Written whole by
   `set_broadcast_senders`, conditioned on the stored string still being the one the caller read
   (or absent), so concurrent edits fail with `CONFLICT` instead of losing one.
+- `brands` (S) — invoicing instances only: JSON list of the instance's extra brands (`db::Brand` —
+  `{id, name, email?, phone?, address?, payment_details?, archived?}`, `archived` only ever `true`),
+  at most `db::MAX_BRANDS` (20), absent when empty. The invoicing settings above are the default
+  brand and are not in it. Written whole by `set_brands`, conditioned exactly like
+  `broadcast_senders`. See CLAUDE.md's "Brands" entry.
 - `deleted` (Bool) — soft-delete marker, same omit convention: only ever
   written `true`; absent means active. Set/cleared only via
   `InstanceUpdateShape::SetDeleted` (`setInstanceDeleted`/`bin/cli.rs`'s
@@ -526,6 +531,9 @@ user-generated table, and every field is rendered directly from the list.
   project's invoices.
 - `default_unit_price_cents` (N) — optional; the GST-exclusive rate a new billable item on this
   project gets when `createBillableItem` names no price.
+- `brand_id` (S) — optional; the `instance.brands` entry its invoices go out under. Absent means
+  the default brand (the instance's own settings). Changing it re-stamps the project's draft
+  invoices' `brand_id` (`set_draft_invoice_brand`), never a finalized one's.
 - `archived` (Bool) — only ever written `true`; absent means active, same omit convention as
   `instance.deleted`/`instance.gst_registered`. There is no delete in v1.
 - `created_at`, `updated_at` (N)
@@ -657,7 +665,7 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   digits (`invoicingSettings`'s convention; it simply grows past 999).
 - `issue_date` (S) — optional; `YYYY-MM-DD`. Absent for a draft; set once, at finalization, never
   changed afterward.
-- `snapshot` (S) — optional; JSON (`invoicing::snapshot::InvoiceSnapshot`, `schema_version: 1`).
+- `snapshot` (S) — optional; JSON (`invoicing::snapshot::InvoiceSnapshot`, see `schema_version` below).
   Absent for a draft (whose printable content is instead built live,
   `invoicing::snapshot::build_snapshot`, from the project/instance/items as they currently stand).
   Set once, at finalization, and never touched again — this is the entire mechanism behind "a
@@ -689,11 +697,19 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
 - `credited_cents`, `credited_gst_cents` (N) — optional (absent = 0); the GST-inclusive total and
   GST of every credit note against this invoice, `ADD`ed by `create_credit_note`'s transaction.
 - `sent_at` (N), `sent_to` (SS) — optional; when `sendInvoice` last mailed it, and to whom.
+- `brand_id` (S) — optional (absent = the default brand); the brand it goes out under, copied from
+  its project. Written when the draft is created, re-stamped by `set_draft_invoice_brand`
+  (conditioned `status = draft`) whenever the project changes brand, and stamped once more by
+  `finalize_invoice` in the same write as the snapshot — after which it never changes. It's what
+  `invoices(brandId:)` filters on (a `FilterExpression`); a draft's displayed brand is read live
+  from its project.
 
 **`paid_date` now means "settled"**: present exactly when `total_cents − credited_cents − Σ
 payments ≤ 0`, dated by whatever settled it — see CLAUDE.md's "Due dates, payments and credit
-notes" house rule. Snapshot `schema_version` is 2 (adds `due_date`, per-line `gst_free`, and the
-`credit_note` block a credit note's snapshot carries).
+notes" house rule. Snapshot `schema_version` 2 added `due_date`, per-line `gst_free`, and the
+`credit_note` block a credit note's snapshot carries; 3 adds `seller.legal_name`, set when the
+invoice went out under a brand whose name differs from the legal name. Older snapshots still parse
+(every added field is optional).
 
 **Attach/detach/finalize/delete use `TransactWriteItems`** (`Put`/`Update`/`Delete` items only — IAM has no
 `TransactWriteItems` action; each item is authorised by the existing `PutItem`/`UpdateItem`/
@@ -744,6 +760,8 @@ send; never deleted.
   rendered.
 - `sent_at` (N), `sent_to` (SS) — optional; the last `sendCreditNote`.
 - `created_by_user_id` (S), `created_at` (N)
+- `brand_id` (S) — optional (absent = the default brand); copied from its invoice's at issue,
+  never changed.
 
 Written by `create_credit_note` in one `TransactWriteItems` with the invoice's `Update` (`Put` +
 `Update`, no `ConditionCheck`, so the existing IAM grants cover it).
@@ -894,6 +912,9 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
   × rate / 10`) on read.
 - `description` (S) — optional for a purchase; required for a trip (its business purpose). ≤ 2000.
 - `project_id` (S) — optional; absent (never `Null`) when the expense isn't for a project.
+- `brand_id` (S) — optional (absent = the default brand); set directly, independent of the
+  project's (the web form just defaults to it). `expenses(brandId:)` filters on it with a
+  `FilterExpression`, ANDed with the category filter.
 - `billable_item_id` (S) — optional; the item `rebillExpense` made from it (see
   `billable_item.source_expense_id`). `delete_expense` is conditioned on its absence.
 - `receipt_s3_key`, `receipt_filename`, `receipt_content_type` (S), `receipt_size` (N) — optional,
@@ -1179,6 +1200,11 @@ not available on GSIs. This is expected to affect, once the relevant steps land:
   wrong — the reply is stored, just under the wrong ticket — but it produces a visible duplicate.
 - **`ticket_message.rfc_message_id-index`** — the same failure mode as above, for `In-Reply-To`/
   `References` threading of a fast follow-up reply.
+- **`invoice.project_id-created_at-index`** — `updateProject` finds the drafts to re-stamp with a
+  new brand through this index, so a draft created in the same instant as the brand change (or by a
+  `createInvoice` that read the project just before it) can keep the old `brand_id`. Only the
+  `invoices(brandId:)` filter is affected — the draft still *shows* its project's brand, and
+  finalization stamps the right one — and the next brand change, or finalizing, corrects it.
 
 Primary-table reads (`GetItem`, `BatchGetItem`) use strongly consistent reads by default, so
 entity fetches by id are reliable; only the GSI-mediated resolution steps above carry this risk.

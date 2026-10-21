@@ -3,7 +3,8 @@
 //!
 //!   - the whole lifecycle: project -> billable items -> draft invoice -> finalize
 //!     (needs a business name; strictly final afterwards) -> paid -> PDF link;
-//!   - draft editing (add/remove/delete) and `update_project`'s merge semantics;
+//!   - draft editing (add/remove/delete) and `update_project`'s merge semantics,
+//!     including keeping a project's brand; `list_brands`;
 //!   - expenses: a purchase and a cents-per-km trip, update/delete, and the
 //!     caller's financial-year km summary;
 //!   - the boundaries: a superuser without a membership sees nothing (and
@@ -953,4 +954,71 @@ async fn payments_credit_notes_sending_and_reports() {
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn brands_are_listed_and_update_project_keeps_the_brand() {
+    let Some(w) = world().await else { return };
+    let t = &w.member_token;
+    set_business_name(&w).await;
+    let brand = db::Brand {
+        id: format!("brand-{}", nanoid::nanoid!(8)),
+        name: "Positive Rate".into(),
+        email: None,
+        phone: None,
+        address: None,
+        payment_details: None,
+        archived: false,
+    };
+    assert!(
+        w.f.db()
+            .set_brands(&w.instance, &[], std::slice::from_ref(&brand))
+            .await
+            .unwrap()
+    );
+
+    let listed = call_tool(&w.f, t, "list_brands", json!({"instanceId": w.instance}))
+        .await
+        .unwrap();
+    let names: Vec<&str> = listed["brands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Fictional Trading Co", "Positive Rate"]);
+    assert_eq!(listed["brands"][0]["brandId"], "default");
+
+    let p = call_tool(
+        &w.f,
+        t,
+        "create_project",
+        json!({"instanceId": w.instance, "name": "Branded", "clientName": "Acme Pty Ltd",
+               "brandId": brand.id}),
+    )
+    .await
+    .unwrap();
+    let pid = p["project"]["id"].as_str().unwrap().to_string();
+    assert_eq!(p["project"]["brand"]["brandId"], brand.id.as_str());
+
+    // An update that doesn't mention the brand keeps it...
+    let p = call_tool(
+        &w.f,
+        t,
+        "update_project",
+        json!({"id": pid, "reference": "PO-9"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p["project"]["brand"]["brandId"], brand.id.as_str());
+    // ...and "default" moves it back.
+    let p = call_tool(
+        &w.f,
+        t,
+        "update_project",
+        json!({"id": pid, "brandId": "default"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(p["project"]["brand"]["brandId"], "default");
 }

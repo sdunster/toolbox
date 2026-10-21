@@ -10,6 +10,8 @@ import TextInput from "../../components/ui/TextInput";
 import { inputBase } from "../../components/ui/inputStyles";
 import { ProjectBillingFields } from "./ProjectBillingFields";
 import { billingInput, initialBillingValues } from "../../lib/projectBilling";
+import { DEFAULT_BRAND_ID } from "../../lib/brands";
+import { InstanceBrandSelect } from "./BrandSelect";
 
 /**
  * Create a project in the selected invoicing instance, then go straight to
@@ -18,7 +20,13 @@ import { billingInput, initialBillingValues } from "../../lib/projectBilling";
  * updater is needed here. Blank optional fields are sent as-is; the API
  * trims them and omits the attribute.
  */
-export function CreateProjectForm({ instanceId }: { instanceId: string }) {
+export function CreateProjectForm({
+  instanceId,
+  slug,
+}: {
+  instanceId: string;
+  slug: string;
+}) {
   const navigate = useNavigate();
   const [name, setName] = useState("");
   const [clientName, setClientName] = useState("");
@@ -26,6 +34,7 @@ export function CreateProjectForm({ instanceId }: { instanceId: string }) {
   const [clientAddress, setClientAddress] = useState("");
   const [reference, setReference] = useState("");
   const [billing, setBilling] = useState(() => initialBillingValues());
+  const [brandId, setBrandId] = useState(DEFAULT_BRAND_ID);
   const [error, setError] = useState<string | null>(null);
 
   const [commit, isSaving] = useMutation<CreateProjectFormMutation>(graphql`
@@ -58,6 +67,7 @@ export function CreateProjectForm({ instanceId }: { instanceId: string }) {
           clientAddress: clientAddress.trim(),
           reference: reference.trim(),
           ...parsed.input,
+          brandId,
         },
       },
       onCompleted: (data) => {
@@ -119,6 +129,13 @@ export function CreateProjectForm({ instanceId }: { instanceId: string }) {
             placeholder="e.g. the site address"
           />
         </FormField>
+        <InstanceBrandSelect
+          slug={slug}
+          id="new-project-brand"
+          value={brandId}
+          onChange={setBrandId}
+          help="The name this project's invoices are issued under."
+        />
         <ProjectBillingFields
           idPrefix="new-project"
           values={billing}

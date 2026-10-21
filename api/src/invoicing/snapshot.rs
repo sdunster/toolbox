@@ -10,7 +10,8 @@
 //! to branch on old rows without a migration. Version 2 added `due_date`,
 //! per-line `gst_free`, and the `credit_note` block — a credit note is the
 //! same printable shape with that block set (see
-//! [`build_credit_note_snapshot`]).
+//! [`build_credit_note_snapshot`]). Version 3 added `seller.legal_name`, for
+//! an invoice issued under a brand (`invoicing::brand`).
 
 use serde::{Deserialize, Serialize};
 
@@ -18,11 +19,15 @@ use crate::db;
 use crate::invoicing::money;
 
 /// The current snapshot shape.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct InvoiceSnapshotSeller {
     pub name: Option<String>,
+    /// The seller's legal name, when the invoice went out under a brand
+    /// with a different name — printed as "{legal_name} trading as {name}".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legal_name: Option<String>,
     pub abn: Option<String>,
     pub address: Option<String>,
     pub phone: Option<String>,
@@ -124,7 +129,8 @@ pub struct InvoiceSnapshot {
 ///
 /// - `title`: "Tax Invoice" iff `instance.gst_registered`, else "Invoice".
 /// - `display_number`: `number` zero-padded to 3 digits, or `None`.
-/// - `seller`: the instance's business settings, verbatim.
+/// - `seller`/`payment_details`: the instance's business settings, with the
+///   project's brand's overrides applied (`invoicing::brand::resolve`).
 /// - `bill_to`/`reference`: the project's client name/ABN/address and
 ///   reference, verbatim.
 /// - `lines`: `items` sorted by `date`, then `created_at` (the tie-break
@@ -134,8 +140,7 @@ pub struct InvoiceSnapshot {
 /// - `gst_cents`: `invoicing::money::gst_cents(subtotal_cents)` when
 ///   GST-registered, else `0`.
 /// - `total_cents`: `subtotal_cents + gst_cents`.
-/// - `payment_details`/`currency`: the instance's, verbatim
-///   (`currency_or_default` for the latter).
+/// - `currency`: the instance's (`currency_or_default`) — never per brand.
 /// - `no_gst_note`: `!gst_registered`.
 pub fn build_snapshot(
     instance: &db::Instance,
@@ -170,6 +175,7 @@ pub fn build_snapshot(
         .collect();
 
     let (subtotal_cents, gst_cents, total_cents) = totals(&lines, gst_registered);
+    let seller = crate::invoicing::brand::resolve(instance, project.brand_id.as_deref());
 
     InvoiceSnapshot {
         schema_version: SCHEMA_VERSION,
@@ -177,11 +183,12 @@ pub fn build_snapshot(
         display_number: number.map(|n| format!("{n:03}")),
         issue_date: issue_date.map(str::to_string),
         seller: InvoiceSnapshotSeller {
-            name: instance.business_name.clone(),
+            name: seller.name,
+            legal_name: seller.legal_name,
             abn: instance.business_abn.clone(),
-            address: instance.business_address.clone(),
-            phone: instance.business_phone.clone(),
-            email: instance.business_email.clone(),
+            address: seller.address,
+            phone: seller.phone,
+            email: seller.email,
         },
         bill_to: InvoiceSnapshotBillTo {
             name: project.client_name.clone(),
@@ -195,7 +202,7 @@ pub fn build_snapshot(
         subtotal_cents,
         gst_cents,
         total_cents,
-        payment_details: instance.payment_details.clone(),
+        payment_details: seller.payment_details,
         due_date: due_date.map(str::to_string),
         credit_note: None,
         no_gst_note: !gst_registered,
@@ -316,6 +323,7 @@ mod tests {
             currency: None,
             payment_terms_days: None,
             broadcast_senders: Vec::new(),
+            brands: Vec::new(),
         }
     }
 
@@ -331,6 +339,7 @@ mod tests {
             client_email: None,
             payment_terms_days: None,
             default_unit_price_cents: None,
+            brand_id: None,
             archived: false,
             created_at: 0,
             updated_at: 0,
@@ -481,6 +490,61 @@ mod tests {
     }
 
     #[test]
+    fn a_brand_changes_the_seller_but_not_the_abn() {
+        let mut instance = fictional_instance(true);
+        instance.brands = vec![db::Brand {
+            id: "b1".into(),
+            name: "Positive Rate".into(),
+            email: Some("hello@positiverate.example".into()),
+            phone: None,
+            address: None,
+            payment_details: Some("Pay Positive Rate".into()),
+            archived: false,
+        }];
+        let mut project = fictional_project();
+        project.brand_id = Some("b1".into());
+        let snap = build_snapshot(&instance, &project, &[], None, None, None);
+        assert_eq!(snap.seller.name.as_deref(), Some("Positive Rate"));
+        assert_eq!(
+            snap.seller.legal_name.as_deref(),
+            Some("Fictional Trades Pty Ltd")
+        );
+        assert_eq!(snap.seller.abn.as_deref(), Some("11 222 333 444"));
+        assert_eq!(
+            snap.seller.email.as_deref(),
+            Some("hello@positiverate.example")
+        );
+        assert_eq!(snap.seller.phone.as_deref(), Some("0400 000 000"));
+        assert_eq!(snap.payment_details.as_deref(), Some("Pay Positive Rate"));
+
+        // The default brand prints exactly what it always did.
+        let snap = build_snapshot(&instance, &fictional_project(), &[], None, None, None);
+        assert_eq!(
+            snap.seller.name.as_deref(),
+            Some("Fictional Trades Pty Ltd")
+        );
+        assert_eq!(snap.seller.legal_name, None);
+        assert!(!serde_json::to_string(&snap).unwrap().contains("legal_name"));
+    }
+
+    #[test]
+    fn a_v2_snapshot_still_deserializes() {
+        let snap = build_snapshot(
+            &fictional_instance(true),
+            &fictional_project(),
+            &[],
+            Some(1),
+            Some("2026-08-19"),
+            Some("2026-09-02"),
+        );
+        let mut json: serde_json::Value = serde_json::to_value(&snap).unwrap();
+        json["schema_version"] = 2.into();
+        let old: InvoiceSnapshot = serde_json::from_value(json).expect("v2 parses");
+        assert_eq!(old.seller.legal_name, None);
+        assert_eq!(old.seller.name, snap.seller.name);
+    }
+
+    #[test]
     fn snapshot_round_trips_through_json() {
         let instance = fictional_instance(true);
         let project = fictional_project();
@@ -496,7 +560,7 @@ mod tests {
         let json = serde_json::to_string(&snap).expect("serialize");
         let round_tripped: InvoiceSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(snap, round_tripped);
-        assert_eq!(round_tripped.schema_version, 2);
+        assert_eq!(round_tripped.schema_version, 3);
         assert_eq!(round_tripped.due_date.as_deref(), Some("2026-09-02"));
     }
 
