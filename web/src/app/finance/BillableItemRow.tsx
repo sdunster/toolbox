@@ -21,7 +21,9 @@ const billableItemRowFragment = graphql`
     id
     date
     description
+    kind
     quantity
+    unit
     unitPriceCents
     amountCents
     gstFree
@@ -216,9 +218,11 @@ export function BillableItemRow({
           idPrefix={`edit-${data.id}`}
           currency={currency}
           initial={{
+            kind: data.kind === "DISCOUNT" ? "DISCOUNT" : "CHARGE",
             date: data.date,
             description: data.description,
             quantity: data.quantity,
+            unit: data.unit ?? "",
             price: centsToInput(data.unitPriceCents),
             gstFree: data.gstFree,
           }}
@@ -298,19 +302,26 @@ export function BillableItemRow({
       </div>
 
       <div className="flex items-baseline justify-between gap-3 lg:contents">
-        <span className="flex items-baseline gap-1.5 text-sm text-ink-muted tabular-nums lg:contents">
-          <span className="lg:order-4 lg:text-right">
-            <span className="sr-only">Quantity </span>
-            {data.quantity}
+        {data.kind === "DISCOUNT" ? (
+          <span className="text-sm text-ink-muted lg:order-4 lg:col-span-2 lg:text-right">
+            Discount
           </span>
-          <span aria-hidden="true" className="lg:hidden">
-            ×
+        ) : (
+          <span className="flex items-baseline gap-1.5 text-sm text-ink-muted tabular-nums lg:contents">
+            <span className="lg:order-4 lg:text-right">
+              <span className="sr-only">Quantity </span>
+              {data.quantity}
+              {data.unit && ` ${data.unit}`}
+            </span>
+            <span aria-hidden="true" className="lg:hidden">
+              ×
+            </span>
+            <span className="lg:order-5 lg:text-right">
+              <span className="sr-only">Unit price </span>
+              {formatCents(data.unitPriceCents)}
+            </span>
           </span>
-          <span className="lg:order-5 lg:text-right">
-            <span className="sr-only">Unit price </span>
-            {formatCents(data.unitPriceCents)}
-          </span>
-        </span>
+        )}
         <span className="text-sm font-medium text-ink-strong tabular-nums lg:order-6 lg:text-right">
           <span className="sr-only">Amount </span>
           {formatCents(data.amountCents)}

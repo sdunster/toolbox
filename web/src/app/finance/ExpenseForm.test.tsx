@@ -42,6 +42,8 @@ describe("ExpenseForm", () => {
       supplier: "Fictional Hardware",
       amountCents: 11_000,
       gstCents: 1_000,
+      businessUsePercent: 100,
+      gstNotClaimable: false,
       distanceKm: null,
     });
 
@@ -107,8 +109,38 @@ describe("ExpenseForm", () => {
       supplier: null,
       amountCents: null,
       gstCents: null,
+      businessUsePercent: null,
+      gstNotClaimable: false,
       distanceKm: "12.5",
     });
+  });
+
+  it("sends business use and claimability, ticking it for entertainment", async () => {
+    const user = UserEvent.setup();
+    const onSubmit = renderForm();
+    await user.type(screen.getByLabelText("Supplier"), "Fictional Telco");
+    await user.type(screen.getByLabelText("Amount incl. GST (AUD)"), "110");
+    await user.type(screen.getByLabelText("Business use (%)"), "60");
+    expect(
+      screen.getByText(/claims 6\.00 AUD of GST \(60% business use\)/),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add expense" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        businessUsePercent: 60,
+        gstNotClaimable: false,
+      }),
+    );
+
+    await user.selectOptions(
+      screen.getByLabelText("Category"),
+      "MEALS_ENTERTAINMENT",
+    );
+    expect(screen.getByLabelText("GST can't be claimed")).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "Add expense" }));
+    expect(onSubmit).toHaveBeenLastCalledWith(
+      expect.objectContaining({ gstNotClaimable: true }),
+    );
   });
 
   it("shows a brand picker only with a second brand, following the project", async () => {

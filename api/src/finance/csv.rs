@@ -1,6 +1,6 @@
 //! CSV exports for an accountant: invoices, credit notes, payments and
 //! expenses over a date range. Pure — the caller reads the rows and the
-//! projects they name. See CLAUDE.md's "Reports" house rule.
+//! projects and clients they name ([`Directory`]). See CLAUDE.md's "Reports" house rule.
 //!
 //! Amounts are plain decimals (`1234.50`, no thousands separator, no
 //! currency symbol) so a spreadsheet reads them as numbers. Every free-text
@@ -58,20 +58,37 @@ fn in_range(date: &str, from: &str, to: &str) -> bool {
     date >= from && date <= to
 }
 
-fn project_cells(projects: &HashMap<String, db::Project>, id: Option<&str>) -> (String, String) {
-    match id.and_then(|id| projects.get(id)) {
-        Some(p) => (text(&p.name), text(&p.client_name)),
-        None => (String::new(), String::new()),
+/// The projects and clients the exported rows name, by id.
+#[derive(Clone, Debug, Default)]
+pub struct Directory {
+    pub projects: HashMap<String, db::Project>,
+    pub clients: HashMap<String, db::Client>,
+}
+
+impl Directory {
+    /// The project's name and its client's name, as cells.
+    fn project_cells(&self, id: Option<&str>) -> (String, String) {
+        match id.and_then(|id| self.projects.get(id)) {
+            Some(p) => {
+                let client = self
+                    .clients
+                    .get(&p.client_id)
+                    .map(|c| text(&c.fields.name))
+                    .unwrap_or_default();
+                (text(&p.name), client)
+            }
+            None => (String::new(), String::new()),
+        }
     }
 }
 
+/// An invoice's number as printed (blank for a draft, which isn't exported).
+fn invoice_number(inv: &db::Invoice) -> String {
+    text(inv.display_number.as_deref().unwrap_or(""))
+}
+
 /// Finalized invoices issued in `from..=to`, oldest first.
-pub fn invoices(
-    invoices: &[db::Invoice],
-    projects: &HashMap<String, db::Project>,
-    from: &str,
-    to: &str,
-) -> String {
+pub fn invoices(invoices: &[db::Invoice], directory: &Directory, from: &str, to: &str) -> String {
     let mut out = line(
         &[
             "Number",
@@ -85,7 +102,7 @@ pub fn invoices(
             "Credited",
             "Paid",
             "Balance",
-            "Paid date",
+            "Settled date",
         ]
         .map(String::from),
     );
@@ -105,9 +122,9 @@ pub fn invoices(
     for inv in rows {
         let total = inv.total_cents.unwrap_or(0);
         let gst = inv.gst_cents.unwrap_or(0);
-        let (project, client) = project_cells(projects, Some(&inv.project_id));
+        let (project, client) = directory.project_cells(Some(&inv.project_id));
         out.push_str(&line(&[
-            inv.number.map(|n| format!("{n:03}")).unwrap_or_default(),
+            invoice_number(inv),
             inv.issue_date.clone().unwrap_or_default(),
             inv.due_date.clone().unwrap_or_default(),
             project,
@@ -118,7 +135,7 @@ pub fn invoices(
             plain_cents(inv.credited_cents),
             plain_cents(inv.paid_cents()),
             plain_cents(inv.balance_cents()),
-            inv.paid_date.clone().unwrap_or_default(),
+            inv.settled_date.clone().unwrap_or_default(),
         ]));
     }
     out
@@ -129,7 +146,7 @@ pub fn invoices(
 pub fn credit_notes(
     notes: &[db::CreditNote],
     invoice_numbers: &HashMap<String, String>,
-    projects: &HashMap<String, db::Project>,
+    directory: &Directory,
     from: &str,
     to: &str,
 ) -> String {
@@ -157,9 +174,9 @@ pub fn credit_notes(
             .then(a.number.cmp(&b.number))
     });
     for note in rows {
-        let (project, client) = project_cells(projects, Some(&note.project_id));
+        let (project, client) = directory.project_cells(Some(&note.project_id));
         out.push_str(&line(&[
-            note.display_number(),
+            text(&note.display_number),
             note.issue_date.clone(),
             invoice_numbers
                 .get(&note.invoice_id)
@@ -177,12 +194,7 @@ pub fn credit_notes(
 }
 
 /// Every payment received in `from..=to`, oldest first.
-pub fn payments(
-    invoices: &[db::Invoice],
-    projects: &HashMap<String, db::Project>,
-    from: &str,
-    to: &str,
-) -> String {
+pub fn payments(invoices: &[db::Invoice], directory: &Directory, from: &str, to: &str) -> String {
     let mut out =
         line(&["Date", "Invoice", "Project", "Client", "Amount", "Note"].map(String::from));
     let mut rows: Vec<(&db::InvoicePayment, &db::Invoice)> = invoices
@@ -192,10 +204,10 @@ pub fn payments(
         .collect();
     rows.sort_by(|a, b| a.0.date.cmp(&b.0.date).then(a.1.number.cmp(&b.1.number)));
     for (p, inv) in rows {
-        let (project, client) = project_cells(projects, Some(&inv.project_id));
+        let (project, client) = directory.project_cells(Some(&inv.project_id));
         out.push_str(&line(&[
             p.date.clone(),
-            inv.number.map(|n| format!("{n:03}")).unwrap_or_default(),
+            invoice_number(inv),
             project,
             client,
             plain_cents(p.amount_cents),
@@ -206,12 +218,7 @@ pub fn payments(
 }
 
 /// Expenses dated `from..=to`, oldest first.
-pub fn expenses(
-    expenses: &[db::Expense],
-    projects: &HashMap<String, db::Project>,
-    from: &str,
-    to: &str,
-) -> String {
+pub fn expenses(expenses: &[db::Expense], directory: &Directory, from: &str, to: &str) -> String {
     let mut out = line(
         &[
             "Date",
@@ -222,6 +229,8 @@ pub fn expenses(
             "Amount",
             "GST",
             "Amount ex GST",
+            "Business use %",
+            "Claimable GST",
             "Distance (km)",
             "Rate (c/km)",
             "Re-billed",
@@ -252,16 +261,18 @@ pub fn expenses(
                 rate_cents_per_km.to_string(),
             ),
         };
-        let (project, _) = project_cells(projects, e.fields.project_id.as_deref());
+        let (project, _) = directory.project_cells(e.fields.project_id.as_deref());
         out.push_str(&line(&[
             e.fields.date.clone(),
             text(e.fields.category.label()),
             supplier,
             text(e.fields.description.as_deref().unwrap_or("")),
             project,
-            plain_cents(e.amount_cents()),
+            plain_cents(e.total_cents()),
             plain_cents(e.gst_cents()),
             plain_cents(e.amount_ex_gst_cents()),
+            e.business_use_percent().to_string(),
+            plain_cents(e.claimable_gst_cents()),
             distance,
             rate,
             if e.billable_item_id.is_some() {
@@ -308,19 +319,21 @@ mod tests {
                 description: Some("Timber, treated".into()),
                 detail: db::ExpenseDetail::Purchase {
                     supplier: "Hardware Co".into(),
-                    amount_cents: 11_000,
+                    total_cents: 11_000,
                     gst_cents: Some(1_000),
+                    business_use_percent: None,
+                    gst_not_claimable: false,
                 },
             },
             billable_item_id: rebilled.then(|| "item".to_string()),
-            receipt: None,
+            receipts: vec![],
             created_by_user_id: "u".into(),
             created_at: 0,
             updated_at: 0,
         };
         let csv = expenses(
             &[mk("2026-07-01", true), mk("2026-06-30", false)],
-            &HashMap::new(),
+            &Directory::default(),
             "2026-07-01",
             "2026-07-31",
         );
@@ -328,7 +341,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[1],
-            "2026-07-01,Materials & supplies,Hardware Co,\"Timber, treated\",,110.00,10.00,100.00,,,yes"
+            "2026-07-01,Materials & supplies,Hardware Co,\"Timber, treated\",,110.00,10.00,100.00,100,10.00,,,yes"
         );
     }
 }

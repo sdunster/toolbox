@@ -7,12 +7,14 @@ import type { InvoiceDraftPanelDeleteMutation } from "./__generated__/InvoiceDra
 import type { InvoiceDraftPanelFinalizeMutation } from "./__generated__/InvoiceDraftPanelFinalizeMutation.graphql";
 import type { InvoiceDraftPanelAddItemsQuery } from "./__generated__/InvoiceDraftPanelAddItemsQuery.graphql";
 import type { InvoiceDraftPanelAddItemsMutation } from "./__generated__/InvoiceDraftPanelAddItemsMutation.graphql";
+import type { InvoiceDraftPanelDetailsMutation } from "./__generated__/InvoiceDraftPanelDetailsMutation.graphql";
 import { useRetryableLazyLoadQuery } from "../../components/useRetryableLazyLoadQuery";
 import RelayErrorBoundary from "../../components/RelayErrorBoundary";
 import LoadingIndicator from "../../components/LoadingIndicator";
 import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
+import { inputBase } from "../../components/ui/inputStyles";
 import { relayMutationErrorMessage } from "../../lib/relayMutationError";
 import { addDays, formatDate, localToday } from "../../lib/dates";
 import { formatCents } from "../../lib/money";
@@ -28,9 +30,15 @@ const invoiceDraftPanelFragment = graphql`
   fragment InvoiceDraftPanel_invoice on Invoice {
     id
     currency
+    ownReference
+    notes
+    totalsProblem
     project {
       id
-      effectivePaymentTermsDays
+      reference
+      client {
+        effectivePaymentTermsDays
+      }
     }
     items {
       id
@@ -68,7 +76,9 @@ function AddInvoiceItemsPanel({
               id
               date
               description
+              kind
               quantity
+              unit
               unitPriceCents
               amountCents
             }
@@ -94,6 +104,7 @@ function AddInvoiceItemsPanel({
       ) {
         addInvoiceItems(invoiceId: $invoiceId, itemIds: $itemIds) {
           id
+          totalsProblem
           items {
             id
             ...BillableItemRow_item
@@ -148,8 +159,9 @@ function AddInvoiceItemsPanel({
                 </span>
               </div>
               <span className="text-ink-muted tabular-nums">
-                {item.quantity} × {formatCents(item.unitPriceCents)} ={" "}
-                {formatCents(item.amountCents)}
+                {item.kind === "DISCOUNT"
+                  ? `Discount ${formatCents(item.amountCents)}`
+                  : `${item.quantity}${item.unit ? ` ${item.unit}` : ""} × ${formatCents(item.unitPriceCents)} = ${formatCents(item.amountCents)}`}
               </span>
             </div>
           </li>
@@ -207,10 +219,35 @@ export function InvoiceDraftPanel({
   const [dueDateChoice, setDueDateChoice] = useState<string | null>(null);
   const defaultDueDate = addDays(
     issueDate,
-    data.project.effectivePaymentTermsDays,
+    data.project.client.effectivePaymentTermsDays,
   );
   const dueDate = dueDateChoice ?? defaultDueDate;
+  // Owner only, for importing an invoice under its original number.
+  const [number, setNumber] = useState("");
+  const [reference, setReference] = useState(data.ownReference ?? "");
+  const [notes, setNotes] = useState(data.notes ?? "");
+  const [detailsSaved, setDetailsSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const [commitDetails, isSavingDetails] =
+    useMutation<InvoiceDraftPanelDetailsMutation>(graphql`
+      mutation InvoiceDraftPanelDetailsMutation(
+        $invoiceId: ID!
+        $reference: String
+        $notes: String
+      ) {
+        updateInvoiceDetails(
+          invoiceId: $invoiceId
+          reference: $reference
+          notes: $notes
+        ) {
+          id
+          ownReference
+          notes
+          ...InvoicePreview_invoice
+        }
+      }
+    `);
 
   const [commitRemove] = useMutation<InvoiceDraftPanelRemoveMutation>(graphql`
     mutation InvoiceDraftPanelRemoveMutation(
@@ -219,6 +256,7 @@ export function InvoiceDraftPanel({
     ) {
       removeInvoiceItems(invoiceId: $invoiceId, itemIds: $itemIds) {
         id
+        totalsProblem
         items {
           id
           ...BillableItemRow_item
@@ -239,11 +277,13 @@ export function InvoiceDraftPanel({
         $invoiceId: ID!
         $issueDate: String!
         $dueDate: String
+        $number: Int
       ) {
         finalizeInvoice(
           invoiceId: $invoiceId
           issueDate: $issueDate
           dueDate: $dueDate
+          number: $number
         ) {
           id
           status
@@ -312,11 +352,33 @@ export function InvoiceDraftPanel({
     });
   }
 
+  function handleSaveDetails(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setDetailsSaved(false);
+    commitDetails({
+      variables: {
+        invoiceId: data.id,
+        reference: reference.trim(),
+        notes: notes.trim(),
+      },
+      onCompleted: () => setDetailsSaved(true),
+      onError: (err) =>
+        setError(relayMutationErrorMessage(err, "Failed to save details.")),
+    });
+  }
+
   function handleFinalize(e: React.FormEvent) {
     e.preventDefault();
     setError(null);
+    const trimmed = number.trim();
+    const explicit = trimmed === "" ? null : Number.parseInt(trimmed, 10);
+    if (explicit !== null && (Number.isNaN(explicit) || explicit < 1)) {
+      setError("The invoice number must be a whole number of 1 or more.");
+      return;
+    }
     commitFinalize({
-      variables: { invoiceId: data.id, issueDate, dueDate },
+      variables: { invoiceId: data.id, issueDate, dueDate, number: explicit },
       onCompleted: () => setShowFinalize(false),
       onError: (err) =>
         setError(relayMutationErrorMessage(err, "Failed to finalize invoice.")),
@@ -358,6 +420,54 @@ export function InvoiceDraftPanel({
         )}
       </section>
 
+      <form
+        onSubmit={handleSaveDetails}
+        className="flex flex-col gap-3 rounded-lg border border-line p-4"
+      >
+        <FormField label="Reference / PO number" htmlFor="invoice-reference">
+          <TextInput
+            id="invoice-reference"
+            value={reference}
+            onChange={(e) => setReference(e.target.value)}
+            maxLength={200}
+            placeholder={data.project.reference ?? "e.g. PO 1234"}
+          />
+          <p className="mt-1 text-xs text-ink-muted">
+            Printed instead of the project&apos;s reference
+            {data.project.reference ? ` (${data.project.reference})` : ""}.
+          </p>
+        </FormField>
+        <FormField label="Notes" htmlFor="invoice-notes">
+          <textarea
+            id="invoice-notes"
+            className={inputBase}
+            rows={3}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            maxLength={2000}
+          />
+          <p className="mt-1 text-xs text-ink-muted">
+            Printed above the payment details.
+          </p>
+        </FormField>
+        <div className="flex items-center gap-3">
+          <Button type="submit" variant="secondary" disabled={isSavingDetails}>
+            {isSavingDetails ? "Saving…" : "Save reference and notes"}
+          </Button>
+          {detailsSaved && (
+            <span className="text-sm text-green-700 dark:text-green-400">
+              Saved.
+            </span>
+          )}
+        </div>
+      </form>
+
+      {data.totalsProblem && (
+        <p role="status" className="text-sm text-amber-700 dark:text-amber-400">
+          {data.totalsProblem} — it can&apos;t be finalized like this.
+        </p>
+      )}
+
       <div className="flex flex-wrap gap-2">
         <Button variant="secondary" onClick={() => setShowAdd((v) => !v)}>
           {showAdd ? "Hide add items" : "Add items"}
@@ -391,7 +501,7 @@ export function InvoiceDraftPanel({
         )}
         <Button
           onClick={() => setShowFinalize((v) => !v)}
-          disabled={data.items.length === 0}
+          disabled={data.items.length === 0 || data.totalsProblem != null}
         >
           Finalize
         </Button>
@@ -436,13 +546,31 @@ export function InvoiceDraftPanel({
                 />
               </FormField>
               <p className="mt-1 text-xs text-ink-muted">
-                {data.project.effectivePaymentTermsDays} days&apos; terms by
-                default.
+                {data.project.client.effectivePaymentTermsDays} days&apos; terms
+                by default.
               </p>
             </div>
+            {isOwner && (
+              <div className="w-48">
+                <FormField label="Number (optional)" htmlFor="finalize-number">
+                  <TextInput
+                    id="finalize-number"
+                    type="number"
+                    min={1}
+                    value={number}
+                    onChange={(e) => setNumber(e.target.value)}
+                    placeholder="Next in sequence"
+                  />
+                </FormField>
+                <p className="mt-1 text-xs text-ink-muted">
+                  For importing an existing invoice under its original number.
+                </p>
+              </div>
+            )}
             <p className="text-sm text-amber-700 dark:text-amber-400">
-              Finalizing assigns the next invoice number and makes this invoice
-              read-only. This cannot be undone.
+              Finalizing assigns the next invoice number (or the one given) and
+              makes this invoice read-only. It prints today&apos;s business
+              settings and number format. This cannot be undone.
             </p>
             <div className="flex gap-2">
               <Button type="submit" disabled={isFinalizing}>

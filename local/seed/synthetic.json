@@ -517,15 +517,35 @@
         "created_at": { "N": "1735711200" }
       }
     ],
+    "client": [
+      {
+        "_comment": "A fictional client of the seeded finance instance, with every optional field set.",
+        "id": { "S": "SeedClient01" },
+        "instance_id": { "S": "SeedLedger01" },
+        "name": { "S": "Fictional Retail Pty Ltd" },
+        "abn": { "S": "55 666 777 888" },
+        "address": { "S": "22 Example Street\nExampleville" },
+        "email": { "S": "accounts@retail.example.com" },
+        "payment_terms_days": { "N": "30" },
+        "created_at": { "N": "1735689600" },
+        "updated_at": { "N": "1735689600" }
+      },
+      {
+        "_comment": "A second fictional client, with every optional field absent — exercises the null-field rendering path.",
+        "id": { "S": "SeedClient02" },
+        "instance_id": { "S": "SeedLedger01" },
+        "name": { "S": "Fictional Trades Co" },
+        "created_at": { "N": "1735693200" },
+        "updated_at": { "N": "1735693200" }
+      }
+    ],
     "project": [
       {
-        "_comment": "A fictional client/job on the seeded finance instance, with every optional field set.",
+        "_comment": "A fictional job on the seeded finance instance, with every optional field set.",
         "id": { "S": "SeedProj0001" },
         "instance_id": { "S": "SeedLedger01" },
+        "client_id": { "S": "SeedClient01" },
         "name": { "S": "Website Redesign" },
-        "client_name": { "S": "Fictional Retail Pty Ltd" },
-        "client_abn": { "S": "55 666 777 888" },
-        "client_address": { "S": "22 Example Street\nExampleville" },
         "reference": { "S": "Shopfront site" },
         "created_at": { "N": "1735689600" },
         "updated_at": { "N": "1735689600" }
@@ -534,8 +554,8 @@
         "_comment": "A second fictional project, with every optional field absent — exercises the null-field rendering path.",
         "id": { "S": "SeedProj0002" },
         "instance_id": { "S": "SeedLedger01" },
+        "client_id": { "S": "SeedClient02" },
         "name": { "S": "Monthly Bookkeeping" },
-        "client_name": { "S": "Fictional Trades Co" },
         "created_at": { "N": "1735693200" },
         "updated_at": { "N": "1735693200" }
       }
@@ -570,7 +590,7 @@
         "updated_at": { "N": "1786320000" }
       },
       {
-        "_comment": "A fractional quantity: 12.5 hours.",
+        "_comment": "A fractional quantity with a unit: 12.5 hours.",
         "id": { "S": "SeedItem0003" },
         "instance_id": { "S": "SeedLedger01" },
         "project_id": { "S": "SeedProj0001" },
@@ -578,6 +598,7 @@
         "description": { "S": "Front-end build" },
         "quantity_hundredths": { "N": "1250" },
         "unit_price_cents": { "N": "12500" },
+        "unit": { "S": "hrs" },
         "created_by_user_id": { "S": "SeedOwnerUsr" },
         "created_at": { "N": "1787097600" },
         "updated_at": { "N": "1787097600" }
@@ -642,6 +663,7 @@
         "status": { "S": "draft" },
         "version": { "N": "1" },
         "item_ids": { "SS": ["SeedItem0001", "SeedItem0002"] },
+        "list_key": { "S": "2026-08-20#draft#001787200000" },
         "created_by_user_id": { "S": "SeedOwnerUsr" },
         "created_at": { "N": "1787200000" },
         "updated_at": { "N": "1787200000" }

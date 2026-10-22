@@ -8,8 +8,10 @@ import {
   EXPENSE_CATEGORIES,
   VEHICLE_KM,
   type ExpenseCategory,
+  claimableGstCents,
   defaultGstCents,
   formatFinancialYear,
+  gstUsuallyNotClaimable,
   financialYearOf,
   parseDistanceToTenths,
   rateForDate,
@@ -17,6 +19,22 @@ import {
 } from "../../lib/expenses";
 import { type BrandOption, DEFAULT_BRAND_ID } from "../../lib/brands";
 import { BrandSelect } from "./BrandSelect";
+
+/** What the GST report will claim back, as a sentence for the form. */
+function claimablePreview(
+  gstCents: number | null,
+  businessUse: string,
+  notClaimable: boolean,
+  currency: string,
+): string {
+  if (gstCents === null) return "No GST to claim.";
+  const use = businessUse.trim() === "" ? 100 : Number(businessUse.trim());
+  if (!Number.isInteger(use) || use < 1 || use > 100) return "";
+  const claimable = claimableGstCents(gstCents, use, notClaimable);
+  return notClaimable
+    ? "None of the GST is claimed in the GST report."
+    : `The GST report claims ${formatCents(claimable)} ${currency} of GST${use < 100 ? ` (${use}% business use)` : ""}.`;
+}
 
 /** What `createExpense`/`updateExpense` take as `input` — the fields the
  * chosen category doesn't use are sent as `null`. */
@@ -30,6 +48,9 @@ export interface ExpenseFormValues {
   supplier: string | null;
   amountCents: number | null;
   gstCents: number | null;
+  /** `1..=100`; `null` for a trip (wholly business by definition). */
+  businessUsePercent: number | null;
+  gstNotClaimable: boolean;
   /** Sent as typed (trimmed) — the API is the one distance parser. */
   distanceKm: string | null;
 }
@@ -53,6 +74,10 @@ export interface ExpenseFormInitial {
   /** `null` with a non-blank `amount` means the expense is GST-free;
    * `undefined` means "not set yet" — pre-fill a eleventh of the amount. */
   gst: string | null | undefined;
+  /** As typed; `"100"` (or blank) means wholly for the business. */
+  businessUse: string;
+  /** `undefined` means "not chosen yet" — follow the category's default. */
+  gstNotClaimable: boolean | undefined;
   distanceKm: string;
 }
 
@@ -113,6 +138,14 @@ export function ExpenseForm({
   const [gstFree, setGstFree] = useState(
     initial.gst === null && initial.amount !== "",
   );
+  const [businessUse, setBusinessUse] = useState(initial.businessUse);
+  // `null` until the user ticks or unticks it — until then it follows the
+  // category (entertainment GST usually can't be claimed).
+  const [notClaimableChoice, setNotClaimableChoice] = useState<boolean | null>(
+    initial.gstNotClaimable ?? null,
+  );
+  const gstNotClaimable =
+    notClaimableChoice ?? gstUsuallyNotClaimable(category);
   const [distanceKm, setDistanceKm] = useState(initial.distanceKm);
   const [fieldError, setFieldError] = useState<string | null>(null);
 
@@ -143,6 +176,8 @@ export function ExpenseForm({
         supplier: null,
         amountCents: null,
         gstCents: null,
+        businessUsePercent: null,
+        gstNotClaimable: false,
         distanceKm: distanceKm.trim(),
       });
       return;
@@ -160,6 +195,11 @@ export function ExpenseForm({
       );
       return;
     }
+    const use = businessUse.trim() === "" ? 100 : Number(businessUse.trim());
+    if (!Number.isInteger(use) || use < 1 || use > 100) {
+      setFieldError("Business use must be a whole percentage from 1 to 100.");
+      return;
+    }
     setFieldError(null);
     onSubmit({
       projectId,
@@ -170,6 +210,8 @@ export function ExpenseForm({
       supplier: supplier.trim(),
       amountCents,
       gstCents,
+      businessUsePercent: use,
+      gstNotClaimable: gstFree ? false : gstNotClaimable,
       distanceKm: null,
     });
   }
@@ -336,6 +378,42 @@ export function ExpenseForm({
               GST-free
             </label>
           </div>
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-[10rem_1fr] sm:items-end">
+            <FormField label="Business use (%)" htmlFor={id("business-use")}>
+              <TextInput
+                id={id("business-use")}
+                type="number"
+                min={1}
+                max={100}
+                value={businessUse}
+                onChange={(e) => setBusinessUse(e.target.value)}
+                placeholder="100"
+              />
+            </FormField>
+            {!gstFree && (
+              <label className="col-span-2 flex items-center gap-2 text-sm text-ink sm:col-span-1 sm:pb-2">
+                <input
+                  type="checkbox"
+                  checked={gstNotClaimable}
+                  onChange={(e) => setNotClaimableChoice(e.target.checked)}
+                  className="size-4 rounded-sm border-line text-accent focus:ring-2 focus:ring-accent/25"
+                />
+                GST can&apos;t be claimed
+              </label>
+            )}
+          </div>
+          <p
+            className="-mt-2 text-xs text-ink-muted"
+            aria-live="polite"
+            data-testid={id("claimable")}
+          >
+            {claimablePreview(
+              gstFree ? null : parsePriceToCents(gstValue),
+              businessUse,
+              gstNotClaimable,
+              currency,
+            )}
+          </p>
           <FormField label="Notes (optional)" htmlFor={id("description")}>
             <TextInput
               id={id("description")}

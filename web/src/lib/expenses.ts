@@ -43,6 +43,23 @@ export function defaultGstCents(amountCents: number): number {
   return Math.round(amountCents / 11);
 }
 
+/** Categories whose GST usually can't be claimed back (entertainment) —
+ * the form ticks "GST can't be claimed" for these by default. */
+export function gstUsuallyNotClaimable(category: string): boolean {
+  return category === "MEALS_ENTERTAINMENT";
+}
+
+/** The GST the GST report claims for a purchase: none when it can't be
+ * claimed, else the business share (rounded half-up, as the API does). */
+export function claimableGstCents(
+  gstCents: number,
+  businessUsePercent: number,
+  notClaimable: boolean,
+): number {
+  if (notClaimable) return 0;
+  return Math.round((gstCents * businessUsePercent) / 100);
+}
+
 /** The ATO cap the running total is measured against. */
 export const ANNUAL_CAP_KM = 5_000;
 

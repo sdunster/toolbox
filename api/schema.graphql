@@ -58,15 +58,21 @@ type BillableItem {
 	"""
 	quantity: String!
 	"""
-	GST-exclusive, in cents.
+	GST-exclusive, in cents. For a discount, the (positive) amount it
+	takes off — the same value `BillableItemInput.unitPriceCents` took.
 	"""
 	unitPriceCents: Int!
 	"""
-	round-half-up(quantity × unit price), in cents — computed here, never
-	stored, so it can't drift from the two values it's derived from.
-	Can exceed 2^31 at the validation bounds (up to 10^15); it is
-	serialized as a JSON number, which a JS client holds exactly (it's
-	under 2^53).
+	What the quantity counts (`hrs`); `null` when unset.
+	"""
+	unit: String
+	kind: BillableItemKind!
+	"""
+	round-half-up(quantity × unit price), in cents, negative for a
+	discount — computed here, never stored, so it can't drift from the
+	two values it's derived from. Can exceed 2^31 at the validation
+	bounds (up to 10^15); it is serialized as a JSON number, which a JS
+	client holds exactly (it's under 2^53).
 	"""
 	amountCents: Int!
 	"""
@@ -151,6 +157,12 @@ Optional: omitted, a new item takes its project's
 update keeps the item's current price.
 - `gstFree`: no GST on this line even when the instance is
 GST-registered (e.g. a re-billed GST-free cost). Defaults to `false`.
+- `unit`: what the quantity counts (`hrs`, `ea`), ≤ 20 chars, printed
+after it. Blank means none.
+- `kind`: `CHARGE` (the default) or `DISCOUNT` — a fixed amount taken
+off the invoice: `quantity` must be `"1"`, `unitPriceCents` (required,
+above zero) is the amount off, and `unit` is refused. It reduces the
+GST-bearing subtotal unless `gstFree`.
 """
 input BillableItemInput {
 	date: String!
@@ -158,6 +170,16 @@ input BillableItemInput {
 	quantity: String!
 	unitPriceCents: Int
 	gstFree: Boolean! = false
+	unit: String
+	kind: BillableItemKind! = CHARGE
+}
+
+"""
+`BillableItem.kind`: an ordinary charge, or a fixed-amount discount.
+"""
+enum BillableItemKind {
+	CHARGE
+	DISCOUNT
 }
 
 """
@@ -359,28 +381,78 @@ type BroadcastSender {
 	address: String!
 }
 
+type Client {
+	id: ID!
+	name: String!
+	abn: String
+	address: String
+	"""
+	Where `sendInvoice` mails by default.
+	"""
+	email: String
+	"""
+	This client's own payment terms override; `null` means the
+	instance's apply — see `effectivePaymentTermsDays`.
+	"""
+	paymentTermsDays: Int
+	"""
+	The terms this client's invoices actually get: its own override,
+	else the instance's.
+	"""
+	effectivePaymentTermsDays: Int!
+	"""
+	The client's projects, archived ones included, by name.
+	"""
+	projects: [Project!]!
+	archived: Boolean!
+	createdAt: Int!
+	updatedAt: Int!
+}
+
+"""
+`createClient`/`updateClient`'s argument (update is a full replace).
+
+- `name`: required — the bill-to name every invoice prints.
+- `email`: where `sendInvoice` mails by default.
+- `paymentTermsDays`: `0..=365`, overriding the instance's terms for
+this client's invoices; `null` uses the instance's.
+"""
+input ClientInput {
+	name: String!
+	abn: String
+	address: String
+	email: String
+	paymentTermsDays: Int
+}
+
+type ClientReceivable {
+	client: Client!
+	outstandingCents: Int!
+	"""
+	The part of `outstandingCents` past its due date.
+	"""
+	overdueCents: Int!
+	invoiceCount: Int!
+}
+
 """
 `createProject`'s argument.
 
-- `clientEmail`: where `sendInvoice` mails by default.
-- `paymentTermsDays`: `0..=365`, overriding the instance's terms for
-this project's invoices; `null` uses the instance's.
+- `clientId`: the client its invoices bill — one of the instance's,
+not archived.
+- `reference`: printed on its invoices, unless an invoice sets its own.
 - `defaultUnitPriceCents`: the GST-exclusive rate a new billable item on
 this project gets when it doesn't name one.
 """
 input CreateProjectInput {
+	clientId: ID!
 	"""
 	The brand its invoices go out under; omitted or `"default"` means
 	the default brand.
 	"""
 	brandId: ID
 	name: String!
-	clientName: String!
-	clientAbn: String
-	clientAddress: String
-	clientEmail: String
 	reference: String
-	paymentTermsDays: Int
 	defaultUnitPriceCents: Int
 }
 
@@ -393,7 +465,8 @@ type CreditNote {
 	id: ID!
 	number: Int!
 	"""
-	`CN-001`.
+	The number as printed (`CN-001`), in the instance's number format
+	when it was issued.
 	"""
 	displayNumber: String!
 	"""
@@ -478,6 +551,12 @@ input CreditNoteInput {
 	"""
 	reason: String!
 	lines: [CreditNoteLineInput!]
+	"""
+	Owner only: take exactly this number instead of the next in
+	sequence — any number no credit note in the instance has, as
+	`finalizeInvoice(number:)` does for an invoice. For importing.
+	"""
+	number: Int
 }
 
 """
@@ -548,6 +627,20 @@ type Expense {
 	"""
 	gstCents: Int
 	"""
+	The share that was for the business, `1..=100` — always 100 for a
+	trip.
+	"""
+	businessUsePercent: Int!
+	"""
+	The GST was paid but can't be claimed back.
+	"""
+	gstNotClaimable: Boolean!
+	"""
+	The GST the GST report claims for it: the business share of
+	`gstCents`, or `0` when it isn't claimable.
+	"""
+	claimableGstCents: Int!
+	"""
 	A trip's distance, as its shortest decimal string (`"12.5"`) —
 	the form `ExpenseInput.distanceKm` accepts. `null` for a purchase.
 	"""
@@ -563,10 +656,10 @@ type Expense {
 	"""
 	rebilledItem: BillableItem
 	"""
-	The uploaded receipt, if any — download it with
+	The uploaded receipt files, oldest first — download one with
 	`downloadExpenseReceipt`.
 	"""
-	receipt: ExpenseReceiptInfo
+	receipts: [ExpenseReceiptInfo!]!
 	"""
 	Dataloaded — see [`TicketMessage::author`]'s doc comment.
 	"""
@@ -638,7 +731,11 @@ Which fields apply depends on `category` — see
 - A purchase (every category but `VEHICLE_KM`): `supplier` and
 `amountCents` (integer cents, **GST-inclusive** — what was paid) are
 required; `gstCents` (the GST included in that amount) is optional —
-omit it for a GST-free purchase; `distanceKm` is refused.
+omit it for a GST-free purchase; `businessUsePercent` (`1..=100`,
+default 100) is the share that was for the business, scaling what the
+GST report counts; `gstNotClaimable` marks GST that was paid but can't
+be claimed back (entertainment, or bought before GST registration);
+`distanceKm` is refused.
 - A vehicle trip (`VEHICLE_KM`): `distanceKm` (a decimal string, ≤ 1 dp,
 `0 < d ≤ 5000`) and `description` (the trip's business purpose) are
 required; `supplier`/`amountCents`/`gstCents` are refused — the
@@ -660,6 +757,8 @@ input ExpenseInput {
 	supplier: String
 	amountCents: Int
 	gstCents: Int
+	businessUsePercent: Int
+	gstNotClaimable: Boolean! = false
 	distanceKm: String
 }
 
@@ -668,9 +767,17 @@ An expense's uploaded receipt. Download it with
 `downloadExpenseReceipt`.
 """
 type ExpenseReceiptInfo {
+	"""
+	What `downloadExpenseReceipt`/`removeExpenseReceipt` name.
+	"""
+	id: ID!
 	filename: String!
 	contentType: String!
 	size: Int!
+	"""
+	Unix seconds.
+	"""
+	uploadedAt: Int!
 }
 
 type FinanceSettingsInfo {
@@ -698,6 +805,22 @@ type FinanceSettingsInfo {
 	fetch that doesn't ask for this field costs nothing extra.
 	"""
 	nextInvoiceNumber: Int!
+	"""
+	The credit-note counterpart of `nextInvoiceNumber`.
+	"""
+	nextCreditNoteNumber: Int!
+	"""
+	Printed before every invoice number; `""` for none.
+	"""
+	invoiceNumberPrefix: String!
+	"""
+	Printed before every credit-note number; defaults to `"CN-"`.
+	"""
+	creditNoteNumberPrefix: String!
+	"""
+	Digits a number is zero-padded to; defaults to 3.
+	"""
+	numberPadding: Int!
 }
 
 """
@@ -890,8 +1013,8 @@ type Invoice {
 	status: InvoiceStatusType!
 	number: Int
 	"""
-	Zero-padded to 3 digits (`"008"`); `null` for a draft. Mirrors
-	`finance::snapshot::InvoiceSnapshot::display_number` exactly.
+	The number as printed, in the instance's number format when it was
+	finalized (`"INV-0042"`); `null` for a draft.
 	"""
 	displayNumber: String
 	"""
@@ -968,7 +1091,26 @@ type Invoice {
 	"""
 	title: String!
 	billTo: InvoiceBillToInfo!
+	"""
+	The reference printed: the invoice's own, else its project's.
+	"""
 	reference: String
+	"""
+	The invoice's own reference (a PO number) as set on the draft —
+	`null` when it prints its project's. Editable only on a draft
+	(`updateInvoiceDetails`).
+	"""
+	ownReference: String
+	"""
+	Free text printed above the payment details. Editable only on a
+	draft.
+	"""
+	notes: String
+	"""
+	Why this draft can't be finalized as it stands — its discounts
+	outweigh its charges — or `null`. Always `null` once finalized.
+	"""
+	totalsProblem: String
 	seller: InvoiceSellerInfo!
 	lines: [InvoiceLineInfo!]!
 	subtotalCents: Int!
@@ -982,7 +1124,7 @@ type Invoice {
 }
 
 """
-The printed "Invoice to" block — from the project's client fields, per
+The printed "Invoice to" block — from the project's client, per
 `finance::snapshot::InvoiceSnapshotBillTo`.
 """
 type InvoiceBillToInfo {
@@ -1042,8 +1184,22 @@ type InvoiceLineInfo {
 	date: String!
 	description: String!
 	quantity: String!
+	"""
+	Negative on a discount line.
+	"""
 	unitPriceCents: Int!
+	"""
+	Negative on a discount line.
+	"""
 	amountCents: Int!
+	"""
+	What the quantity counts (`hrs`), printed after it.
+	"""
+	unit: String
+	"""
+	A fixed-amount discount: printed with its amount only.
+	"""
+	discount: Boolean!
 	"""
 	No GST on this line.
 	"""
@@ -1745,6 +1901,18 @@ type MutationRoot {
 	"""
 	updateBrand(instanceId: ID!, brandId: ID!, input: BrandInput!, archived: Boolean! = false): Instance!
 	"""
+	Create a client in a finance instance. Member, like `createProject`;
+	rejects a support instance. See `ClientInput`.
+	"""
+	createClient(instanceId: ID!, input: ClientInput!): Client!
+	"""
+	Update a client — full replace, including `archived`. Id-only,
+	authorised like `updateProject` (`NOT_FOUND` for missing or not
+	yours). A change reaches its projects' drafts; a finalized invoice
+	froze its bill-to.
+	"""
+	updateClient(id: ID!, input: ClientInput!, archived: Boolean! = false): Client!
+	"""
 	Create a project in a finance instance. Member (owner or agent) —
 	managing projects/items/draft invoices is day-to-day work, not an
 	owner-only setting, per CLAUDE.md's "Finance" house rule. Rejects a
@@ -1816,9 +1984,19 @@ type MutationRoot {
 	may be finance final work on a job you've since archived). Every
 	id in `itemIds` must belong to this project and be currently
 	unbilled (`CONFLICT`/`NOT_FOUND` otherwise), 1–50 of them
-	(`MAX_INVOICE_ITEMS`), no duplicates.
+	(`MAX_INVOICE_ITEMS`), no duplicates. `reference` (a PO number,
+	printed in place of the project's) and `notes` are optional — see
+	`updateInvoiceDetails`.
 	"""
-	createInvoice(projectId: ID!, itemIds: [ID!]!): Invoice!
+	createInvoice(projectId: ID!, itemIds: [ID!]!, reference: String, notes: String): Invoice!
+	"""
+	Set a draft's own `reference` (a PO number, printed in place of its
+	project's) and `notes` (printed above the payment details) — a full
+	replace: blank or omitted clears one. `CONFLICT` once finalized, or
+	if it changed concurrently; bumps `version`, so a finalize that read
+	the draft before this fails rather than freezing stale details.
+	"""
+	updateInvoiceDetails(invoiceId: ID!, reference: String, notes: String): Invoice!
 	"""
 	Add unbilled items to a draft invoice, in one transaction
 	(`db::Handler::add_invoice_items`) that also bumps the invoice's
@@ -1973,21 +2151,36 @@ type MutationRoot {
 	"""
 	attachExpenseReceipt(expenseId: ID!, key: String!, contentType: String!): Expense!
 	"""
-	Detach an expense's receipt.
+	Detach one of an expense's receipts. The file stays in storage, like
+	every receipt: it may back a tax claim.
 	"""
-	removeExpenseReceipt(expenseId: ID!): Expense!
+	removeExpenseReceipt(expenseId: ID!, receiptId: ID!): Expense!
 	"""
-	A presigned download URL for an expense's receipt. `NOT_FOUND` when
-	it has none.
+	A presigned download URL for one of an expense's receipts.
+	`NOT_FOUND` when it has no such receipt.
 	"""
-	downloadExpenseReceipt(expenseId: ID!): String!
+	downloadExpenseReceipt(expenseId: ID!, receiptId: ID!): String!
 	"""
 	Owner-or-superuser: set the next invoice number to be assigned by
-	`finalizeInvoice` (`db::Handler::set_next_invoice_number` writes
+	`finalizeInvoice` (`db::Handler::set_last_invoice_number` writes
 	`next - 1` to the counter). Forward-only — `CONFLICT` if `next`
 	would move the counter backward. `next` must be at least 1.
 	"""
 	setNextInvoiceNumber(instanceId: ID!, next: Int!): Instance!
+	"""
+	Owner-or-superuser: the credit-note counterpart of
+	`setNextInvoiceNumber` — forward-only, `next` at least 1.
+	"""
+	setNextCreditNoteNumber(instanceId: ID!, next: Int!): Instance!
+	"""
+	Owner-or-superuser: how invoice and credit-note numbers print — a
+	prefix for each (≤ 12 characters of letters, digits, spaces and
+	`. _ -`; the invoice prefix may be blank, the credit-note one may
+	not, so the two sequences can't be confused) and a zero-padding
+	width (`1..=8`). Applies to documents issued from now on: each
+	document's number is frozen as it was printed.
+	"""
+	setNumberFormat(instanceId: ID!, invoicePrefix: String!, creditNotePrefix: String!, padding: Int!): Instance!
 }
 
 """
@@ -2092,21 +2285,14 @@ type Project {
 	"""
 	instance: Instance!
 	name: String!
-	clientName: String!
-	clientAbn: String
-	clientAddress: String
+	"""
+	The client its invoices bill. Dataloaded.
+	"""
+	client: Client!
+	"""
+	Printed on its invoices, unless an invoice sets its own.
+	"""
 	reference: String
-	clientEmail: String
-	"""
-	This project's own payment terms override; `null` means the
-	instance's apply — see `effectivePaymentTermsDays`.
-	"""
-	paymentTermsDays: Int
-	"""
-	The terms this project's invoices actually get: its own override,
-	else the instance's.
-	"""
-	effectivePaymentTermsDays: Int!
 	"""
 	GST-exclusive cents a new billable item gets when it names no price.
 	"""
@@ -2247,6 +2433,17 @@ type QueryRoot {
 	[`Self::ticket`]'s no-probing posture.
 	"""
 	project(id: ID!): Project
+	"""
+	Every client of a finance instance, sorted by name
+	case-insensitively. Unpaginated, like `projects`, with the same
+	guard and kind check.
+	"""
+	clients(instanceId: ID!, includeArchived: Boolean! = false): [Client!]!
+	"""
+	Fetch a single client by id — `null` for one that doesn't exist or
+	that the caller can't see, exactly like `project`.
+	"""
+	client(id: ID!): Client
 	"""
 	Billable items in a finance instance — every project's, or one
 	project's when `projectId` is given — as a Relay connection, newest
@@ -2412,6 +2609,10 @@ type ReceivablesReport {
 	Every invoice with a balance owing, most overdue first.
 	"""
 	invoices: [Invoice!]!
+	"""
+	What each client owes across all their projects, largest first.
+	"""
+	byClient: [ClientReceivable!]!
 }
 
 """
@@ -2698,17 +2899,17 @@ omitted optional field is cleared.
 """
 input UpdateProjectInput {
 	"""
+	Moving a project to another client changes what its drafts bill,
+	never a finalized invoice.
+	"""
+	clientId: ID!
+	"""
 	Omitted or `"default"` means the default brand. Moving a project to
 	another brand changes its drafts, never a finalized invoice.
 	"""
 	brandId: ID
 	name: String!
-	clientName: String!
-	clientAbn: String
-	clientAddress: String
-	clientEmail: String
 	reference: String
-	paymentTermsDays: Int
 	defaultUnitPriceCents: Int
 	archived: Boolean!
 }

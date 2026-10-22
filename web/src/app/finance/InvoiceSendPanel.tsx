@@ -13,7 +13,9 @@ const invoiceSendPanelFragment = graphql`
     sentAt
     sentTo
     project {
-      clientEmail
+      client {
+        email
+      }
     }
   }
 `;
@@ -70,7 +72,7 @@ export function InvoiceSendPanel({
       {open && (
         <SendDocumentForm
           idPrefix="send-invoice"
-          clientEmail={data.project.clientEmail ?? null}
+          clientEmail={data.project.client.email ?? null}
           isSending={isSending}
           error={error}
           submitLabel="Send email"

@@ -7,6 +7,7 @@ import LoadingIndicator from "../../components/LoadingIndicator";
 import { RequireFinanceInstance } from "./RequireFinanceInstance";
 import { FinanceSettingsForm } from "./FinanceSettingsForm";
 import { InvoiceNumberingForm } from "./InvoiceNumberingForm";
+import { NumberFormatForm } from "./NumberFormatForm";
 import { BrandsSection } from "./BrandsSection";
 
 const financeSettingsPageQuery = graphql`
@@ -15,6 +16,7 @@ const financeSettingsPageQuery = graphql`
       id
       ...FinanceSettingsForm_instance
       ...InvoiceNumberingForm_instance
+      ...NumberFormatForm_instance
       ...BrandsSection_instance
     }
   }
@@ -39,6 +41,7 @@ function Content({ slug }: { slug: string }) {
       <FinanceSettingsForm instance={data.instance} />
       <BrandsSection instance={data.instance} />
       <InvoiceNumberingForm instance={data.instance} />
+      <NumberFormatForm instance={data.instance} />
     </div>
   );
 }

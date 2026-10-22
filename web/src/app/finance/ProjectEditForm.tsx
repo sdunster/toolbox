@@ -7,27 +7,26 @@ import { Card } from "../../components/ui/Card";
 import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
-import { inputBase } from "../../components/ui/inputStyles";
 import { ProjectBillingFields } from "./ProjectBillingFields";
 import { billingInput, initialBillingValues } from "../../lib/projectBilling";
 import { InstanceBrandSelect } from "./BrandSelect";
+import { ClientSelect } from "./ClientSelect";
 
 const projectEditFormFragment = graphql`
   fragment ProjectEditForm_project on Project {
     id
     name
-    clientName
-    clientAbn
-    clientAddress
+    client {
+      id
+    }
     reference
-    clientEmail
-    paymentTermsDays
     defaultUnitPriceCents
     archived
     brand {
       brandId
     }
     instance {
+      id
       slug
     }
   }
@@ -47,16 +46,12 @@ export function ProjectEditForm({
 }) {
   const data = useFragment(projectEditFormFragment, project);
   const [name, setName] = useState(data.name);
-  const [clientName, setClientName] = useState(data.clientName);
-  const [clientAbn, setClientAbn] = useState(data.clientAbn ?? "");
-  const [clientAddress, setClientAddress] = useState(data.clientAddress ?? "");
+  const [clientId, setClientId] = useState(data.client.id);
   const [reference, setReference] = useState(data.reference ?? "");
   const [archived, setArchived] = useState(data.archived);
   const [brandId, setBrandId] = useState(data.brand.brandId);
   const [billing, setBilling] = useState(() =>
     initialBillingValues({
-      clientEmail: data.clientEmail,
-      paymentTermsDays: data.paymentTermsDays,
       defaultUnitPriceCents: data.defaultUnitPriceCents,
     }),
   );
@@ -85,10 +80,8 @@ export function ProjectEditForm({
       variables: {
         id: data.id,
         input: {
+          clientId,
           name: name.trim(),
-          clientName: clientName.trim(),
-          clientAbn: clientAbn.trim(),
-          clientAddress: clientAddress.trim(),
           reference: reference.trim(),
           ...parsed.input,
           brandId,
@@ -116,33 +109,17 @@ export function ProjectEditForm({
             required
           />
         </FormField>
-        <FormField label="Client name" htmlFor="project-client-name">
-          <TextInput
-            id="project-client-name"
-            value={clientName}
-            onChange={(e) => setClientName(e.target.value)}
-            maxLength={200}
-            required
-          />
-        </FormField>
-        <FormField label="Client ABN" htmlFor="project-client-abn">
-          <TextInput
-            id="project-client-abn"
-            value={clientAbn}
-            onChange={(e) => setClientAbn(e.target.value)}
-            maxLength={200}
-          />
-        </FormField>
-        <FormField label="Client address" htmlFor="project-client-address">
-          <textarea
-            id="project-client-address"
-            className={inputBase}
-            rows={3}
-            value={clientAddress}
-            onChange={(e) => setClientAddress(e.target.value)}
-            maxLength={2000}
-          />
-        </FormField>
+        <ClientSelect
+          instanceId={data.instance.id}
+          id="project-client"
+          value={clientId}
+          current={data.client.id}
+          onChange={setClientId}
+        />
+        <p className="-mt-2 text-xs text-ink-muted">
+          Moving it to another client changes its draft invoices; finalized ones
+          keep the client they were issued to.
+        </p>
         <FormField label="Reference" htmlFor="project-reference">
           <TextInput
             id="project-reference"

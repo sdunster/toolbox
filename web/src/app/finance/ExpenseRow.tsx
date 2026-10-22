@@ -22,6 +22,9 @@ const expenseRowFragment = graphql`
     supplier
     amountCents
     gstCents
+    businessUsePercent
+    gstNotClaimable
+    claimableGstCents
     distanceKm
     rateCentsPerKm
     project {
@@ -34,7 +37,10 @@ const expenseRowFragment = graphql`
     rebilledItem {
       id
     }
-    receipt {
+    receipts {
+      id
+      # Shown by ExpenseExtras, which gets the list as a prop.
+      # eslint-disable-next-line relay/unused-fields
       filename
     }
   }
@@ -149,6 +155,8 @@ export function ExpenseRow({
               : data.gstCents == null
                 ? null
                 : centsToInput(data.gstCents),
+            businessUse: String(data.businessUsePercent),
+            gstNotClaimable: data.gstNotClaimable,
             distanceKm: data.distanceKm ?? "",
           }}
           submitLabel="Save"
@@ -225,7 +233,7 @@ export function ExpenseRow({
           expenseId={data.id}
           hasProject={data.project != null}
           rebilled={data.rebilledItem != null}
-          receiptFilename={data.receipt?.filename ?? null}
+          receipts={data.receipts}
           onChanged={onChanged}
         />
       </div>
@@ -243,6 +251,16 @@ export function ExpenseRow({
               ? "GST-free"
               : `incl. ${formatCents(data.gstCents)} GST`}
         </p>
+        {!isTrip &&
+          (data.businessUsePercent < 100 ||
+            (data.gstCents != null &&
+              data.claimableGstCents !== data.gstCents)) && (
+            <p className="text-xs text-ink-muted">
+              {data.businessUsePercent < 100 &&
+                `${data.businessUsePercent}% business · `}
+              claims {formatCents(data.claimableGstCents)} GST
+            </p>
+          )}
       </div>
 
       <div className="flex flex-wrap items-center gap-1 lg:-my-1 lg:justify-end">

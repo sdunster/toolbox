@@ -1156,6 +1156,7 @@ mod tests {
             payment_terms_days: None,
             broadcast_senders: Vec::new(),
             brands: Vec::new(),
+            number_format: db::NumberFormat::default(),
         }
     }
 

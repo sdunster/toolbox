@@ -28,6 +28,9 @@ pub struct ExpenseInput<'a> {
     pub supplier: Option<&'a str>,
     pub amount_cents: Option<i64>,
     pub gst_cents: Option<i64>,
+    /// `1..=100`; `None` means 100.
+    pub business_use_percent: Option<i32>,
+    pub gst_not_claimable: bool,
     pub distance_km: Option<&'a str>,
 }
 
@@ -42,9 +45,13 @@ fn non_blank(raw: Option<&str>) -> Option<&str> {
 ///   trimmed, blank means none, ≤ 2000 chars.
 /// - A purchase: `supplier` (≤ 200 chars) and `amountCents` (GST-inclusive,
 ///   `0 < a ≤ 1,000,000,000`) are required; `gstCents` is optional,
-///   `0 ≤ g ≤ amountCents`; `distanceKm` is refused.
+///   `0 ≤ g ≤ amountCents`; `businessUsePercent` is optional, `1..=100`
+///   (100, wholly for the business, is stored as absent);
+///   `distanceKm` is refused.
 /// - A vehicle trip: `distanceKm` and `description` (its business purpose)
-///   are required; `supplier`/`amountCents`/`gstCents` are refused — the
+///   are required; `supplier`/`amountCents`/`gstCents`, a business use
+///   below 100% and `gstNotClaimable` are refused (a trip's distance is
+///   already only the business kilometres, and it carries no GST) — the
 ///   amount comes from distance × the ATO rate for the date's financial
 ///   year, which is looked up here and never accepted from the caller.
 pub fn validate_expense_input(input: ExpenseInput<'_>) -> Result<db::ExpenseFields, String> {
@@ -63,6 +70,11 @@ pub fn validate_expense_input(input: ExpenseInput<'_>) -> Result<db::ExpenseFiel
         if supplier.is_some() || input.amount_cents.is_some() || input.gst_cents.is_some() {
             return Err(
                 "A vehicle trip takes a distance, not a supplier, amount or GST".to_string(),
+            );
+        }
+        if input.business_use_percent.is_some_and(|p| p != 100) || input.gst_not_claimable {
+            return Err(
+                "A vehicle trip records only business kilometres and carries no GST".to_string(),
             );
         }
         let distance = distance.ok_or_else(|| "Distance is required".to_string())?;
@@ -100,10 +112,17 @@ pub fn validate_expense_input(input: ExpenseInput<'_>) -> Result<db::ExpenseFiel
                 return Err("GST cannot be more than the amount".to_string());
             }
         }
+        let business_use_percent = match input.business_use_percent {
+            None | Some(100) => None,
+            Some(p @ 1..=99) => Some(p as u32),
+            Some(_) => return Err("Business use must be between 1% and 100%".to_string()),
+        };
         db::ExpenseDetail::Purchase {
             supplier: supplier.to_string(),
-            amount_cents,
+            total_cents: amount_cents,
             gst_cents: input.gst_cents,
+            business_use_percent,
+            gst_not_claimable: input.gst_not_claimable,
         }
     };
 
@@ -150,10 +169,51 @@ mod tests {
             f.detail,
             db::ExpenseDetail::Purchase {
                 supplier: "Bunnings".to_string(),
-                amount_cents: 11_000,
+                total_cents: 11_000,
                 gst_cents: Some(1_000),
+                business_use_percent: None,
+                gst_not_claimable: false,
             }
         );
+    }
+
+    #[test]
+    fn business_use_is_kept_below_100_and_dropped_at_100() {
+        let f = validate_expense_input(ExpenseInput {
+            business_use_percent: Some(60),
+            gst_not_claimable: true,
+            ..purchase()
+        })
+        .unwrap();
+        assert!(matches!(
+            f.detail,
+            db::ExpenseDetail::Purchase {
+                business_use_percent: Some(60),
+                gst_not_claimable: true,
+                ..
+            }
+        ));
+        let f = validate_expense_input(ExpenseInput {
+            business_use_percent: Some(100),
+            ..purchase()
+        })
+        .unwrap();
+        assert!(matches!(
+            f.detail,
+            db::ExpenseDetail::Purchase {
+                business_use_percent: None,
+                ..
+            }
+        ));
+        for bad in [0, -5, 101] {
+            assert!(
+                validate_expense_input(ExpenseInput {
+                    business_use_percent: Some(bad),
+                    ..purchase()
+                })
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -253,6 +313,14 @@ mod tests {
             },
             ExpenseInput {
                 date: "2030-01-01",
+                ..trip()
+            },
+            ExpenseInput {
+                business_use_percent: Some(50),
+                ..trip()
+            },
+            ExpenseInput {
+                gst_not_claimable: true,
                 ..trip()
             },
         ] {

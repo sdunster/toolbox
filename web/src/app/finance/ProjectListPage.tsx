@@ -14,7 +14,9 @@ const projectListPageQuery = graphql`
     projects(instanceId: $instanceId, includeArchived: $includeArchived) {
       id
       name
-      clientName
+      client {
+        name
+      }
       reference
       archived
     }
@@ -68,7 +70,7 @@ function ProjectList({
                 )}
               </div>
               <span className="text-sm text-ink-muted">
-                {project.clientName}
+                {project.client.name}
               </span>
             </div>
             {project.reference && (
@@ -121,8 +123,8 @@ function Content({ instanceId, slug }: { instanceId: string; slug: string }) {
 }
 
 /**
- * `/app/projects` — the selected finance instance's projects (clients or
- * jobs), sorted by name, plus the create form. Archived projects are hidden
+ * `/app/projects` — the selected finance instance's projects (jobs, each
+ * billed to one client), sorted by name, plus the create form. Archived projects are hidden
  * unless "Show archived" is ticked, which re-runs `projects` with
  * `includeArchived: true`.
  */

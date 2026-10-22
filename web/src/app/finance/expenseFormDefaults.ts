@@ -16,5 +16,7 @@ export const blankExpense = (
   supplier: "",
   amount: "",
   gst: undefined,
+  businessUse: "",
+  gstNotClaimable: undefined,
   distanceKm: "",
 });

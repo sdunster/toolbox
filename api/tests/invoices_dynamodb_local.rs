@@ -256,8 +256,9 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String, 
         .create_project(
             &instance.id,
             &db::ProjectFields {
+                client_id: fictional_client(db, &instance.id, "Fictional Client Pty Ltd", None)
+                    .await,
                 name: "Fictional Job".into(),
-                client_name: "Fictional Client Pty Ltd".into(),
                 ..Default::default()
             },
         )
@@ -283,6 +284,8 @@ async fn create_items(
                 description: &format!("Line {n}"),
                 quantity_hundredths: 200,
                 unit_price_cents: 10_000,
+                unit: None,
+                discount: false,
                 gst_free: false,
                 created_by_user_id: user_id,
             })
@@ -375,9 +378,13 @@ const LIST_INVOICES_QUERY: &str = "
     }
 ";
 
-const UPDATE_PROJECT_MUTATION: &str = "
-    mutation($id: ID!, $input: UpdateProjectInput!) {
-        updateProject(id: $id, input: $input) { id clientName }
+const PROJECT_CLIENT_QUERY: &str = "
+    query($id: ID!) { project(id: $id) { client { id } } }
+";
+
+const UPDATE_CLIENT_MUTATION: &str = "
+    mutation($id: ID!, $input: ClientInput!) {
+        updateClient(id: $id, input: $input) { id name }
     }
 ";
 
@@ -715,8 +722,8 @@ async fn item_from_another_project_or_already_billed_is_a_conflict() {
         .create_project(
             &instance_id,
             &db::ProjectFields {
+                client_id: fictional_client(&db, &instance_id, "Other Client", None).await,
                 name: "Other Job".into(),
-                client_name: "Other Client".into(),
                 ..Default::default()
             },
         )
@@ -816,28 +823,31 @@ async fn finalize_assigns_sequential_numbers_and_freezes_the_snapshot() {
         "invoice",
     );
 
-    // Edit the project's client name and the instance's business name.
-    let update_project = schema
+    // Rename the project's client and the instance's business.
+    let client_id = expect_data(
+        &schema
+            .execute(
+                Request::new(PROJECT_CLIENT_QUERY)
+                    .variables(Variables::from_json(json!({ "id": project_id })))
+                    .data(auth()),
+            )
+            .await,
+        "project.client.id",
+    );
+    let update_client = schema
         .execute(
-            Request::new(UPDATE_PROJECT_MUTATION)
+            Request::new(UPDATE_CLIENT_MUTATION)
                 .variables(Variables::from_json(json!({
-                    "id": project_id,
-                    "input": {
-                        "name": "Fictional Job",
-                        "clientName": "Renamed Client Pty Ltd",
-                        "clientAbn": null,
-                        "clientAddress": null,
-                        "reference": null,
-                        "archived": false,
-                    }
+                    "id": client_id,
+                    "input": { "name": "Renamed Client Pty Ltd" }
                 })))
                 .data(owner_auth(&owner_id, &instance_id)),
         )
         .await;
     assert!(
-        update_project.errors.is_empty(),
+        update_client.errors.is_empty(),
         "{:?}",
-        update_project.errors
+        update_client.errors
     );
 
     let update_settings = schema
@@ -1285,28 +1295,6 @@ async fn finalize_with_explicit_number_takes_any_unused_number() {
     .await;
     assert_eq!(expect_data(&auto, "finalizeInvoice")["number"], 43);
     w.assert_number_refused(43).await;
-
-    // An invoice finalized before reservation rows existed has none; its
-    // number is found on the invoice itself.
-    let legacy = w
-        .finalize_numbered(&w.new_draft().await, 5, w.owner())
-        .await;
-    assert_eq!(expect_data(&legacy, "finalizeInvoice")["number"], 5);
-    toolbox::local_dev::dynamodb_client()
-        .await
-        .delete_item()
-        .table_name(format!("{prefix}_counter"))
-        .key(
-            "id",
-            aws_sdk_dynamodb::types::AttributeValue::S(db::invoice_number_reservation_id(
-                &w.instance_id,
-                5,
-            )),
-        )
-        .send()
-        .await
-        .unwrap();
-    w.assert_number_refused(5).await;
 }
 
 #[tokio::test]
@@ -1336,8 +1324,8 @@ async fn finalize_requires_business_name_to_be_set_first() {
         .create_project(
             &instance.id,
             &db::ProjectFields {
+                client_id: fictional_client(&db, &instance.id, "Client", None).await,
                 name: "Job".into(),
-                client_name: "Client".into(),
                 ..Default::default()
             },
         )
@@ -1373,7 +1361,7 @@ async fn invoice_list_filters_and_paginates() {
     for _ in 0..2 {
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
         let inv = db
-            .create_invoice(&instance_id, &project_id, &items, &agent_id, None)
+            .create_invoice(&new_invoice(&instance_id, &project_id, &items, &agent_id))
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1382,7 +1370,7 @@ async fn invoice_list_filters_and_paginates() {
     for _ in 0..3 {
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
         let inv = db
-            .create_invoice(&instance_id, &project_id, &items, &agent_id, None)
+            .create_invoice(&new_invoice(&instance_id, &project_id, &items, &agent_id))
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1394,6 +1382,7 @@ async fn invoice_list_filters_and_paginates() {
                 inv.version,
                 &db::FinalizeInvoice {
                     number: number as u32,
+                    display_number: "001",
                     issue_date: "2026-08-19",
                     due_date: "2026-08-19",
                     snapshot_json: "{}",
@@ -1626,7 +1615,7 @@ mod db_level_conflicts {
         let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "staleversion").await;
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
         let invoice = db
-            .create_invoice(&instance_id, &project_id, &items, &agent_id, None)
+            .create_invoice(&new_invoice(&instance_id, &project_id, &items, &agent_id))
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1651,6 +1640,8 @@ mod db_level_conflicts {
                     description: "Edited while draft",
                     quantity_hundredths: 300,
                     unit_price_cents: 5_000,
+                    unit: None,
+                    discount: false,
                     gst_free: false,
                 },
             )
@@ -1666,6 +1657,7 @@ mod db_level_conflicts {
                 invoice.version,
                 &db::FinalizeInvoice {
                     number: 1,
+                    display_number: "001",
                     issue_date: "2026-08-19",
                     due_date: "2026-08-19",
                     snapshot_json: "{}",
@@ -1693,6 +1685,7 @@ mod db_level_conflicts {
                 current.version,
                 &db::FinalizeInvoice {
                     number: 1,
+                    display_number: "001",
                     issue_date: "2026-08-19",
                     due_date: "2026-08-19",
                     snapshot_json: "{}",
@@ -1714,13 +1707,12 @@ mod db_level_conflicts {
         let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "staleversion2").await;
         let items = create_items(&db, &instance_id, &project_id, &agent_id, 2).await;
         let invoice = db
-            .create_invoice(
+            .create_invoice(&new_invoice(
                 &instance_id,
                 &project_id,
                 &[items[0].clone()],
                 &agent_id,
-                None,
-            )
+            ))
             .await
             .expect("create_invoice")
             .expect("committed");
@@ -1748,6 +1740,7 @@ mod db_level_conflicts {
                 wrong_version,
                 &db::FinalizeInvoice {
                     number: 1,
+                    display_number: "001",
                     issue_date: "2026-08-19",
                     due_date: "2026-08-19",
                     snapshot_json: "{}",
@@ -1770,5 +1763,192 @@ mod db_level_conflicts {
         assert_eq!(still.version, invoice.version);
         assert_eq!(still.status, db::InvoiceStatus::Draft);
         assert_eq!(still.item_ids, vec![items[0].clone()]);
+    }
+}
+
+#[tokio::test]
+async fn invoice_list_runs_by_issue_date_not_entry_order() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "listorder").await;
+    let schema = build_schema(db.clone());
+    let auth = || member_auth(&agent_id, &instance_id);
+
+    // Entered newest-first, as an import of old invoices might be: the list
+    // still runs by issue date, newest first, with a draft on top.
+    let mut by_date = Vec::new();
+    for date in ["2025-03-01", "2024-01-15", "2024-11-30", "2023-06-01"] {
+        let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
+        let created = create_invoice(&schema, &project_id, &items, auth()).await;
+        let id = expect_data(&created, "createInvoice.id")
+            .as_str()
+            .unwrap()
+            .to_string();
+        expect_data(
+            &finalize(&schema, &id, date, auth()).await,
+            "finalizeInvoice",
+        );
+        by_date.push((date, id));
+    }
+    let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
+    let draft = expect_data(
+        &create_invoice(&schema, &project_id, &items, auth()).await,
+        "createInvoice.id",
+    );
+    by_date.sort_by(|a, b| b.0.cmp(a.0));
+    let mut expected: Vec<String> = vec![draft.as_str().unwrap().to_string()];
+    expected.extend(by_date.into_iter().map(|(_, id)| id));
+
+    // Two at a time, so the order holds across pages too.
+    let mut seen = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = schema
+            .execute(
+                Request::new(LIST_INVOICES_QUERY)
+                    .variables(Variables::from_json(json!({
+                        "instanceId": instance_id, "filter": "ALL", "first": 2, "after": after,
+                    })))
+                    .data(auth()),
+            )
+            .await;
+        let conn = expect_data(&page, "invoices");
+        for edge in conn["edges"].as_array().unwrap() {
+            seen.push(edge["node"]["id"].as_str().unwrap().to_string());
+        }
+        if conn["pageInfo"]["hasNextPage"] != json!(true) {
+            break;
+        }
+        after = conn["pageInfo"]["endCursor"].as_str().map(str::to_string);
+    }
+    assert_eq!(seen, expected);
+}
+
+#[tokio::test]
+async fn number_format_is_owner_only_and_frozen_per_document() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance_id, owner_id, agent_id, project_id) = setup(&db, "numfmt").await;
+    let schema = build_schema(db.clone());
+    let set_format = |prefix: &str, cn: &str, padding: i64, auth: AuthInfo| {
+        let schema = &schema;
+        let vars = json!({
+            "i": instance_id, "p": prefix, "c": cn, "n": padding,
+        });
+        async move {
+            schema
+                .execute(
+                    Request::new(
+                        "mutation($i: ID!, $p: String!, $c: String!, $n: Int!) {
+                            setNumberFormat(instanceId: $i, invoicePrefix: $p,
+                                creditNotePrefix: $c, padding: $n) {
+                                financeSettings { invoiceNumberPrefix creditNotePrefix: creditNoteNumberPrefix numberPadding }
+                            }
+                        }",
+                    )
+                    .variables(Variables::from_json(vars))
+                    .data(auth),
+                )
+                .await
+        }
+    };
+
+    // An agent can't; bad values are refused.
+    let r = set_format("INV-", "CR-", 4, member_auth(&agent_id, &instance_id)).await;
+    assert!(!r.errors.is_empty());
+    for (p, c, n) in [
+        ("INV/", "CR-", 4),
+        ("INV-", "", 4),
+        ("X", "X", 4),
+        ("INV-", "CR-", 9),
+    ] {
+        let r = set_format(p, c, n, owner_auth(&owner_id, &instance_id)).await;
+        assert!(!r.errors.is_empty(), "{p:?} {c:?} {n}");
+    }
+
+    // An invoice finalized now prints the old (default) format...
+    let finalize_one = || async {
+        let items = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
+        let id = expect_data(
+            &create_invoice(
+                &schema,
+                &project_id,
+                &items,
+                member_auth(&agent_id, &instance_id),
+            )
+            .await,
+            "createInvoice.id",
+        );
+        expect_data(
+            &finalize(
+                &schema,
+                id.as_str().unwrap(),
+                "2026-08-19",
+                member_auth(&agent_id, &instance_id),
+            )
+            .await,
+            "finalizeInvoice",
+        )
+    };
+    let before = finalize_one().await;
+    assert_eq!(before["displayNumber"], "001");
+
+    let r = set_format(" INV- ", "CR-", 4, owner_auth(&owner_id, &instance_id)).await;
+    assert_eq!(
+        expect_data(&r, "setNumberFormat.financeSettings"),
+        json!({ "invoiceNumberPrefix": "INV-", "creditNotePrefix": "CR-", "numberPadding": 4 })
+    );
+
+    // ...and keeps it; the next one takes the new format.
+    let after = finalize_one().await;
+    assert_eq!(after["displayNumber"], "INV-0002");
+    let reread = expect_data(
+        &schema
+            .execute(
+                Request::new(invoice_query())
+                    .variables(Variables::from_json(json!({ "id": before["id"] })))
+                    .data(member_auth(&agent_id, &instance_id)),
+            )
+            .await,
+        "invoice.displayNumber",
+    );
+    assert_eq!(reread, "001");
+}
+
+/// A fictional client of `instance_id` for a project to bill; its id.
+async fn fictional_client(
+    db: &impl db::Handler,
+    instance_id: &str,
+    name: &str,
+    email: Option<&str>,
+) -> String {
+    db.create_client(
+        instance_id,
+        &db::ClientFields {
+            name: name.into(),
+            email: email.map(str::to_string),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create_client")
+    .id
+}
+
+/// A draft with no brand, reference or notes.
+fn new_invoice<'a>(
+    instance_id: &'a str,
+    project_id: &'a str,
+    item_ids: &'a [String],
+    user_id: &'a str,
+) -> db::NewInvoice<'a> {
+    db::NewInvoice {
+        instance_id,
+        project_id,
+        item_ids,
+        created_by_user_id: user_id,
+        brand_id: None,
+        reference: None,
+        notes: None,
     }
 }

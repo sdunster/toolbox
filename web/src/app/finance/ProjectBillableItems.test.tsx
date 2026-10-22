@@ -80,9 +80,11 @@ describe("AddBillableItemForm", () => {
     expect(received).toEqual({
       projectId: "proj-1",
       input: {
+        kind: "CHARGE",
         date: "2026-08-19",
         description: "Site visit\n* measure up",
         quantity: "1.5",
+        unit: "",
         unitPriceCents: 120050,
         gstFree: false,
       },
@@ -91,6 +93,68 @@ describe("AddBillableItemForm", () => {
     expect(screen.getByLabelText("Description")).toHaveValue("");
     expect(screen.getByLabelText("Quantity")).toHaveValue("");
     expect(screen.getByLabelText("Date")).toHaveValue("2026-08-19");
+  });
+
+  it("sends a discount as quantity 1 with the amount off", async () => {
+    let received: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.mutation(
+        "ProjectBillableItemsCreateMutation",
+        ({ variables }) => {
+          received = variables;
+          return HttpResponse.json({
+            data: {
+              createBillableItem: { __typename: "BillableItem", id: "new-2" },
+            },
+          });
+        },
+      ),
+    );
+    const user = UserEvent.setup();
+    const onCreated = renderForm();
+    await user.click(screen.getByLabelText("Discount (a fixed amount off)"));
+    expect(screen.queryByLabelText("Quantity")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Unit")).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("Description"), "Loyalty discount");
+    await user.type(screen.getByLabelText("Amount off (NZD)"), "50");
+    expect(screen.getByText("-50.00 NZD")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Add item" }));
+
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
+    expect(received).toMatchObject({
+      input: {
+        kind: "DISCOUNT",
+        quantity: "1",
+        unit: "",
+        unitPriceCents: 5000,
+      },
+    });
+  });
+
+  it("sends a unit with a charge", async () => {
+    let received: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.mutation(
+        "ProjectBillableItemsCreateMutation",
+        ({ variables }) => {
+          received = variables;
+          return HttpResponse.json({
+            data: {
+              createBillableItem: { __typename: "BillableItem", id: "new-3" },
+            },
+          });
+        },
+      ),
+    );
+    const user = UserEvent.setup();
+    const onCreated = renderForm();
+    await user.type(screen.getByLabelText("Description"), "Labour");
+    await user.type(screen.getByLabelText("Quantity"), "2.5");
+    await user.type(screen.getByLabelText("Unit"), " hrs ");
+    await user.type(screen.getByLabelText("Unit price (NZD)"), "90");
+    await user.click(screen.getByRole("button", { name: "Add item" }));
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
+    expect(received).toMatchObject({ input: { unit: "hrs", quantity: "2.5" } });
   });
 
   it("refuses an unparseable price without calling the API", async () => {
