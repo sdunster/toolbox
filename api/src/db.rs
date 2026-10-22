@@ -898,7 +898,8 @@ pub enum BillableItemUpdateShape<'a> {
 }
 
 /// A new billable item's fields — `create_billable_item`'s and
-/// `rebill_expense`'s input.
+/// `rebill_expense`'s input, and the lines `create_invoice`/
+/// `add_invoice_items` create directly on a draft.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewBillableItem<'a> {
     pub instance_id: &'a str,
@@ -1502,8 +1503,12 @@ impl HasID for CreditNote {
 pub struct NewInvoice<'a> {
     pub instance_id: &'a str,
     pub project_id: &'a str,
-    /// Non-empty; see [`Handler::create_invoice`].
+    /// Existing unbilled items to attach; see [`Handler::create_invoice`].
     pub item_ids: &'a [String],
+    /// Lines entered directly on the draft, created already attached to it;
+    /// see [`Handler::create_invoice`]. `item_ids` and `new_items` together
+    /// are non-empty.
+    pub new_items: &'a [NewBillableItem<'a>],
     pub created_by_user_id: &'a str,
     pub brand_id: Option<&'a str>,
     pub reference: Option<&'a str>,
@@ -2952,14 +2957,19 @@ pub trait Handler: Sync {
     /// conditioned on `attribute_not_exists(invoice_id) AND project_id =
     /// :project_id`. The invoice's own `Put` is conditioned on
     /// `attribute_not_exists(id)` (the same astronomically-unlikely nanoid
-    /// guard every other `create_*` uses). `item_ids` must be non-empty and
-    /// is **not re-validated here** — the caller (`createInvoice`) is
-    /// expected to have already checked every id belongs to `project_id`
-    /// and is currently unbilled, for a clear error message; this call
-    /// re-checks it atomically via the transaction's own per-item
-    /// condition. Returns `Ok(None)` (nothing written) if that condition
-    /// failed for any item — a race between the caller's check and this
-    /// write, since the pre-check already covers the ordinary case.
+    /// guard every other `create_*` uses). Each of `new_items` is `Put` in
+    /// the same transaction with `invoice_id` already set (conditioned on
+    /// `attribute_not_exists(id)`), and its id appended to the invoice's
+    /// `item_ids` after the existing ones — so a line entered directly on a
+    /// draft is never, even briefly, an unbilled item in the project's
+    /// pool. `item_ids` and `new_items` together must be non-empty, and
+    /// `item_ids` is **not re-validated here** — the caller
+    /// (`createInvoice`) is expected to have already checked every id
+    /// belongs to `project_id` and is currently unbilled, for a clear error
+    /// message; this call re-checks it atomically via the transaction's own
+    /// per-item condition. Returns `Ok(None)` (nothing written) if that
+    /// condition failed for any item — a race between the caller's check
+    /// and this write, since the pre-check already covers the ordinary case.
     fn create_invoice(
         &self,
         invoice: &NewInvoice<'_>,
@@ -2981,16 +2991,20 @@ pub trait Handler: Sync {
     /// on `status = draft AND version = expected_version`), plus, for each
     /// item, `Update … SET invoice_id` conditioned on
     /// `attribute_not_exists(invoice_id) AND project_id = :project_id` — the
-    /// same per-item condition as [`Self::create_invoice`]. `Ok(false)` on
-    /// any condition failure (the draft changed concurrently, or an item is
-    /// no longer eligible).
+    /// same per-item condition as [`Self::create_invoice`] — and `Put`s
+    /// each of `new_items` with `invoice_id` already set, its id added to
+    /// `item_ids` too, exactly as `create_invoice` does. Returns the created
+    /// items (empty when `new_items` is), or `Ok(None)` (nothing written)
+    /// on any condition failure (the draft changed concurrently, or an item
+    /// is no longer eligible).
     fn add_invoice_items(
         &self,
         invoice_id: &str,
         project_id: &str,
         item_ids: &[String],
+        new_items: &[NewBillableItem<'_>],
         expected_version: u64,
-    ) -> impl Future<Output = Result<bool>> + Send;
+    ) -> impl Future<Output = Result<Option<Vec<BillableItem>>>> + Send;
     /// Remove `item_ids` from a draft invoice: the mirror image of
     /// [`Self::add_invoice_items`] — `DELETE`s them from `item_ids` (same
     /// `status`/`version` condition and `version` bump) plus, for each item,

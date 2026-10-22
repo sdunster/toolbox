@@ -218,6 +218,81 @@ function unbilledItem(id: string, description: string) {
   };
 }
 
+describe("ProjectBillableItems — new invoice", () => {
+  it("creates a draft from a typed first line and navigates to it", async () => {
+    let createVariables: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.query("ProjectBillableItemsQuery", () =>
+        HttpResponse.json({
+          data: {
+            billableItems: {
+              edges: [],
+              pageInfo: {
+                hasNextPage: false,
+                hasPreviousPage: false,
+                startCursor: null,
+                endCursor: null,
+              },
+            },
+          },
+        }),
+      ),
+      relayEndpoint.mutation(
+        "ProjectBillableItemsNewInvoiceMutation",
+        ({ variables }) => {
+          createVariables = variables;
+          return HttpResponse.json({
+            data: { createInvoice: { __typename: "Invoice", id: "inv-new" } },
+          });
+        },
+      ),
+    );
+    const user = UserEvent.setup();
+    render(
+      <MemoryRouter>
+        <RelayEnvironmentProvider
+          environment={createUnauthenticatedGraphQLEnvironment()}
+        >
+          <ProjectBillableItems
+            instanceId="inst-1"
+            projectId="proj-1"
+            currency="AUD"
+            archived={false}
+            defaultPrice="120.00"
+          />
+        </RelayEnvironmentProvider>
+      </MemoryRouter>,
+    );
+
+    await user.click(
+      await screen.findByRole("button", { name: "New invoice" }),
+    );
+    await user.type(
+      document.getElementById("new-invoice-description")!,
+      "Site visit",
+    );
+    await user.type(document.getElementById("new-invoice-quantity")!, "1.5");
+    await user.click(
+      screen.getByRole("button", { name: "Create draft invoice" }),
+    );
+
+    await waitFor(() =>
+      expect(createVariables).toEqual({
+        projectId: "proj-1",
+        input: {
+          kind: "CHARGE",
+          date: localToday(),
+          description: "Site visit",
+          quantity: "1.5",
+          unit: "",
+          unitPriceCents: 12000,
+          gstFree: false,
+        },
+      }),
+    );
+  });
+});
+
 describe("ProjectBillableItems — create invoice from selected", () => {
   it("sends only the checked unbilled items and navigates to the new invoice", async () => {
     let createVariables: Record<string, unknown> | undefined;

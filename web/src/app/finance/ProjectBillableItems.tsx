@@ -4,6 +4,7 @@ import { useNavigate } from "react-router";
 import type { ProjectBillableItemsQuery } from "./__generated__/ProjectBillableItemsQuery.graphql";
 import type { ProjectBillableItemsCreateMutation } from "./__generated__/ProjectBillableItemsCreateMutation.graphql";
 import type { ProjectBillableItemsCreateInvoiceMutation } from "./__generated__/ProjectBillableItemsCreateInvoiceMutation.graphql";
+import type { ProjectBillableItemsNewInvoiceMutation } from "./__generated__/ProjectBillableItemsNewInvoiceMutation.graphql";
 import { useRetryableLazyLoadQuery } from "../../components/useRetryableLazyLoadQuery";
 import RelayErrorBoundary from "../../components/RelayErrorBoundary";
 import LoadingIndicator from "../../components/LoadingIndicator";
@@ -201,10 +202,81 @@ function CreateInvoiceButton({
 }
 
 /**
+ * "New invoice": start a draft by typing its first line straight onto it
+ * (`createInvoice`'s `newItems`), without recording an unbilled item first.
+ * Navigates to the new draft, where more lines can be added.
+ */
+function NewInvoiceForm({
+  projectId,
+  currency,
+  defaultPrice,
+  onCancel,
+}: {
+  projectId: string;
+  currency: string;
+  defaultPrice: string;
+  onCancel: () => void;
+}) {
+  const navigate = useNavigate();
+  const [error, setError] = useState<string | null>(null);
+  const [commit, isCreating] =
+    useMutation<ProjectBillableItemsNewInvoiceMutation>(graphql`
+      mutation ProjectBillableItemsNewInvoiceMutation(
+        $projectId: ID!
+        $input: BillableItemInput!
+      ) {
+        createInvoice(projectId: $projectId, newItems: [$input]) {
+          id
+        }
+      }
+    `);
+
+  return (
+    <Card>
+      <h3 className="mb-1 text-sm font-semibold tracking-wide text-ink-muted uppercase">
+        New invoice
+      </h3>
+      <p className="mb-4 text-sm text-ink-muted">
+        Enter the first line; you can add more on the draft.
+      </p>
+      <BillableItemForm
+        idPrefix="new-invoice"
+        currency={currency}
+        initial={{
+          date: localToday(),
+          description: "",
+          quantity: "",
+          price: defaultPrice,
+        }}
+        submitLabel="Create draft invoice"
+        savingLabel="Creating…"
+        isSaving={isCreating}
+        error={error}
+        onCancel={onCancel}
+        onSubmit={(input) => {
+          setError(null);
+          commit({
+            variables: { projectId, input },
+            onCompleted: (data) => {
+              navigate(`/app/invoices/${data.createInvoice.id}`);
+            },
+            onError: (err) =>
+              setError(
+                relayMutationErrorMessage(err, "Failed to create invoice."),
+              ),
+          });
+        }}
+      />
+    </Card>
+  );
+}
+
+/**
  * The project page's "Billable items" section: this project's items (with
  * inline Edit/Delete for unbilled/draft ones, checkboxes on unbilled ones,
  * and a "Create invoice from selected" action once something's checked)
- * and, unless the project is archived, the "Add item" form. `instanceId` is
+ * and, unless the project is archived, "New invoice" (typing its lines
+ * straight onto a draft) and the "Add item" form. `instanceId` is
  * the *project's* instance, not the switcher's selection — `billableItems`
  * rejects a project from any other instance, and a deep link can arrive
  * with a different one selected.
@@ -224,6 +296,7 @@ export function ProjectBillableItems({
   defaultPrice?: string;
 }) {
   const [refreshKey, setRefreshKey] = useState(0);
+  const [showNewInvoice, setShowNewInvoice] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   // The ids `Items` currently renders with an unbilled checkbox — reported
   // up by `BillableItemList`. Deleting a selected item already prunes it
@@ -305,7 +378,23 @@ export function ProjectBillableItems({
           &quot;Archived&quot; above to add more.
         </p>
       ) : (
-        <div className="max-w-3xl">
+        <div className="flex max-w-3xl flex-col gap-4">
+          {showNewInvoice ? (
+            <NewInvoiceForm
+              projectId={projectId}
+              currency={currency}
+              defaultPrice={defaultPrice}
+              onCancel={() => setShowNewInvoice(false)}
+            />
+          ) : (
+            <Button
+              variant="secondary"
+              className="self-start"
+              onClick={() => setShowNewInvoice(true)}
+            >
+              New invoice
+            </Button>
+          )}
           <AddBillableItemForm
             projectId={projectId}
             currency={currency}

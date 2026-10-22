@@ -433,15 +433,22 @@ fn explicit_number(
 }
 
 /// Validate a set of billable-item ids to add to an invoice
-/// (`createInvoice`'s `itemIds`, or `addInvoiceItems`'): at least one, no
-/// duplicates against each other or `existing` (the invoice's current
-/// `item_ids` — empty for `createInvoice`), and the combined total capped at
-/// [`MAX_INVOICE_ITEMS`].
-fn validate_new_invoice_item_ids(ids: &[ID], existing: &[String]) -> Result<Vec<String>> {
-    if ids.is_empty() {
-        return Err(anyhow!("At least one item id is required"));
+/// (`createInvoice`'s `itemIds`, or `addInvoiceItems`'): no duplicates
+/// against each other or `existing` (the invoice's current `item_ids` —
+/// empty for `createInvoice`). `new_count` is how many lines the same call
+/// enters directly (`newItems`): together with `ids` there must be at least
+/// one, and the invoice's combined total is capped at [`MAX_INVOICE_ITEMS`].
+fn validate_new_invoice_item_ids(
+    ids: &[ID],
+    new_count: usize,
+    existing: &[String],
+) -> Result<Vec<String>> {
+    if ids.is_empty() && new_count == 0 {
+        return Err(anyhow!(
+            "At least one item is required — an existing item id or a new item"
+        ));
     }
-    if existing.len() + ids.len() > MAX_INVOICE_ITEMS {
+    if existing.len() + ids.len() + new_count > MAX_INVOICE_ITEMS {
         return Err(anyhow!(
             "An invoice can have at most {MAX_INVOICE_ITEMS} items"
         ));
@@ -518,8 +525,11 @@ async fn fetch_eligible_items<A: App + HasDb + Send + Sync>(
 /// Reject a prospective invoice total (subtotal + GST, in cents) that would
 /// exceed `Number.MAX_SAFE_INTEGER` — see CLAUDE.md's "Finance" house
 /// rule ("Totals overflow") and `finance::validate_total_within_safe_integer`.
+/// `items` are the invoice's existing rows, `new_items` the lines entered
+/// directly in the same call.
 fn check_invoice_total_within_safe_integer(
     items: &[db::BillableItem],
+    new_items: &[ValidBillableItem],
     gst_registered: bool,
 ) -> Result<()> {
     // Charges only: a discount can only bring the total down.
@@ -527,7 +537,10 @@ fn check_invoice_total_within_safe_integer(
         .iter()
         .filter(|it| !it.discount)
         .map(db::BillableItem::amount_cents)
-        .sum();
+        .chain(new_items.iter().filter(|it| !it.discount).map(|it| {
+            finance::money::line_amount_cents(it.quantity_hundredths, it.unit_price_cents)
+        }))
+        .fold(0i64, i64::saturating_add);
     let gst = if gst_registered {
         finance::money::gst_cents(subtotal)
     } else {
@@ -546,6 +559,7 @@ struct ValidBillableItem {
     unit_price_cents: i64,
     unit: Option<String>,
     discount: bool,
+    gst_free: bool,
 }
 
 /// `unit_price_cents` is the price the caller resolved — the input's own,
@@ -580,7 +594,76 @@ fn validate_billable_item_input(
         unit_price_cents,
         unit,
         discount,
+        gst_free: input.gst_free,
     })
+}
+
+/// Validate a *new* billable item on `project` — `createBillableItem`'s
+/// rules, shared with the lines `createInvoice`/`addInvoiceItems` enter
+/// directly on a draft (`newItems`), so an item is the same whichever way
+/// it was entered: an archived project takes none, and an omitted
+/// `unitPriceCents` on a charge falls back to the project's default rate.
+fn validate_new_billable_item(
+    project: &db::Project,
+    input: &BillableItemInput,
+) -> Result<ValidBillableItem> {
+    if project.archived {
+        return Err(anyhow!(
+            "Project is archived — un-archive it to add billable items"
+        ));
+    }
+    // A discount names its own amount; the project's rate is for charges.
+    let default_price = match input.kind {
+        BillableItemKindType::Charge => project.default_unit_price_cents,
+        BillableItemKindType::Discount => None,
+    };
+    let unit_price_cents =
+        input
+            .unit_price_cents
+            .or(default_price)
+            .ok_or_else(|| match input.kind {
+                BillableItemKindType::Charge => {
+                    anyhow!("Unit price is required — this project has no default rate")
+                }
+                BillableItemKindType::Discount => anyhow!("Give the discount's amount"),
+            })?;
+    validate_billable_item_input(input, unit_price_cents)
+}
+
+/// [`validate_new_billable_item`] for each of an invoice mutation's
+/// `newItems`, naming the line (1-based) in any error.
+fn validate_new_invoice_lines(
+    project: &db::Project,
+    inputs: &[BillableItemInput],
+) -> Result<Vec<ValidBillableItem>> {
+    inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            validate_new_billable_item(project, input)
+                .map_err(|e| anyhow!("New item {}: {e}", i + 1))
+        })
+        .collect()
+}
+
+/// The row to write for a validated new item on `project`.
+fn new_billable_item<'a>(
+    project: &'a db::Project,
+    user_id: &'a str,
+    fields: &'a ValidBillableItem,
+) -> db::NewBillableItem<'a> {
+    db::NewBillableItem {
+        instance_id: &project.instance_id,
+        project_id: &project.id,
+        date: &fields.date,
+        description: &fields.description,
+        quantity_hundredths: fields.quantity_hundredths,
+        unit_price_cents: fields.unit_price_cents,
+        unit: fields.unit.as_deref(),
+        discount: fields.discount,
+        gst_free: fields.gst_free,
+        created_by_user_id: user_id,
+    }
 }
 
 /// `createProject`/`updateProject`'s raw fields, before validation. The
@@ -4661,42 +4744,11 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         let Some(AuthInfo::User { id: user_id, .. }) = ctx.data_opt::<AuthInfo>() else {
             return Err(ApiError::forbidden("Must be authenticated as a user").into());
         };
-        if project.archived {
-            return Err(anyhow!(
-                "Project is archived — un-archive it to add billable items"
-            ));
-        }
-        // A discount names its own amount; the project's rate is for charges.
-        let default_price = match input.kind {
-            BillableItemKindType::Charge => project.default_unit_price_cents,
-            BillableItemKindType::Discount => None,
-        };
-        let unit_price_cents =
-            input
-                .unit_price_cents
-                .or(default_price)
-                .ok_or_else(|| match input.kind {
-                    BillableItemKindType::Charge => {
-                        anyhow!("Unit price is required — this project has no default rate")
-                    }
-                    BillableItemKindType::Discount => anyhow!("Give the discount's amount"),
-                })?;
-        let fields = validate_billable_item_input(&input, unit_price_cents)?;
+        let fields = validate_new_billable_item(&project, &input)?;
         let created = self
             .app
             .db()
-            .create_billable_item(&db::NewBillableItem {
-                instance_id: &project.instance_id,
-                project_id: &project.id,
-                date: &fields.date,
-                description: &fields.description,
-                quantity_hundredths: fields.quantity_hundredths,
-                unit_price_cents: fields.unit_price_cents,
-                unit: fields.unit.as_deref(),
-                discount: fields.discount,
-                gst_free: input.gst_free,
-                created_by_user_id: user_id,
-            })
+            .create_billable_item(&new_billable_item(&project, user_id, &fields))
             .await?;
         Ok(BillableItem::new(created))
     }
@@ -4899,21 +4951,28 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
 
     // ── Invoices ──────────────────────────────────────────────────────────────
 
-    /// Create a draft invoice from a project's unbilled items, in one
-    /// transaction (`db::Handler::create_invoice`). Authorised through the
-    /// project like `createBillableItem` — `NOT_FOUND` for a missing
-    /// project or a non-member alike; an archived project is allowed (you
-    /// may be finance final work on a job you've since archived). Every
-    /// id in `itemIds` must belong to this project and be currently
-    /// unbilled (`CONFLICT`/`NOT_FOUND` otherwise), 1–50 of them
-    /// (`MAX_INVOICE_ITEMS`), no duplicates. `reference` (a PO number,
-    /// printed in place of the project's) and `notes` are optional — see
-    /// `updateInvoiceDetails`.
+    /// Create a draft invoice for a project, in one transaction
+    /// (`db::Handler::create_invoice`), from the project's unbilled items
+    /// (`itemIds`), lines entered directly on it (`newItems`), or both.
+    /// Authorised through the project like `createBillableItem` —
+    /// `NOT_FOUND` for a missing project or a non-member alike; an archived
+    /// project is allowed for `itemIds` alone (you may be finance final
+    /// work on a job you've since archived) but takes no `newItems`, like
+    /// `createBillableItem`. Every id in `itemIds` must belong to this
+    /// project and be currently unbilled (`CONFLICT`/`NOT_FOUND`
+    /// otherwise), no duplicates. Each of `newItems` is validated exactly as
+    /// `createBillableItem` validates its input (an omitted price takes the
+    /// project's default rate) and is created already on this draft — it
+    /// never sits in the project's unbilled pool. 1–50 items in all
+    /// (`MAX_INVOICE_ITEMS`). `reference` (a PO number, printed in place of
+    /// the project's) and `notes` are optional — see `updateInvoiceDetails`.
+    #[allow(clippy::too_many_arguments)]
     async fn create_invoice(
         &self,
         ctx: &Context<'_>,
         project_id: ID,
-        item_ids: Vec<ID>,
+        #[graphql(default)] item_ids: Vec<ID>,
+        #[graphql(default)] new_items: Vec<BillableItemInput>,
         reference: Option<String>,
         notes: Option<String>,
     ) -> Result<Invoice<A>> {
@@ -4922,7 +4981,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             return Err(ApiError::forbidden("Must be authenticated as a user").into());
         };
         let (reference, notes) = validate_invoice_details(reference.as_deref(), notes.as_deref())?;
-        let ids = validate_new_invoice_item_ids(&item_ids, &[])?;
+        let ids = validate_new_invoice_item_ids(&item_ids, new_items.len(), &[])?;
+        let new_fields = validate_new_invoice_lines(&project, &new_items)?;
         let items = fetch_eligible_items(&*self.app, &project.id, &ids).await?;
 
         let instance = self
@@ -4934,8 +4994,12 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", project.instance_id.as_str()))?;
-        check_invoice_total_within_safe_integer(&items, instance.gst_registered)?;
+        check_invoice_total_within_safe_integer(&items, &new_fields, instance.gst_registered)?;
 
+        let new_rows: Vec<db::NewBillableItem<'_>> = new_fields
+            .iter()
+            .map(|f| new_billable_item(&project, user_id, f))
+            .collect();
         let created = self
             .app
             .db()
@@ -4943,6 +5007,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 instance_id: &project.instance_id,
                 project_id: &project.id,
                 item_ids: &ids,
+                new_items: &new_rows,
                 created_by_user_id: user_id,
                 brand_id: finance::brand::find(&instance, project.brand_id.as_deref())
                     .map(|b| b.id.as_str()),
@@ -5002,25 +5067,52 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         }))
     }
 
-    /// Add unbilled items to a draft invoice, in one transaction
-    /// (`db::Handler::add_invoice_items`) that also bumps the invoice's
-    /// `version`. `NOT_FOUND`/`CONFLICT` for the same reasons as
-    /// `createInvoice`; `CONFLICT` if the invoice is already finalized, or
-    /// changed concurrently (a stale `version`).
+    /// Add to a draft invoice — the project's unbilled items (`itemIds`),
+    /// lines entered directly on it (`newItems`), or both — in one
+    /// transaction (`db::Handler::add_invoice_items`) that also bumps the
+    /// invoice's `version`. `NOT_FOUND`/`CONFLICT` and the `newItems` rules
+    /// (validated like `createBillableItem`, refused for an archived
+    /// project) are `createInvoice`'s; `CONFLICT` if the invoice is already
+    /// finalized, or changed concurrently (a stale `version`).
     async fn add_invoice_items(
         &self,
         ctx: &Context<'_>,
         invoice_id: ID,
-        item_ids: Vec<ID>,
+        #[graphql(default)] item_ids: Vec<ID>,
+        #[graphql(default)] new_items: Vec<BillableItemInput>,
     ) -> Result<Invoice<A>> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        let Some(AuthInfo::User { id: user_id, .. }) = ctx.data_opt::<AuthInfo>() else {
+            return Err(ApiError::forbidden("Must be authenticated as a user").into());
+        };
         if invoice.status != db::InvoiceStatus::Draft {
             return Err(
                 ApiError::conflict("Invoice is finalized and can no longer be edited").into(),
             );
         }
-        let new_ids = validate_new_invoice_item_ids(&item_ids, &invoice.item_ids)?;
-        let new_items = fetch_eligible_items(&*self.app, &invoice.project_id, &new_ids).await?;
+        let new_ids = validate_new_invoice_item_ids(&item_ids, new_items.len(), &invoice.item_ids)?;
+        // Only `newItems` needs the project: its archived flag and default
+        // rate.
+        let project = if new_items.is_empty() {
+            None
+        } else {
+            Some(
+                self.app
+                    .db()
+                    .get_projects(&[invoice.project_id.as_str()])
+                    .await?
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| ApiError::not_found("Project", invoice.project_id.as_str()))?,
+            )
+        };
+        let new_fields = match &project {
+            Some(project) => validate_new_invoice_lines(project, &new_items)?,
+            None => vec![],
+        };
+        let attached_items =
+            fetch_eligible_items(&*self.app, &invoice.project_id, &new_ids).await?;
 
         let existing_items: Vec<db::BillableItem> = if invoice.item_ids.is_empty() {
             vec![]
@@ -5043,21 +5135,33 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", invoice.instance_id.as_str()))?;
         let mut all_items = existing_items;
-        all_items.extend(new_items);
-        check_invoice_total_within_safe_integer(&all_items, instance.gst_registered)?;
+        all_items.extend(attached_items);
+        check_invoice_total_within_safe_integer(&all_items, &new_fields, instance.gst_registered)?;
 
-        let committed = self
+        let new_rows: Vec<db::NewBillableItem<'_>> = match &project {
+            Some(project) => new_fields
+                .iter()
+                .map(|f| new_billable_item(project, user_id, f))
+                .collect(),
+            None => vec![],
+        };
+        let created = self
             .app
             .db()
-            .add_invoice_items(&invoice.id, &invoice.project_id, &new_ids, invoice.version)
-            .await?;
-        if !committed {
-            return Err(
-                ApiError::conflict("Invoice changed concurrently — reload and try again").into(),
-            );
-        }
+            .add_invoice_items(
+                &invoice.id,
+                &invoice.project_id,
+                &new_ids,
+                &new_rows,
+                invoice.version,
+            )
+            .await?
+            .ok_or_else(|| {
+                ApiError::conflict("Invoice changed concurrently — reload and try again")
+            })?;
         let mut item_ids_result = invoice.item_ids.clone();
         item_ids_result.extend(new_ids);
+        item_ids_result.extend(created.into_iter().map(|item| item.id));
         Ok(Invoice::new(db::Invoice {
             item_ids: item_ids_result,
             version: invoice.version + 1,

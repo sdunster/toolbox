@@ -490,8 +490,9 @@ impl db::Handler for Handler {
         _invoice_id: &str,
         _project_id: &str,
         _item_ids: &[String],
+        _new_items: &[db::NewBillableItem<'_>],
         _expected_version: u64,
-    ) -> db::Result<bool> {
+    ) -> db::Result<Option<Vec<db::BillableItem>>> {
         Self::unsupported()
     }
 

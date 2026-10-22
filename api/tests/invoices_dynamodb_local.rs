@@ -19,6 +19,8 @@
 //!   - `setNextInvoiceNumber` is forward-only;
 //!   - `finalizeInvoice` requires `businessName` to be set first;
 //!   - `BillableItem.status` transitions UNBILLED -> DRAFT -> INVOICED;
+//!   - `newItems` enters lines directly on a draft (create and add), never
+//!     via the unbilled pool, with `createBillableItem`'s rules;
 //!   - `invoices` list filters (ALL/DRAFT/UNPAID/PAID) and pagination.
 //!
 //! # Running this test
@@ -1048,6 +1050,191 @@ async fn create_invoice_returns_items_already_reporting_draft_and_their_invoice(
     }
 }
 
+/// `newItems` enters lines straight onto a draft — on `createInvoice` (alone
+/// or beside `itemIds`) and on `addInvoiceItems` — with `createBillableItem`'s
+/// rules: the project's default rate fills an omitted price, an archived
+/// project takes none, and a bad line is named. The lines are ordinary items
+/// on the draft (`DRAFT`), never in the unbilled pool, and go back to it like
+/// any other once removed.
+#[tokio::test]
+async fn new_items_go_straight_onto_a_draft() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "newitems").await;
+    let schema = build_schema(db.clone());
+    let auth = || member_auth(&agent_id, &instance_id);
+    let project = db.get_projects(&[project_id.as_str()]).await.unwrap()[0]
+        .clone()
+        .unwrap();
+    let set_project = |default_unit_price_cents: Option<i64>, archived: bool| {
+        let db = db.clone();
+        let project = project.clone();
+        async move {
+            db.update_project(
+                &project.id,
+                db::ProjectUpdateShape::Fields {
+                    fields: &db::ProjectFields {
+                        client_id: project.client_id.clone(),
+                        name: project.name.clone(),
+                        reference: project.reference.clone(),
+                        default_unit_price_cents,
+                        brand_id: project.brand_id.clone(),
+                    },
+                    archived,
+                },
+            )
+            .await
+            .expect("update_project");
+        }
+    };
+    set_project(Some(15_000), false).await;
+
+    const CREATE: &str =
+        "mutation($projectId: ID!, $itemIds: [ID!]!, $newItems: [BillableItemInput!]!) {
+        createInvoice(projectId: $projectId, itemIds: $itemIds, newItems: $newItems) {
+            id subtotalCents items { id status description unitPriceCents invoice { id } }
+        }
+    }";
+    const ADD: &str = "mutation($invoiceId: ID!, $newItems: [BillableItemInput!]!) {
+        addInvoiceItems(invoiceId: $invoiceId, newItems: $newItems) {
+            id subtotalCents items { id status description }
+        }
+    }";
+    let run = |doc: &'static str, vars: Value| {
+        let schema = &schema;
+        let auth = auth();
+        async move {
+            schema
+                .execute(
+                    Request::new(doc)
+                        .variables(Variables::from_json(vars))
+                        .data(auth),
+                )
+                .await
+        }
+    };
+
+    // Neither existing nor new items: refused.
+    let empty = run(
+        CREATE,
+        json!({ "projectId": project_id, "itemIds": [], "newItems": [] }),
+    )
+    .await;
+    assert!(expect_error_message(&empty).contains("At least one item"));
+
+    // A new line beside an existing one; the new one takes the default rate.
+    let existing = create_items(&db, &instance_id, &project_id, &agent_id, 1).await;
+    let created = run(
+        CREATE,
+        json!({
+            "projectId": project_id,
+            "itemIds": existing,
+            "newItems": [{ "date": "2026-08-20", "description": "Site visit", "quantity": "2" }],
+        }),
+    )
+    .await;
+    let invoice = expect_data(&created, "createInvoice");
+    let invoice_id = invoice["id"].as_str().unwrap().to_string();
+    let items = invoice["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["id"], existing[0].as_str());
+    assert_eq!(items[1]["description"], "Site visit");
+    assert_eq!(items[1]["unitPriceCents"], 15_000);
+    for item in items {
+        assert_eq!(item["status"], "DRAFT");
+        assert_eq!(item["invoice"]["id"].as_str().unwrap(), invoice_id);
+    }
+    // 2 x 100.00 (existing) + 2 x 150.00 (new)
+    assert_eq!(invoice["subtotalCents"], 50_000);
+    let new_id = items[1]["id"].as_str().unwrap().to_string();
+    let stored = db.get_billable_items(&[new_id.as_str()]).await.unwrap()[0]
+        .clone()
+        .unwrap();
+    assert_eq!(stored.invoice_id.as_deref(), Some(invoice_id.as_str()));
+    assert_eq!(stored.created_by_user_id, agent_id);
+
+    // Only new lines, on create and on add; a bad line is named.
+    let only_new = run(
+        CREATE,
+        json!({
+            "projectId": project_id,
+            "itemIds": [],
+            "newItems": [{ "date": "2026-08-20", "description": "Callout", "quantity": "1", "unitPriceCents": 9_900 }],
+        }),
+    )
+    .await;
+    let second_id = expect_data(&only_new, "createInvoice")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let added = run(
+        ADD,
+        json!({
+            "invoiceId": second_id,
+            "newItems": [
+                { "date": "2026-08-21", "description": "Parts", "quantity": "3", "unit": "ea", "unitPriceCents": 1_000 },
+                { "date": "2026-08-21", "description": "Loyalty", "quantity": "1", "unitPriceCents": 900, "kind": "DISCOUNT" },
+            ],
+        }),
+    )
+    .await;
+    let second = expect_data(&added, "addInvoiceItems");
+    let descriptions: Vec<&str> = second["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["description"].as_str().unwrap())
+        .collect();
+    assert_eq!(descriptions, ["Callout", "Parts", "Loyalty"]);
+    // 99.00 + 30.00 - 9.00
+    assert_eq!(second["subtotalCents"], 12_000);
+    let bad = run(
+        ADD,
+        json!({
+            "invoiceId": second_id,
+            "newItems": [
+                { "date": "2026-08-21", "description": "Fine", "quantity": "1" },
+                { "date": "2026-08-21", "description": "Bad", "quantity": "1.234" },
+            ],
+        }),
+    )
+    .await;
+    assert!(
+        expect_error_message(&bad).starts_with("New item 2:"),
+        "{:?}",
+        bad.errors
+    );
+
+    // Removed from the draft, a directly entered line is an ordinary
+    // unbilled item.
+    let removed = schema
+        .execute(
+            Request::new(remove_invoice_items_mutation())
+                .variables(Variables::from_json(
+                    json!({ "invoiceId": invoice_id, "itemIds": [new_id] }),
+                ))
+                .data(auth()),
+        )
+        .await;
+    expect_data(&removed, "removeInvoiceItems");
+    let stored = db.get_billable_items(&[new_id.as_str()]).await.unwrap()[0]
+        .clone()
+        .unwrap();
+    assert!(stored.invoice_id.is_none());
+
+    // An archived project takes no new lines — not even on an existing draft.
+    set_project(Some(15_000), true).await;
+    let archived = run(
+        ADD,
+        json!({
+            "invoiceId": second_id,
+            "newItems": [{ "date": "2026-08-21", "description": "More", "quantity": "1" }],
+        }),
+    )
+    .await;
+    assert!(expect_error_message(&archived).contains("archived"));
+}
+
 #[tokio::test]
 async fn set_invoice_paid_sets_and_clears_and_is_rejected_on_a_draft() {
     let prefix = require_local_db!();
@@ -1752,9 +1939,16 @@ mod db_level_conflicts {
         let wrong_version = invoice.version + 41;
 
         assert!(
-            !db.add_invoice_items(&invoice.id, &project_id, &[items[1].clone()], wrong_version)
-                .await
-                .expect("add_invoice_items")
+            db.add_invoice_items(
+                &invoice.id,
+                &project_id,
+                &[items[1].clone()],
+                &[],
+                wrong_version
+            )
+            .await
+            .expect("add_invoice_items")
+            .is_none()
         );
         assert!(
             !db.remove_invoice_items(&invoice.id, &[items[0].clone()], wrong_version)
@@ -1979,6 +2173,7 @@ fn new_invoice<'a>(
         instance_id,
         project_id,
         item_ids,
+        new_items: &[],
         created_by_user_id: user_id,
         brand_id: None,
         reference: None,

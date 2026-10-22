@@ -1977,18 +1977,23 @@ type MutationRoot {
 	"""
 	deleteExpense(id: ID!): ID!
 	"""
-	Create a draft invoice from a project's unbilled items, in one
-	transaction (`db::Handler::create_invoice`). Authorised through the
-	project like `createBillableItem` — `NOT_FOUND` for a missing
-	project or a non-member alike; an archived project is allowed (you
-	may be finance final work on a job you've since archived). Every
-	id in `itemIds` must belong to this project and be currently
-	unbilled (`CONFLICT`/`NOT_FOUND` otherwise), 1–50 of them
-	(`MAX_INVOICE_ITEMS`), no duplicates. `reference` (a PO number,
-	printed in place of the project's) and `notes` are optional — see
-	`updateInvoiceDetails`.
+	Create a draft invoice for a project, in one transaction
+	(`db::Handler::create_invoice`), from the project's unbilled items
+	(`itemIds`), lines entered directly on it (`newItems`), or both.
+	Authorised through the project like `createBillableItem` —
+	`NOT_FOUND` for a missing project or a non-member alike; an archived
+	project is allowed for `itemIds` alone (you may be finance final
+	work on a job you've since archived) but takes no `newItems`, like
+	`createBillableItem`. Every id in `itemIds` must belong to this
+	project and be currently unbilled (`CONFLICT`/`NOT_FOUND`
+	otherwise), no duplicates. Each of `newItems` is validated exactly as
+	`createBillableItem` validates its input (an omitted price takes the
+	project's default rate) and is created already on this draft — it
+	never sits in the project's unbilled pool. 1–50 items in all
+	(`MAX_INVOICE_ITEMS`). `reference` (a PO number, printed in place of
+	the project's) and `notes` are optional — see `updateInvoiceDetails`.
 	"""
-	createInvoice(projectId: ID!, itemIds: [ID!]!, reference: String, notes: String): Invoice!
+	createInvoice(projectId: ID!, itemIds: [ID!]! = [], newItems: [BillableItemInput!]! = [], reference: String, notes: String): Invoice!
 	"""
 	Set a draft's own `reference` (a PO number, printed in place of its
 	project's) and `notes` (printed above the payment details) — a full
@@ -1998,13 +2003,15 @@ type MutationRoot {
 	"""
 	updateInvoiceDetails(invoiceId: ID!, reference: String, notes: String): Invoice!
 	"""
-	Add unbilled items to a draft invoice, in one transaction
-	(`db::Handler::add_invoice_items`) that also bumps the invoice's
-	`version`. `NOT_FOUND`/`CONFLICT` for the same reasons as
-	`createInvoice`; `CONFLICT` if the invoice is already finalized, or
-	changed concurrently (a stale `version`).
+	Add to a draft invoice — the project's unbilled items (`itemIds`),
+	lines entered directly on it (`newItems`), or both — in one
+	transaction (`db::Handler::add_invoice_items`) that also bumps the
+	invoice's `version`. `NOT_FOUND`/`CONFLICT` and the `newItems` rules
+	(validated like `createBillableItem`, refused for an archived
+	project) are `createInvoice`'s; `CONFLICT` if the invoice is already
+	finalized, or changed concurrently (a stale `version`).
 	"""
-	addInvoiceItems(invoiceId: ID!, itemIds: [ID!]!): Invoice!
+	addInvoiceItems(invoiceId: ID!, itemIds: [ID!]! = [], newItems: [BillableItemInput!]! = []): Invoice!
 	"""
 	Remove items from a draft invoice, in one transaction
 	(`db::Handler::remove_invoice_items`) that also bumps the invoice's

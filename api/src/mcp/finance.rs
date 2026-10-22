@@ -13,6 +13,13 @@
 //! assign the next number in their sequence, and freeze what they print, so
 //! their descriptions say so and they take an explicit date with no default.
 //!
+//! **Invoicing without the pool:** `create_invoice` and `add_invoice_items`
+//! take `newItems` — lines entered directly on the draft, validated exactly as
+//! `create_billable_item` would and created already on it in the same
+//! transaction — so an agent can cut an invoice in one call without first
+//! recording each line as an UNBILLED item. `itemIds` (existing unbilled items)
+//! still works, alone or alongside.
+//!
 //! **Importing existing invoices** needs nothing extra: billable-item dates,
 //! `issueDate` and `paidDate` all accept any past date, and `finalize_invoice`
 //! takes an optional owner-only `number` — any number not already used in the
@@ -261,6 +268,17 @@ pub fn catalogue() -> Vec<Value> {
     });
     let mut update_item_props = item_input.clone();
     update_item_props["id"] = json!({ "type": "string" });
+    // Lines entered directly on a draft (`newItems` on create_invoice and
+    // add_invoice_items): create_billable_item's fields, minus the project.
+    let new_items_prop = json!({
+        "type": "array",
+        "description": "Lines to enter directly on the invoice, each created already on it             (they never sit in the project's UNBILLED pool) — no need to create_billable_item             first. Same fields and rules as create_billable_item: an omitted unitPriceCents on             a CHARGE takes the project's default rate. Refused for an archived project.",
+        "items": {
+            "type": "object",
+            "properties": item_input.clone(),
+            "required": ["date", "description", "quantity"],
+        },
+    });
     let expense_props = json!({
         "projectId": { "type": "string", "description": "Optional — omit for an expense not tied to a project." },
         "brandId": { "type": "string", "description": "The brand it counts toward (from list_brands); omit for the default brand. Usually its project's brand." },
@@ -629,20 +647,24 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "create_invoice",
             "title": "Create draft invoice",
-            "description": "Start a DRAFT invoice for a project from at least one of that \
-                project's UNBILLED items (see `list_billable_items`). A draft has no number \
-                and can be freely changed or deleted; nothing is final until `finalize_invoice`. \
-                Optional `reference` (e.g. the client's PO number, printed in place of the \
-                project's) and `notes` (printed above the payment details).",
+            "description": "Start a DRAFT invoice for a project, with its lines entered \
+                directly (`newItems`), taken from the project's existing UNBILLED items \
+                (`itemIds`, see `list_billable_items`), or both — at least one line in all, at \
+                most 50. A draft has no number and can be freely changed or deleted (deleting \
+                it returns its lines, new ones included, to UNBILLED); nothing is final until \
+                `finalize_invoice`. Optional `reference` (e.g. the client's PO number, printed \
+                in place of the project's) and `notes` (printed above the payment details). \
+                Sends no email.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "projectId": { "type": "string" },
-                    "itemIds": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "newItems": new_items_prop.clone(),
+                    "itemIds": { "type": "array", "items": { "type": "string" }, "description": "Existing UNBILLED items of this project to put on the invoice." },
                     "reference": { "type": "string" },
                     "notes": { "type": "string" },
                 },
-                "required": ["projectId", "itemIds"],
+                "required": ["projectId"],
             },
             "outputSchema": wrap("invoice", invoice_schema()),
             "annotations": { "title": "Create draft invoice", "idempotentHint": false },
@@ -668,18 +690,22 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "add_invoice_items",
             "title": "Add items to a draft invoice",
-            "description": "Attach more of the project's UNBILLED items to a DRAFT invoice. \
-                Refused on a finalized invoice.",
+            "description": "Add lines to a DRAFT invoice: new lines entered directly \
+                (`newItems`), more of the project's UNBILLED items (`itemIds`), or both. To \
+                change a line already on the draft use update_billable_item; to take one off, \
+                remove_invoice_items. Refused on a finalized invoice. Sends no email.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "invoiceId": { "type": "string" },
-                    "itemIds": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "newItems": new_items_prop,
+                    "itemIds": { "type": "array", "items": { "type": "string" }, "description": "Existing UNBILLED items of the invoice's project to attach." },
                 },
-                "required": ["invoiceId", "itemIds"],
+                "required": ["invoiceId"],
             },
             "outputSchema": wrap("invoice", invoice_schema()),
-            "annotations": { "title": "Add items to a draft invoice", "idempotentHint": true },
+            // Not idempotent: each call with `newItems` creates new lines.
+            "annotations": { "title": "Add items to a draft invoice", "idempotentHint": false },
         }),
         json!({
             "name": "remove_invoice_items",
@@ -1047,6 +1073,30 @@ fn quantity_arg(arguments: &Value) -> Option<String> {
     }
 }
 
+/// `create_invoice`'s and `add_invoice_items`' lines: `itemIds` (existing
+/// items, possibly none) and `newItems` (each a `BillableItemInput`). The
+/// server enforces "at least one line"; this only rejects a new item missing
+/// a required field, naming it, before the GraphQL call would.
+fn invoice_lines_args(arguments: &Value) -> Result<(Vec<String>, Vec<Value>), ToolOutcome> {
+    let item_ids = id_list(arguments, "itemIds").unwrap_or_default();
+    let mut new_items = Vec::new();
+    if let Some(lines) = arguments.get("newItems").and_then(Value::as_array) {
+        for (i, line) in lines.iter().enumerate() {
+            let (Some(_), Some(_), Some(quantity)) = (
+                string_arg(line, "date"),
+                string_arg(line, "description"),
+                quantity_arg(line),
+            ) else {
+                return Err(missing_argument(&format!(
+                    "newItems[{i}].date/description/quantity"
+                )));
+            };
+            new_items.push(item_input(line, quantity));
+        }
+    }
+    Ok((item_ids, new_items))
+}
+
 fn id_list(arguments: &Value, name: &str) -> Option<Vec<String>> {
     let items: Vec<String> = arguments
         .get(name)?
@@ -1251,15 +1301,17 @@ where
             }
         }
         "create_invoice" => {
-            let (Some(project_id), Some(item_ids)) = (
-                string_arg(arguments, "projectId"),
-                id_list(arguments, "itemIds"),
-            ) else {
-                return Some(missing_argument("projectId/itemIds"));
+            let Some(project_id) = string_arg(arguments, "projectId") else {
+                return Some(missing_argument("projectId"));
+            };
+            let (item_ids, new_items) = match invoice_lines_args(arguments) {
+                Ok(lines) => lines,
+                Err(outcome) => return Some(outcome),
             };
             let doc = format!(
-                "mutation McpCreateInvoice($projectId: ID!, $itemIds: [ID!]!, $reference: String, \
-                 $notes: String) {{ createInvoice(projectId: $projectId, itemIds: $itemIds, \
+                "mutation McpCreateInvoice($projectId: ID!, $itemIds: [ID!]!, \
+                 $newItems: [BillableItemInput!]!, $reference: String, $notes: String) {{ \
+                 createInvoice(projectId: $projectId, itemIds: $itemIds, newItems: $newItems, \
                  reference: $reference, notes: $notes) {{ {INVOICE_DETAIL_FIELDS} }} }}"
             );
             rename(
@@ -1268,6 +1320,7 @@ where
                     json!({
                         "projectId": project_id,
                         "itemIds": item_ids,
+                        "newItems": new_items,
                         "reference": string_arg(arguments, "reference"),
                         "notes": string_arg(arguments, "notes"),
                     }),
@@ -1300,21 +1353,44 @@ where
                 "invoice",
             )
         }
-        "add_invoice_items" | "remove_invoice_items" => {
+        "add_invoice_items" => {
+            let Some(invoice_id) = string_arg(arguments, "invoiceId") else {
+                return Some(missing_argument("invoiceId"));
+            };
+            let (item_ids, new_items) = match invoice_lines_args(arguments) {
+                Ok(lines) => lines,
+                Err(outcome) => return Some(outcome),
+            };
+            let doc = format!(
+                "mutation McpAddInvoiceItems($invoiceId: ID!, $itemIds: [ID!]!, \
+                 $newItems: [BillableItemInput!]!) {{ addInvoiceItems(invoiceId: $invoiceId, \
+                 itemIds: $itemIds, newItems: $newItems) {{ {INVOICE_DETAIL_FIELDS} }} }}"
+            );
+            rename(
+                ctx.run(
+                    &doc,
+                    json!({
+                        "invoiceId": invoice_id,
+                        "itemIds": item_ids,
+                        "newItems": new_items,
+                    }),
+                )
+                .await,
+                "addInvoiceItems",
+                "invoice",
+            )
+        }
+        "remove_invoice_items" => {
             let (Some(invoice_id), Some(item_ids)) = (
                 string_arg(arguments, "invoiceId"),
                 id_list(arguments, "itemIds"),
             ) else {
                 return Some(missing_argument("invoiceId/itemIds"));
             };
-            let field = if name == "add_invoice_items" {
-                "addInvoiceItems"
-            } else {
-                "removeInvoiceItems"
-            };
             let doc = format!(
-                "mutation McpInvoiceItems($invoiceId: ID!, $itemIds: [ID!]!) {{ \
-                 {field}(invoiceId: $invoiceId, itemIds: $itemIds) {{ {INVOICE_DETAIL_FIELDS} }} }}"
+                "mutation McpRemoveInvoiceItems($invoiceId: ID!, $itemIds: [ID!]!) {{ \
+                 removeInvoiceItems(invoiceId: $invoiceId, itemIds: $itemIds) \
+                 {{ {INVOICE_DETAIL_FIELDS} }} }}"
             );
             rename(
                 ctx.run(
@@ -1322,7 +1398,7 @@ where
                     json!({ "invoiceId": invoice_id, "itemIds": item_ids }),
                 )
                 .await,
-                field,
+                "removeInvoiceItems",
                 "invoice",
             )
         }

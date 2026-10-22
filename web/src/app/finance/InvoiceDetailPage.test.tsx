@@ -91,6 +91,8 @@ function invoiceResponse(
           id: "proj-1",
           name: "Website Redesign",
           reference: "Shopfront site",
+          archived: false,
+          defaultUnitPriceCents: 15000,
           client: {
             __typename: "Client",
             id: "client-1",
@@ -184,7 +186,7 @@ describe("InvoiceDetailPage — draft", () => {
 
     expect(await screen.findByText("Draft invoice")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Add items" }),
+      screen.getByRole("button", { name: "Add unbilled items" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Delete draft" }),
@@ -211,6 +213,67 @@ describe("InvoiceDetailPage — draft", () => {
         dueDate: "2026-09-18",
         number: null,
       }),
+    );
+  });
+
+  it("types a new line straight onto the draft", async () => {
+    let newLineVariables: Record<string, unknown> | undefined;
+    server.use(
+      relayEndpoint.query("InvoiceDetailPageQuery", () =>
+        HttpResponse.json(invoiceResponse()),
+      ),
+      relayEndpoint.mutation(
+        "InvoiceDraftPanelNewLineMutation",
+        ({ variables }) => {
+          newLineVariables = variables;
+          return HttpResponse.json({
+            data: {
+              addInvoiceItems: {
+                ...invoiceResponse().data.invoice,
+                items: [
+                  item1,
+                  {
+                    ...item1,
+                    id: "item-2",
+                    description: "Hosting setup",
+                    quantity: "2",
+                    amountCents: 30000,
+                  },
+                ],
+              },
+            },
+          });
+        },
+      ),
+    );
+    const user = UserEvent.setup();
+    renderPage();
+
+    await screen.findByText("Draft invoice");
+    await user.click(screen.getByRole("button", { name: "New line" }));
+    // The project's default rate is pre-filled.
+    expect(screen.getByLabelText("Unit price (AUD)")).toHaveValue("150");
+    await user.type(screen.getByLabelText("Description"), "Hosting setup");
+    await user.type(screen.getByLabelText("Quantity"), "2");
+    await user.click(screen.getByRole("button", { name: "Add line" }));
+
+    await waitFor(() =>
+      expect(newLineVariables).toEqual({
+        invoiceId: "inv-1",
+        input: {
+          kind: "CHARGE",
+          date: localToday(),
+          description: "Hosting setup",
+          quantity: "2",
+          unit: "",
+          unitPriceCents: 15000,
+          gstFree: false,
+        },
+      }),
+    );
+    // Remounted, ready for the next line.
+    await waitFor(() =>
+      expect(screen.getByLabelText("Description")).toHaveValue(""),
     );
   });
 
