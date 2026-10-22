@@ -753,10 +753,6 @@ resource "aws_dynamodb_table" "invoice" {
     type = "S"
   }
   attribute {
-    name = "created_at"
-    type = "N"
-  }
-  attribute {
     name = "list_key"
     type = "S"
   }
@@ -795,35 +791,6 @@ resource "aws_dynamodb_table" "invoice" {
     projection_type = "ALL"
   }
 
-  # Superseded by the two list_key indexes above and no longer read; kept
-  # only so the code deployed before them keeps working until this change is
-  # live. Removed by a follow-up change.
-  global_secondary_index {
-    name = "instance_id-created_at-index"
-    key_schema {
-      attribute_name = "instance_id"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "created_at"
-      key_type       = "RANGE"
-    }
-    projection_type = "ALL"
-  }
-
-  # Superseded, as above.
-  global_secondary_index {
-    name = "project_id-created_at-index"
-    key_schema {
-      attribute_name = "project_id"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "created_at"
-      key_type       = "RANGE"
-    }
-    projection_type = "ALL"
-  }
 }
 
 # ── credit_note ──────────────────────────────────────────────────────────────
@@ -856,10 +823,6 @@ resource "aws_dynamodb_table" "credit_note" {
   attribute {
     name = "invoice_id"
     type = "S"
-  }
-  attribute {
-    name = "created_at"
-    type = "N"
   }
   attribute {
     name = "list_key"
@@ -896,35 +859,6 @@ resource "aws_dynamodb_table" "credit_note" {
     projection_type = "ALL"
   }
 
-  # Superseded by the two list_key indexes above and no longer read; kept
-  # only so the code deployed before them keeps working until this change is
-  # live. Removed by a follow-up change.
-  global_secondary_index {
-    name = "instance_id-created_at-index"
-    key_schema {
-      attribute_name = "instance_id"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "created_at"
-      key_type       = "RANGE"
-    }
-    projection_type = "ALL"
-  }
-
-  # Superseded, as above.
-  global_secondary_index {
-    name = "invoice_id-created_at-index"
-    key_schema {
-      attribute_name = "invoice_id"
-      key_type       = "HASH"
-    }
-    key_schema {
-      attribute_name = "created_at"
-      key_type       = "RANGE"
-    }
-    projection_type = "ALL"
-  }
 }
 
 # ── message_delivery ─────────────────────────────────────────────────────────
