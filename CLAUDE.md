@@ -408,9 +408,15 @@ local setup, and `SCHEMA.md` for the data model.
     form only) is both listing GSIs' sort key **and a DynamoDB reserved word** — alias it (`#d`) in
     any expression.
   - **Invoices (`{prefix}_invoice`): snapshot-on-finalize, strict finality, transactions.**
-    `createInvoice(projectId, itemIds)` starts a draft with ≥ 1 unbilled item from that project;
-    `addInvoiceItems`/`removeInvoiceItems` attach/detach items on a draft (removing every item —
-    an empty draft — is allowed; finalizing one is not); `deleteInvoice` removes a draft outright.
+    `createInvoice(projectId, itemIds, newItems)` starts a draft with ≥ 1 line from that project;
+    `addInvoiceItems(invoiceId, itemIds, newItems)`/`removeInvoiceItems` attach/detach items on a
+    draft (removing every item — an empty draft — is allowed; finalizing one is not);
+    `deleteInvoice` removes a draft outright. `itemIds` are existing unbilled items; `newItems` are
+    lines entered directly on the draft — validated by the same `validate_new_billable_item` as
+    `createBillableItem` (archived project refused, project default rate) and `Put` with
+    `invoice_id` already set in the invoice's own transaction, so they are never, even briefly, in
+    the project's unbilled pool. Once written they are ordinary billable items: removing one from
+    the draft (or deleting the draft) leaves it unbilled, like any other.
     A draft also carries an optional PO/`reference` (printed instead of the project's) and `notes`
     (printed above the payment details), set by `createInvoice` or `updateInvoiceDetails`.
     All four write the invoice's `item_ids` and the affected items' `invoice_id` together in one

@@ -8,6 +8,7 @@ import type { InvoiceDraftPanelFinalizeMutation } from "./__generated__/InvoiceD
 import type { InvoiceDraftPanelAddItemsQuery } from "./__generated__/InvoiceDraftPanelAddItemsQuery.graphql";
 import type { InvoiceDraftPanelAddItemsMutation } from "./__generated__/InvoiceDraftPanelAddItemsMutation.graphql";
 import type { InvoiceDraftPanelDetailsMutation } from "./__generated__/InvoiceDraftPanelDetailsMutation.graphql";
+import type { InvoiceDraftPanelNewLineMutation } from "./__generated__/InvoiceDraftPanelNewLineMutation.graphql";
 import { useRetryableLazyLoadQuery } from "../../components/useRetryableLazyLoadQuery";
 import RelayErrorBoundary from "../../components/RelayErrorBoundary";
 import LoadingIndicator from "../../components/LoadingIndicator";
@@ -17,8 +18,9 @@ import TextInput from "../../components/ui/TextInput";
 import { inputBase } from "../../components/ui/inputStyles";
 import { relayMutationErrorMessage } from "../../lib/relayMutationError";
 import { addDays, formatDate, localToday } from "../../lib/dates";
-import { formatCents } from "../../lib/money";
+import { centsToInput, formatCents } from "../../lib/money";
 import { BillableItemRow } from "./BillableItemRow";
+import { BillableItemForm } from "./BillableItemForm";
 import { InvoiceDownloadButton } from "./InvoiceDownloadButton";
 
 // `billableItems` is a connection; a project could in principle have more
@@ -37,6 +39,8 @@ const invoiceDraftPanelFragment = graphql`
     project {
       id
       reference
+      archived
+      defaultUnitPriceCents
       client {
         effectivePaymentTermsDays
       }
@@ -193,7 +197,83 @@ function AddInvoiceItemsPanel({
 }
 
 /**
- * A draft invoice's own actions: manage its items (remove one, or open
+ * "New line": type a line straight onto the draft (`addInvoiceItems`'s
+ * `newItems`) — it's created already on this invoice, never in the
+ * project's unbilled pool. Like the project page's "Add item", the form
+ * remounts after each line, keeping the date just used, so several lines
+ * can be entered in a row.
+ */
+function NewInvoiceLineForm({
+  invoiceId,
+  currency,
+  defaultPrice,
+  onDone,
+}: {
+  invoiceId: string;
+  currency: string;
+  /** The project's default rate as typed, or "" for none. */
+  defaultPrice: string;
+  onDone: () => void;
+}) {
+  const [formKey, setFormKey] = useState(0);
+  const [lastDate, setLastDate] = useState(() => localToday());
+  const [error, setError] = useState<string | null>(null);
+  const [commit, isSaving] = useMutation<InvoiceDraftPanelNewLineMutation>(
+    graphql`
+      mutation InvoiceDraftPanelNewLineMutation(
+        $invoiceId: ID!
+        $input: BillableItemInput!
+      ) {
+        addInvoiceItems(invoiceId: $invoiceId, newItems: [$input]) {
+          id
+          totalsProblem
+          items {
+            id
+            ...BillableItemRow_item
+          }
+          ...InvoicePreview_invoice
+        }
+      }
+    `,
+  );
+
+  return (
+    <div className="rounded-lg border border-line p-4">
+      <BillableItemForm
+        key={formKey}
+        idPrefix="new-line"
+        currency={currency}
+        initial={{
+          date: lastDate,
+          description: "",
+          quantity: "",
+          price: defaultPrice,
+        }}
+        submitLabel="Add line"
+        savingLabel="Adding…"
+        isSaving={isSaving}
+        error={error}
+        onCancel={onDone}
+        onSubmit={(input) => {
+          setError(null);
+          commit({
+            variables: { invoiceId, input },
+            onCompleted: () => {
+              setLastDate(input.date);
+              setFormKey((k) => k + 1);
+            },
+            onError: (err) =>
+              setError(relayMutationErrorMessage(err, "Failed to add line.")),
+          });
+        }}
+      />
+    </div>
+  );
+}
+
+/**
+ * A draft invoice's own actions: manage its items (remove one, type a new
+ * line straight onto it with {@link NewInvoiceLineForm}, or open
  * {@link AddInvoiceItemsPanel} to add more of the project's unbilled
  * ones), delete the draft outright, or finalize it. `isOwner` decides
  * whether a "Complete the finance settings first" error (from
@@ -212,6 +292,7 @@ export function InvoiceDraftPanel({
   const data = useFragment(invoiceDraftPanelFragment, invoice);
   const navigate = useNavigate();
   const [showAdd, setShowAdd] = useState(false);
+  const [showNewLine, setShowNewLine] = useState(false);
   const [showFinalize, setShowFinalize] = useState(false);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
@@ -397,7 +478,7 @@ export function InvoiceDraftPanel({
         </h2>
         {data.items.length === 0 ? (
           <p className="rounded-lg border border-dashed border-line p-4 text-sm text-ink-muted">
-            No items yet — add some below.
+            No items yet — add a line below.
           </p>
         ) : (
           <div className="rounded-lg border border-line">
@@ -470,8 +551,14 @@ export function InvoiceDraftPanel({
       )}
 
       <div className="flex flex-wrap gap-2">
+        {/* An archived project takes no new items, so no new lines either. */}
+        {!data.project.archived && (
+          <Button variant="secondary" onClick={() => setShowNewLine((v) => !v)}>
+            {showNewLine ? "Hide new line" : "New line"}
+          </Button>
+        )}
         <Button variant="secondary" onClick={() => setShowAdd((v) => !v)}>
-          {showAdd ? "Hide add items" : "Add items"}
+          {showAdd ? "Hide unbilled items" : "Add unbilled items"}
         </Button>
         {!confirmingDelete ? (
           <Button
@@ -508,6 +595,19 @@ export function InvoiceDraftPanel({
           Finalize
         </Button>
       </div>
+
+      {showNewLine && (
+        <NewInvoiceLineForm
+          invoiceId={data.id}
+          currency={data.currency}
+          defaultPrice={
+            data.project.defaultUnitPriceCents == null
+              ? ""
+              : centsToInput(data.project.defaultUnitPriceCents)
+          }
+          onDone={() => setShowNewLine(false)}
+        />
+      )}
 
       {showAdd && (
         <RelayErrorBoundary canRetry>

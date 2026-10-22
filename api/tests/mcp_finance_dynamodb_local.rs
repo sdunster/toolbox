@@ -5,6 +5,7 @@
 //!     (needs a business name; strictly final afterwards) -> paid -> PDF link,
 //!     with a draft's PDF link the watermarked review copy;
 //!   - draft editing (add/remove/delete) and `update_project`'s merge semantics,
+//!     and invoicing in one call with `newItems` (no `create_billable_item` first),
 //!     including keeping a project's brand; `list_brands`;
 //!   - expenses: a purchase and a cents-per-km trip, update/delete, and the
 //!     caller's financial-year km summary;
@@ -391,6 +392,90 @@ async fn draft_invoices_can_be_reshaped_and_deleted() {
     call_tool(&w.f, t, "delete_billable_item", json!({"id": id(&a)}))
         .await
         .unwrap();
+}
+
+/// `newItems` cuts an invoice without touching the unbilled pool: one
+/// `create_invoice` call, then more lines with `add_invoice_items`, and a new
+/// line missing a required field is named before the call.
+#[tokio::test]
+async fn invoice_lines_can_be_entered_directly() {
+    let Some(w) = world().await else { return };
+    let t = &w.member_token;
+    let pid = project(&w, "Direct lines").await;
+
+    let created = call_tool(
+        &w.f,
+        t,
+        "create_invoice",
+        json!({"projectId": pid, "reference": "PO-77", "newItems": [
+            {"date": "2026-09-02", "description": "Design", "quantity": "3", "unit": "hrs",
+             "unitPriceCents": 12_000},
+            {"date": "2026-09-03", "description": "Hosting", "quantity": 1,
+             "unitPriceCents": 5_000, "gstFree": true},
+        ]}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    let inv_id = id(&created);
+    assert_eq!(created["status"], "DRAFT");
+    assert_eq!(created["ownReference"], "PO-77");
+    let items = created["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert!(items.iter().all(|i| i["status"] == "DRAFT"));
+    assert_eq!(items[0]["unit"], "hrs");
+    assert_eq!(items[1]["gstFree"], true);
+    assert_eq!(created["subtotalCents"], 41_000);
+
+    // Nothing went through the unbilled pool.
+    let unbilled = call_tool(
+        &w.f,
+        t,
+        "list_billable_items",
+        json!({"instanceId": w.instance, "projectId": pid, "filter": "UNBILLED"}),
+    )
+    .await
+    .unwrap();
+    assert!(unbilled["items"].as_array().unwrap().is_empty());
+
+    let added = call_tool(
+        &w.f,
+        t,
+        "add_invoice_items",
+        json!({"invoiceId": inv_id, "newItems": [
+            {"date": "2026-09-04", "description": "Returning client", "quantity": "1",
+             "unitPriceCents": 1_000, "kind": "DISCOUNT"},
+        ]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(added["invoice"]["items"].as_array().unwrap().len(), 3);
+    assert_eq!(added["invoice"]["subtotalCents"], 40_000);
+
+    let missing = call_tool(
+        &w.f,
+        t,
+        "add_invoice_items",
+        json!({"invoiceId": inv_id, "newItems": [{"date": "2026-09-04", "quantity": "1"}]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(missing.contains("newItems[0]"), "{missing}");
+    let nothing = call_tool(&w.f, t, "create_invoice", json!({"projectId": pid}))
+        .await
+        .unwrap_err();
+    assert!(nothing.contains("At least one item"), "{nothing}");
+
+    set_business_name(&w).await;
+    let finalized = call_tool(
+        &w.f,
+        t,
+        "finalize_invoice",
+        json!({"invoiceId": inv_id, "issueDate": "2026-09-30"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(finalized["invoice"]["lines"].as_array().unwrap().len(), 3);
 }
 
 #[tokio::test]

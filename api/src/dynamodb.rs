@@ -1119,9 +1119,35 @@ const BILLABLE_ITEM_KIND_DISCOUNT: &str = "discount";
 
 /// A new `billable_item` row and the record it hydrates to — shared by
 /// `create_billable_item` and `rebill_expense`.
+/// `Put`s for lines entered directly on a draft invoice
+/// (`create_invoice`/`add_invoice_items`): each row is written with
+/// `invoice_id` already set, conditioned on `attribute_not_exists(id)` like
+/// every other `create_*`. Returns the transaction items and the records.
+fn new_invoice_item_puts(
+    table_name: &str,
+    invoice_id: &str,
+    items: &[db::NewBillableItem<'_>],
+) -> db::Result<(Vec<TransactWriteItem>, Vec<db::BillableItem>)> {
+    let mut puts = Vec::with_capacity(items.len());
+    let mut records = Vec::with_capacity(items.len());
+    for item in items {
+        let (row, record) = billable_item_row(item, None, Some(invoice_id));
+        let put = Put::builder()
+            .table_name(table_name)
+            .set_item(Some(row))
+            .condition_expression("attribute_not_exists(id)")
+            .build()
+            .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
+        puts.push(TransactWriteItem::builder().put(put).build());
+        records.push(record);
+    }
+    Ok((puts, records))
+}
+
 fn billable_item_row(
     item: &db::NewBillableItem<'_>,
     source_expense_id: Option<&str>,
+    invoice_id: Option<&str>,
 ) -> (HashMap<String, AttributeValue>, db::BillableItem) {
     let id = new_id();
     let now = crate::clock::now_sec();
@@ -1173,6 +1199,12 @@ fn billable_item_row(
             AttributeValue::S(expense_id.to_string()),
         );
     }
+    if let Some(invoice_id) = invoice_id {
+        row.insert(
+            "invoice_id".to_string(),
+            AttributeValue::S(invoice_id.to_string()),
+        );
+    }
     let record = db::BillableItem {
         id,
         instance_id: item.instance_id.to_string(),
@@ -1183,7 +1215,7 @@ fn billable_item_row(
         unit_price_cents: item.unit_price_cents,
         unit: item.unit.map(str::to_string),
         discount: item.discount,
-        invoice_id: None,
+        invoice_id: invoice_id.map(str::to_string),
         gst_free: item.gst_free,
         source_expense_id: source_expense_id.map(str::to_string),
         created_by_user_id: item.created_by_user_id.to_string(),
@@ -3590,7 +3622,7 @@ impl db::Handler for Handler {
         item: &db::NewBillableItem<'_>,
     ) -> db::Result<db::BillableItem> {
         self.ensure_writable()?;
-        let (row, record) = billable_item_row(item, None);
+        let (row, record) = billable_item_row(item, None, None);
         let resp = self
             .client
             .put_item()
@@ -3615,7 +3647,7 @@ impl db::Handler for Handler {
         item: &db::NewBillableItem<'_>,
     ) -> db::Result<Option<db::BillableItem>> {
         self.ensure_writable()?;
-        let (row, record) = billable_item_row(item, Some(expense_id));
+        let (row, record) = billable_item_row(item, Some(expense_id), None);
         let put_item = Put::builder()
             .table_name(self.table_name("billable_item"))
             .set_item(Some(row))
@@ -4333,6 +4365,7 @@ impl db::Handler for Handler {
             instance_id,
             project_id,
             item_ids,
+            new_items,
             created_by_user_id,
             brand_id,
             reference,
@@ -4341,6 +4374,13 @@ impl db::Handler for Handler {
         let id = new_id();
         let now = crate::clock::now_sec();
         let list_key = db::draft_list_key(now);
+        let (new_item_puts, new_records) =
+            new_invoice_item_puts(&self.table_name("billable_item"), &id, new_items)?;
+        let all_item_ids: Vec<String> = item_ids
+            .iter()
+            .cloned()
+            .chain(new_records.iter().map(|r| r.id.clone()))
+            .collect();
 
         let mut invoice_item: HashMap<String, AttributeValue> = HashMap::from([
             ("id".to_string(), AttributeValue::S(id.clone())),
@@ -4362,10 +4402,10 @@ impl db::Handler for Handler {
             ("updated_at".to_string(), AttributeValue::N(now.to_string())),
             ("list_key".to_string(), AttributeValue::S(list_key.clone())),
         ]);
-        if !item_ids.is_empty() {
+        if !all_item_ids.is_empty() {
             invoice_item.insert(
                 "item_ids".to_string(),
-                AttributeValue::Ss(item_ids.to_vec()),
+                AttributeValue::Ss(all_item_ids.clone()),
             );
         }
         for (attr, value) in [
@@ -4402,6 +4442,7 @@ impl db::Handler for Handler {
                 .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
             transact_items.push(TransactWriteItem::builder().update(update).build());
         }
+        transact_items.extend(new_item_puts);
 
         let committed = self
             .transact_write("create_invoice", transact_items)
@@ -4415,7 +4456,7 @@ impl db::Handler for Handler {
             project_id: project_id.to_string(),
             status: db::InvoiceStatus::Draft,
             version: 1,
-            item_ids: item_ids.to_vec(),
+            item_ids: all_item_ids,
             created_by_user_id: created_by_user_id.to_string(),
             created_at: now,
             updated_at: now,
@@ -4500,10 +4541,18 @@ impl db::Handler for Handler {
         invoice_id: &str,
         project_id: &str,
         item_ids: &[String],
+        new_items: &[db::NewBillableItem<'_>],
         expected_version: u64,
-    ) -> db::Result<bool> {
+    ) -> db::Result<Option<Vec<db::BillableItem>>> {
         self.ensure_writable()?;
         let now = crate::clock::now_sec();
+        let (new_item_puts, new_records) =
+            new_invoice_item_puts(&self.table_name("billable_item"), invoice_id, new_items)?;
+        let all_item_ids: Vec<String> = item_ids
+            .iter()
+            .cloned()
+            .chain(new_records.iter().map(|r| r.id.clone()))
+            .collect();
         let update_invoice = Update::builder()
             .table_name(self.table_name("invoice"))
             .key("id", AttributeValue::S(invoice_id.to_string()))
@@ -4512,7 +4561,7 @@ impl db::Handler for Handler {
             .expression_attribute_names("#status", "status")
             .expression_attribute_names("#v", "version")
             .expression_attribute_values(":now", AttributeValue::N(now.to_string()))
-            .expression_attribute_values(":ids", AttributeValue::Ss(item_ids.to_vec()))
+            .expression_attribute_values(":ids", AttributeValue::Ss(all_item_ids))
             .expression_attribute_values(":one", AttributeValue::N("1".to_string()))
             .expression_attribute_values(":draft", AttributeValue::S("draft".to_string()))
             .expression_attribute_values(
@@ -4543,8 +4592,11 @@ impl db::Handler for Handler {
                 .map_err(|e| db::Error::Infrastructure(e.to_string()))?;
             transact_items.push(TransactWriteItem::builder().update(update).build());
         }
-        self.transact_write("add_invoice_items", transact_items)
-            .await
+        transact_items.extend(new_item_puts);
+        let committed = self
+            .transact_write("add_invoice_items", transact_items)
+            .await?;
+        Ok(committed.then_some(new_records))
     }
 
     async fn remove_invoice_items(

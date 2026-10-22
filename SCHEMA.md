@@ -638,7 +638,8 @@ page is full or the index is exhausted, and `billable_items_dynamodb_local.rs` p
   GST base unless it's `gst_free`. Finalizing refuses an invoice whose subtotal or taxable
   subtotal would go below zero (`finance::snapshot::check_discounts`).
 - `invoice_id` (S) — optional; absent means unbilled. Set by the transactional attach path
-  (`createInvoice`/`addInvoiceItems`, `db::Handler`'s `create_invoice`/`add_invoice_items`) and
+  (`createInvoice`/`addInvoiceItems`, `db::Handler`'s `create_invoice`/`add_invoice_items` — which
+  also `Put` a `newItems` line with it already set, in the same transaction) and
   cleared by the transactional detach path (`removeInvoiceItems`/`deleteInvoice`), always together
   with the owning `{prefix}_invoice` row's `item_ids` — see that table's entry below. `delete`
   stays conditional on `attribute_not_exists(invoice_id)` regardless of the invoice's own status
@@ -708,7 +709,7 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   snapshot that's already stale. See "Known issues and risks" for the gap this (deliberately)
   still leaves in the *numbering*, not in `version` itself.
 - `item_ids` (SS) — the authoritative set of items on this invoice; absent (empty) is the only way
-  a String Set represents "no items". `createInvoice` requires at least one item to start with, but
+  a String Set represents "no items". `createInvoice` requires at least one item to start with (existing or new), but
   `removeInvoiceItems` may empty a draft afterward (finalizing one is refused instead). Every
   `{prefix}_billable_item` row whose `invoice_id` equals this row's `id` must appear here, and vice
   versa — enforced structurally by the transactional writes, never by a separate consistency pass.
