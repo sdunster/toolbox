@@ -34,8 +34,8 @@
 //! Layout mirrors the product's original sample invoice (see the design
 //! doc's "PDF (PR 4)" section for the exact numbers): a title, a two-column
 //! header (invoice details/bill-to on the left, seller details on the
-//! right), a line-item table with a grey header row and shaded body rows,
-//! totals, and a payment-details footer. Every field that carries
+//! right), a ruled line-item table (grey header row, shaded Description
+//! cells, the totals as its last rows), and a payment-details footer. Every field that carries
 //! user-entered text (bill-to name/ABN/address, reference, seller
 //! name/address/phone/email/ABN, item descriptions, payment details) is
 //! word-wrapped to its column's available width — breaking a single word
@@ -117,27 +117,40 @@ const COL_DESC_X1: f32 = 342.0;
 const COL_QTY_X1: f32 = 408.0;
 const COL_PRICE_X1: f32 = 473.0;
 const COL_TOTAL_X1: f32 = MARGIN_RIGHT;
+/// Every column edge, left to right — the table's vertical grid lines.
+const COLUMN_EDGES: [f32; 5] = [
+    COL_DESC_X0,
+    COL_DESC_X1,
+    COL_QTY_X1,
+    COL_PRICE_X1,
+    COL_TOTAL_X1,
+];
 /// Inset from a column's edges for its text.
 const CELL_PAD: f32 = 6.0;
 
-const HEADER_ROW_HEIGHT: f32 = 22.0;
-const HEADER_FONT_SIZE: f32 = 12.0;
+const HEADER_ROW_HEIGHT: f32 = 20.0;
+const HEADER_FONT_SIZE: f32 = 10.0;
 const BODY_FONT_SIZE: f32 = 10.0;
 const BODY_LINE_HEIGHT: f32 = 13.0;
 /// Vertical padding above/below a body row's wrapped description lines.
-const ROW_V_PAD: f32 = 8.0;
+const ROW_V_PAD: f32 = 4.0;
+/// Height of a totals row (subtotal, GST, total) at the foot of the table.
+const TOTALS_ROW_HEIGHT: f32 = 20.0;
+/// Gap between the bottom of the table and whatever follows it.
+const TABLE_BOTTOM_GAP: f32 = 20.0;
 /// Hanging indent for a bulleted description line (and its wrapped
 /// continuations), and the gap after the bullet glyph.
 const BULLET_INDENT: f32 = 12.0;
 
-const TOTALS_FONT_SIZE: f32 = 12.0;
-const TOTALS_LINE_HEIGHT: f32 = 16.0;
 const NOTE_FONT_SIZE: f32 = 14.0;
 const PAYMENT_FONT_SIZE: f32 = 12.0;
 const PAYMENT_LINE_HEIGHT: f32 = 14.0;
 
 const HEADER_FILL: (f32, f32, f32) = (0.74, 0.75, 0.75);
 const BODY_FILL: (f32, f32, f32) = (0.86, 0.86, 0.86);
+const GRID_COLOR: (f32, f32, f32) = (0.45, 0.45, 0.45);
+/// Grid line thickness, in pt.
+const GRID_THICKNESS: f32 = 0.75;
 
 fn mm(pt: f32) -> Mm {
     Mm::from(Pt(pt))
@@ -198,24 +211,24 @@ impl Metrics {
 }
 
 /// Greedy word-wrap of one already-bullet-stripped line into as many lines
-/// as needed to fit `max_width`pt at `size`. A single word wider than
+/// as needed to fit `max_width`pt at `size` in the regular or `bold` face. A single word wider than
 /// `max_width` — a long email address, an unbroken token — is itself
 /// broken into as many character-chunks as it takes to fit, via
 /// [`break_word`], rather than overflowing the column or looping forever.
 /// An empty `text` yields exactly one empty line, so blank description
 /// lines are preserved rather than swallowed.
-fn wrap_line(metrics: &Metrics, text: &str, max_width: f32, size: f32) -> Vec<String> {
+fn wrap_line(metrics: &Metrics, text: &str, max_width: f32, size: f32, bold: bool) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        if metrics.width(word, size, false) > max_width {
+        if metrics.width(word, size, bold) > max_width {
             // The word alone doesn't fit even on an empty line: flush
             // whatever's pending, then spread the word itself across as
             // many character-chunks as it takes.
             if !current.is_empty() {
                 lines.push(std::mem::take(&mut current));
             }
-            lines.extend(break_word(metrics, word, max_width, size));
+            lines.extend(break_word(metrics, word, max_width, size, bold));
             continue;
         }
         let candidate = if current.is_empty() {
@@ -223,7 +236,7 @@ fn wrap_line(metrics: &Metrics, text: &str, max_width: f32, size: f32) -> Vec<St
         } else {
             format!("{current} {word}")
         };
-        if current.is_empty() || metrics.width(&candidate, size, false) <= max_width {
+        if current.is_empty() || metrics.width(&candidate, size, bold) <= max_width {
             current = candidate;
         } else {
             lines.push(std::mem::replace(&mut current, word.to_string()));
@@ -241,13 +254,13 @@ fn wrap_line(metrics: &Metrics, text: &str, max_width: f32, size: f32) -> Vec<St
 /// per-word — a chunk of exactly one character is still emitted even if
 /// that character alone is wider than `max_width`, so this never loops
 /// forever or drops input.
-fn break_word(metrics: &Metrics, word: &str, max_width: f32, size: f32) -> Vec<String> {
+fn break_word(metrics: &Metrics, word: &str, max_width: f32, size: f32, bold: bool) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut current = String::new();
     for ch in word.chars() {
         let mut candidate = current.clone();
         candidate.push(ch);
-        if current.is_empty() || metrics.width(&candidate, size, false) <= max_width {
+        if current.is_empty() || metrics.width(&candidate, size, bold) <= max_width {
             current = candidate;
         } else {
             chunks.push(std::mem::replace(&mut current, ch.to_string()));
@@ -267,7 +280,7 @@ fn break_word(metrics: &Metrics, word: &str, max_width: f32, size: f32) -> Vec<S
 /// Description column.
 fn wrap_text_lines(metrics: &Metrics, text: &str, max_width: f32, size: f32) -> Vec<String> {
     text.lines()
-        .flat_map(|line| wrap_line(metrics, line, max_width, size))
+        .flat_map(|line| wrap_line(metrics, line, max_width, size, false))
         .collect()
 }
 
@@ -286,7 +299,7 @@ struct DescLine {
 /// Split a (possibly multi-line) description into the physical lines that
 /// will be drawn: each `\n`-separated line is checked for a `"* "`/`"- "`
 /// bullet prefix (stripped and replaced with "•" at render time) and then
-/// word-wrapped to `max_width`.
+/// word-wrapped to `max_width` in the bold face it's drawn in.
 fn layout_description(metrics: &Metrics, description: &str, max_width: f32) -> Vec<DescLine> {
     let mut out = Vec::new();
     for raw_line in description.split('\n') {
@@ -298,7 +311,7 @@ fn layout_description(metrics: &Metrics, description: &str, max_width: f32) -> V
             None => (false, raw_line, 0.0),
         };
         let available = (max_width - indent).max(10.0);
-        let wrapped = wrap_line(metrics, content, available, BODY_FONT_SIZE);
+        let wrapped = wrap_line(metrics, content, available, BODY_FONT_SIZE, true);
         for (i, text) in wrapped.into_iter().enumerate() {
             out.push(DescLine {
                 text,
@@ -311,7 +324,13 @@ fn layout_description(metrics: &Metrics, description: &str, max_width: f32) -> V
 }
 
 fn row_height(desc_lines: usize) -> f32 {
-    (desc_lines.max(1) as f32) * BODY_LINE_HEIGHT + ROW_V_PAD
+    (desc_lines.max(1) as f32) * BODY_LINE_HEIGHT + 2.0 * ROW_V_PAD
+}
+
+/// The baseline that vertically centres a line of `size`pt text (by its
+/// cap height) in a band `height`pt tall whose top is at `top`.
+fn centred_baseline(top: f32, height: f32, size: f32) -> f32 {
+    top - height / 2.0 - size * 0.36
 }
 
 /// `"YYYY-MM-DD"` → `"DD/MM/YYYY"`. Falls back to the input unchanged if it
@@ -365,6 +384,17 @@ fn fill_rect(layer: &PdfLayerReference, x0: f32, y0: f32, x1: f32, y1: f32, colo
     layer.add_rect(rect);
 }
 
+/// Outline every cell of a table row spanning `y0` (bottom) to `y1` (top).
+fn stroke_cells(layer: &PdfLayerReference, y0: f32, y1: f32) {
+    layer.set_outline_color(grey(GRID_COLOR));
+    layer.set_outline_thickness(GRID_THICKNESS);
+    for edges in COLUMN_EDGES.windows(2) {
+        let rect =
+            Rect::new(mm(edges[0]), mm(y0), mm(edges[1]), mm(y1)).with_mode(PaintMode::Stroke);
+        layer.add_rect(rect);
+    }
+}
+
 struct Fonts {
     regular: IndirectFontRef,
     bold: IndirectFontRef,
@@ -383,7 +413,8 @@ fn add_page(doc: &PdfDocumentReference) -> (PdfLayerReference, f32) {
     (doc.get_page(page).get_layer(layer), CONTINUATION_TOP)
 }
 
-/// Draw the table's header row (column labels on a grey background) and
+/// Draw the table's header row (column labels on a grey background, in the
+/// same grid as the body rows) and
 /// return the y to draw the first body row at.
 fn draw_table_header(layer: &PdfLayerReference, ctx: &Ctx<'_>, currency: &str, y: f32) -> f32 {
     fill_rect(
@@ -394,7 +425,8 @@ fn draw_table_header(layer: &PdfLayerReference, ctx: &Ctx<'_>, currency: &str, y
         y,
         grey(HEADER_FILL),
     );
-    let text_y = y - HEADER_ROW_HEIGHT / 2.0 - HEADER_FONT_SIZE * 0.36;
+    stroke_cells(layer, y - HEADER_ROW_HEIGHT, y);
+    let text_y = centred_baseline(y, HEADER_ROW_HEIGHT, HEADER_FONT_SIZE);
     layer.set_fill_color(black());
     draw_left(
         layer,
@@ -423,9 +455,10 @@ fn draw_table_header(layer: &PdfLayerReference, ctx: &Ctx<'_>, currency: &str, y
     y - HEADER_ROW_HEIGHT
 }
 
-/// Draw one body row (its shaded background, description lines, and the
-/// three right-aligned numeric cells) at `y` (top of the row) and return the
-/// y for the next row.
+/// Draw one body row at `y` (top of the row) and return the y for the next
+/// row: the bold description lines in a shaded cell, and the three
+/// right-aligned numeric cells on the description's *last* line, so a
+/// bulleted breakdown reads down to its amount.
 #[allow(clippy::too_many_arguments)]
 fn draw_table_row(
     layer: &PdfLayerReference,
@@ -438,21 +471,23 @@ fn draw_table_row(
     let row_bottom = y - height;
     fill_rect(
         layer,
-        MARGIN_LEFT,
+        COL_DESC_X0,
         row_bottom,
-        MARGIN_RIGHT,
+        COL_DESC_X1,
         y,
         grey(BODY_FILL),
     );
+    stroke_cells(layer, row_bottom, y);
     layer.set_fill_color(black());
 
-    let mut line_y = y - ROW_V_PAD / 2.0 - BODY_FONT_SIZE * 0.36;
+    let mut line_y = centred_baseline(y - ROW_V_PAD, BODY_LINE_HEIGHT, BODY_FONT_SIZE);
+    let mut last_line_y = line_y;
     for desc_line in desc_lines {
         let base_x = COL_DESC_X0 + CELL_PAD + desc_line.indent;
         if desc_line.bullet_start {
             draw_left(
                 layer,
-                &ctx.fonts.regular,
+                &ctx.fonts.bold,
                 "•",
                 BODY_FONT_SIZE,
                 base_x - BULLET_INDENT * 0.6,
@@ -461,16 +496,16 @@ fn draw_table_row(
         }
         draw_left(
             layer,
-            &ctx.fonts.regular,
+            &ctx.fonts.bold,
             &desc_line.text,
             BODY_FONT_SIZE,
             base_x,
             line_y,
         );
+        last_line_y = line_y;
         line_y -= BODY_LINE_HEIGHT;
     }
 
-    let first_line_y = y - ROW_V_PAD / 2.0 - BODY_FONT_SIZE * 0.36;
     // A discount prints its amount only: its quantity (always 1) and unit
     // price say nothing the amount doesn't.
     if !line.discount {
@@ -486,7 +521,7 @@ fn draw_table_row(
             &quantity,
             BODY_FONT_SIZE,
             COL_QTY_X1 - CELL_PAD,
-            first_line_y,
+            last_line_y,
         );
         draw_right(
             layer,
@@ -496,7 +531,7 @@ fn draw_table_row(
             &money::format_cents(line.unit_price_cents),
             BODY_FONT_SIZE,
             COL_PRICE_X1 - CELL_PAD,
-            first_line_y,
+            last_line_y,
         );
     }
     draw_right(
@@ -507,7 +542,7 @@ fn draw_table_row(
         &money::format_cents(line.amount_cents),
         BODY_FONT_SIZE,
         COL_TOTAL_X1 - CELL_PAD,
-        first_line_y,
+        last_line_y,
     );
     row_bottom
 }
@@ -725,12 +760,12 @@ fn draw_header_block(
     y - TABLE_TOP_GAP
 }
 
-/// Draw the totals block (right-aligned) below the table, returning the y
-/// for whatever comes next. Each line goes through the same
-/// bottom-margin-aware new-page check as everything else — in practice this
-/// tiny, fixed-size block (at most 3 lines) never needs it, but there's no
-/// reason for it to be the one block in the document that could still lose
-/// a line off the bottom of the page.
+/// Draw the totals as the table's last rows — subtotal and GST (on a tax
+/// invoice), then the total — each a label in the Description cell and an
+/// amount in the last column, in the same grid as the body rows. Returns
+/// the y of the table's bottom edge. A row that would cross
+/// [`BOTTOM_MARGIN`] starts a new page with the header row repeated, the
+/// same as a body row.
 fn draw_totals(
     doc: &PdfDocumentReference,
     layer: &mut PdfLayerReference,
@@ -739,61 +774,59 @@ fn draw_totals(
     y: f32,
 ) -> f32 {
     let mut y = y;
-    let draw_line = |layer: &mut PdfLayerReference, y: &mut f32, bold: bool, text: &str| {
-        if *y - TOTALS_LINE_HEIGHT < BOTTOM_MARGIN {
+    let mut draw_row = |layer: &mut PdfLayerReference, bold: bool, label: &str, cents: i64| {
+        if y - TOTALS_ROW_HEIGHT < BOTTOM_MARGIN {
             let (new_layer, new_y) = add_page(doc);
             *layer = new_layer;
-            *y = new_y;
+            y = draw_table_header(layer, ctx, &snap.currency, new_y);
         }
+        stroke_cells(layer, y - TOTALS_ROW_HEIGHT, y);
         layer.set_fill_color(black());
+        let font = if bold {
+            &ctx.fonts.bold
+        } else {
+            &ctx.fonts.regular
+        };
+        let text_y = centred_baseline(y, TOTALS_ROW_HEIGHT, BODY_FONT_SIZE);
+        draw_left(
+            layer,
+            font,
+            label,
+            BODY_FONT_SIZE,
+            COL_DESC_X0 + CELL_PAD,
+            text_y,
+        );
         draw_right(
             layer,
             ctx.metrics,
-            if bold {
-                &ctx.fonts.bold
-            } else {
-                &ctx.fonts.regular
-            },
+            font,
             bold,
-            text,
-            TOTALS_FONT_SIZE,
-            MARGIN_RIGHT,
-            *y,
+            &money::format_cents(cents),
+            BODY_FONT_SIZE,
+            COL_TOTAL_X1 - CELL_PAD,
+            text_y,
         );
-        *y -= TOTALS_LINE_HEIGHT;
+        y -= TOTALS_ROW_HEIGHT;
     };
     if snap.gst_registered {
-        draw_line(
+        draw_row(
             layer,
-            &mut y,
             false,
-            &format!(
-                "Subtotal {}   {}",
-                snap.currency,
-                money::format_cents(snap.subtotal_cents)
-            ),
+            &format!("Subtotal {}", snap.currency),
+            snap.subtotal_cents,
         );
-        draw_line(
-            layer,
-            &mut y,
-            false,
-            &format!("GST (10%)   {}", money::format_cents(snap.gst_cents)),
-        );
+        draw_row(layer, false, "GST (10%)", snap.gst_cents);
     }
     let total_label = if snap.credit_note.is_some() {
         "Total credit"
     } else {
         "Total"
     };
-    draw_line(
+    draw_row(
         layer,
-        &mut y,
         true,
-        &format!(
-            "{total_label} {}   {}",
-            snap.currency,
-            money::format_cents(snap.total_cents)
-        ),
+        &format!("{total_label} {}", snap.currency),
+        snap.total_cents,
     );
     y
 }
@@ -917,8 +950,8 @@ pub fn render_invoice_pdf(snapshot: &InvoiceSnapshot) -> Result<Vec<u8>> {
         y = draw_table_row(&layer, &ctx, line, &desc_lines, y);
     }
 
-    y -= 10.0;
     y = draw_totals(&doc, &mut layer, &ctx, snapshot, y);
+    y -= TABLE_BOTTOM_GAP;
     draw_notes_and_payment(&doc, &mut layer, &ctx, snapshot, y);
 
     let mut bytes = Vec::new();
@@ -1120,14 +1153,17 @@ mod tests {
     #[test]
     fn wrap_line_preserves_a_blank_line() {
         let metrics = Metrics::new().unwrap();
-        assert_eq!(wrap_line(&metrics, "", 200.0, 10.0), vec!["".to_string()]);
+        assert_eq!(
+            wrap_line(&metrics, "", 200.0, 10.0, false),
+            vec!["".to_string()]
+        );
     }
 
     #[test]
     fn wrap_line_breaks_long_text_into_multiple_lines() {
         let metrics = Metrics::new().unwrap();
         let text = "one two three four five six seven eight nine ten";
-        let lines = wrap_line(&metrics, text, 60.0, 10.0);
+        let lines = wrap_line(&metrics, text, 60.0, 10.0, false);
         assert!(lines.len() > 1);
         for l in &lines {
             assert!(
@@ -1158,7 +1194,7 @@ mod tests {
     fn wrap_line_breaks_a_long_unbroken_word_by_characters() {
         let metrics = Metrics::new().unwrap();
         let word = "x".repeat(120);
-        let lines = wrap_line(&metrics, &word, 60.0, 10.0);
+        let lines = wrap_line(&metrics, &word, 60.0, 10.0, false);
         assert!(lines.len() > 1, "expected the word to be split into chunks");
         for l in &lines {
             assert!(
@@ -1175,7 +1211,7 @@ mod tests {
         let metrics = Metrics::new().unwrap();
         let token = "a".repeat(100);
         let text = format!("see {token} for details");
-        let lines = wrap_line(&metrics, &text, 60.0, 10.0);
+        let lines = wrap_line(&metrics, &text, 60.0, 10.0, false);
         assert!(lines.len() > 2);
         for l in &lines {
             assert!(
