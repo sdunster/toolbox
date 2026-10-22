@@ -170,6 +170,8 @@ struct World {
     instance_id: String,
     user_id: String,
     project_id: String,
+    /// The project's client.
+    client_id: String,
 }
 
 impl World {
@@ -225,13 +227,19 @@ async fn setup(label: &str) -> Option<World> {
     db.create_membership(&user.id, &instance.id, db::MembershipRole::Agent)
         .await
         .expect("membership");
+    let client_id = fictional_client(
+        &db,
+        &instance.id,
+        "Fictional Client Pty Ltd",
+        Some("client@example.com"),
+    )
+    .await;
     let project = db
         .create_project(
             &instance.id,
             &db::ProjectFields {
+                client_id: client_id.clone(),
                 name: "Fictional Job".into(),
-                client_name: "Fictional Client Pty Ltd".into(),
-                client_email: Some("client@example.com".into()),
                 default_unit_price_cents: Some(10_000),
                 ..Default::default()
             },
@@ -256,6 +264,7 @@ async fn setup(label: &str) -> Option<World> {
         instance_id: instance.id,
         user_id: user.id,
         project_id: project.id,
+        client_id,
     })
 }
 
@@ -363,7 +372,7 @@ async fn due_dates_follow_terms_and_drive_overdue() {
     let _ = require_local_db!();
     let Some(w) = setup("due").await else { return };
 
-    // The project has no terms of its own: the instance's 30 days apply.
+    // The client has no terms of its own: the instance's 30 days apply.
     let a = invoice(
         &w,
         &[item(&w, &w.project_id, "1", None, false).await],
@@ -373,25 +382,18 @@ async fn due_dates_follow_terms_and_drive_overdue() {
     .await;
     assert_eq!(str_of(&a, "dueDate"), "2026-08-31");
 
-    // A project override wins.
+    // A client override wins.
     let r = w
         .run(
-            "mutation($id: ID!, $input: UpdateProjectInput!) { updateProject(id: $id, input: $input) {
-                paymentTermsDays effectivePaymentTermsDays clientEmail defaultUnitPriceCents } }",
-            json!({ "id": w.project_id, "input": {
-                "name": "Fictional Job", "clientName": "Fictional Client Pty Ltd",
-                "clientEmail": "Client@Example.com", "paymentTermsDays": 7,
-                "defaultUnitPriceCents": 10000, "archived": false } }),
+            "mutation($id: ID!, $input: ClientInput!) { updateClient(id: $id, input: $input) {
+                paymentTermsDays effectivePaymentTermsDays email } }",
+            json!({ "id": w.client_id, "input": {
+                "name": "Fictional Client Pty Ltd",
+                "email": "Client@Example.com", "paymentTermsDays": 7 } }),
         )
         .await;
-    assert_eq!(
-        data(&r, "updateProject.effectivePaymentTermsDays"),
-        json!(7)
-    );
-    assert_eq!(
-        data(&r, "updateProject.clientEmail"),
-        json!("client@example.com")
-    );
+    assert_eq!(data(&r, "updateClient.effectivePaymentTermsDays"), json!(7));
+    assert_eq!(data(&r, "updateClient.email"), json!("client@example.com"));
     let b = invoice(
         &w,
         &[item(&w, &w.project_id, "1", None, false).await],
@@ -685,8 +687,8 @@ async fn send_invoice_mails_the_client_with_the_pdf() {
         .create_project(
             &w.instance_id,
             &db::ProjectFields {
+                client_id: fictional_client(w.db(), &w.instance_id, "Client", None).await,
                 name: "No email".into(),
-                client_name: "Client".into(),
                 ..Default::default()
             },
         )
@@ -822,20 +824,28 @@ async fn receipts_attach_only_their_own_uploads() {
     };
     let id = expense(&w, None).await;
     let other = expense(&w, None).await;
-    let r = w
-        .run(
-            "mutation($id: ID!) { createExpenseReceiptUpload(expenseId: $id, filename: \"receipt.pdf\", contentType: \"application/pdf\") { key uploadUrl } }",
-            json!({ "id": id }),
-        )
-        .await;
-    let key = data(&r, "createExpenseReceiptUpload.key")
-        .as_str()
-        .unwrap()
-        .to_string();
+    let upload = |name: &'static str| {
+        let w = &w;
+        let id = id.clone();
+        async move {
+            let r = w
+                .run(
+                    "mutation($id: ID!, $name: String!) { createExpenseReceiptUpload(expenseId: $id, \
+                     filename: $name, contentType: \"application/pdf\") { key uploadUrl } }",
+                    json!({ "id": id, "name": name }),
+                )
+                .await;
+            data(&r, "createExpenseReceiptUpload.key")
+                .as_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    let key = upload("receipt.pdf").await;
     assert!(key.ends_with("/receipt.pdf"));
 
     // Not uploaded yet.
-    let attach = "mutation($id: ID!, $key: String!) { attachExpenseReceipt(expenseId: $id, key: $key, contentType: \"application/pdf\") { receipt { filename size contentType } } }";
+    let attach = "mutation($id: ID!, $key: String!) { attachExpenseReceipt(expenseId: $id, key: $key, contentType: \"application/pdf\") { receipts { id filename size contentType } } }";
     let r = w.run(attach, json!({ "id": id, "key": key })).await;
     assert!(error_message(&r).contains("finished uploading"));
 
@@ -848,26 +858,56 @@ async fn receipts_attach_only_their_own_uploads() {
     let r = w.run(attach, json!({ "id": other, "key": key })).await;
     assert_eq!(error_code(&r), "FORBIDDEN");
     let r = w.run(attach, json!({ "id": id, "key": key })).await;
-    assert_eq!(
-        data(&r, "attachExpenseReceipt.receipt.filename"),
-        json!("receipt.pdf")
-    );
-    assert_eq!(data(&r, "attachExpenseReceipt.receipt.size"), json!(16));
+    let receipts = data(&r, "attachExpenseReceipt.receipts");
+    assert_eq!(receipts[0]["filename"], json!("receipt.pdf"));
+    assert_eq!(receipts[0]["size"], json!(16));
+    let first_id = receipts[0]["id"].as_str().unwrap().to_string();
+    // The same file can't be attached twice.
+    let r = w.run(attach, json!({ "id": id, "key": key })).await;
+    assert_eq!(error_code(&r), "CONFLICT");
+
+    // A second receipt joins the first.
+    let second = upload("card-slip.pdf").await;
+    w.s.app
+        .storage
+        .put_bytes(&second, b"%PDF-1.4 slip", "application/pdf")
+        .await
+        .unwrap();
+    let r = w.run(attach, json!({ "id": id, "key": second })).await;
+    let receipts = data(&r, "attachExpenseReceipt.receipts");
+    let names: Vec<&str> = receipts
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["filename"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["receipt.pdf", "card-slip.pdf"]);
 
     let r = w
         .run(
-            "mutation($id: ID!) { downloadExpenseReceipt(expenseId: $id) }",
-            json!({ "id": id }),
+            "mutation($id: ID!, $r: ID!) { downloadExpenseReceipt(expenseId: $id, receiptId: $r) }",
+            json!({ "id": id, "r": first_id }),
         )
         .await;
     assert!(data(&r, "downloadExpenseReceipt").as_str().is_some());
     let r = w
         .run(
-            "mutation($id: ID!) { removeExpenseReceipt(expenseId: $id) { receipt { filename } } }",
-            json!({ "id": id }),
+            "mutation($id: ID!, $r: ID!) { removeExpenseReceipt(expenseId: $id, receiptId: $r) { receipts { filename } } }",
+            json!({ "id": id, "r": first_id }),
         )
         .await;
-    assert_eq!(data(&r, "removeExpenseReceipt.receipt"), Value::Null);
+    assert_eq!(
+        data(&r, "removeExpenseReceipt.receipts"),
+        json!([{ "filename": "card-slip.pdf" }])
+    );
+    // Gone now.
+    let r = w
+        .run(
+            "mutation($id: ID!, $r: ID!) { downloadExpenseReceipt(expenseId: $id, receiptId: $r) }",
+            json!({ "id": id, "r": first_id }),
+        )
+        .await;
+    assert_eq!(error_code(&r), "NOT_FOUND");
 }
 
 #[tokio::test]
@@ -896,8 +936,8 @@ async fn gst_free_lines_and_default_rates() {
         .create_project(
             &w.instance_id,
             &db::ProjectFields {
+                client_id: fictional_client(w.db(), &w.instance_id, "Client", None).await,
                 name: "No rate".into(),
-                client_name: "Client".into(),
                 ..Default::default()
             },
         )
@@ -1028,4 +1068,24 @@ async fn reports_and_exports() {
         )
         .await;
     assert!(error_message(&r).contains("two years"));
+}
+
+/// A fictional client of `instance_id` for a project to bill; its id.
+async fn fictional_client(
+    db: &impl db::Handler,
+    instance_id: &str,
+    name: &str,
+    email: Option<&str>,
+) -> String {
+    db.create_client(
+        instance_id,
+        &db::ClientFields {
+            name: name.into(),
+            email: email.map(str::to_string),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create_client")
+    .id
 }

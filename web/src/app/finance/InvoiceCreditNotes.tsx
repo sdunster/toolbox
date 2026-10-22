@@ -20,7 +20,9 @@ const invoiceCreditNotesFragment = graphql`
     totalCents
     creditedCents
     project {
-      clientEmail
+      client {
+        email
+      }
     }
     creditNotes {
       id
@@ -193,8 +195,11 @@ function CreditNoteRow({
  */
 export function InvoiceCreditNotes({
   invoice,
+  isOwner,
 }: {
   invoice: InvoiceCreditNotes_invoice$key;
+  /** Only an owner may give a credit note an explicit number. */
+  isOwner: boolean;
 }) {
   const data = useFragment(invoiceCreditNotesFragment, invoice);
   const [open, setOpen] = useState(false);
@@ -204,6 +209,8 @@ export function InvoiceCreditNotes({
   const [issueDate, setIssueDate] = useState(() => localToday());
   const [reason, setReason] = useState("");
   const [lines, setLines] = useState<LineDraft[]>([emptyLine()]);
+  // Owner only, for importing a credit note under its original number.
+  const [number, setNumber] = useState("");
   const [error, setError] = useState<string | null>(null);
 
   const [commit, isIssuing] = useMutation<InvoiceCreditNotesIssueMutation>(
@@ -241,6 +248,12 @@ export function InvoiceCreditNotes({
       setError("Give every line an amount greater than zero.");
       return;
     }
+    const trimmed = number.trim();
+    const explicit = trimmed === "" ? null : Number.parseInt(trimmed, 10);
+    if (explicit !== null && (Number.isNaN(explicit) || explicit < 1)) {
+      setError("The credit note number must be a whole number of 1 or more.");
+      return;
+    }
     setError(null);
     commit({
       variables: {
@@ -248,6 +261,7 @@ export function InvoiceCreditNotes({
         input: {
           issueDate,
           reason: reason.trim(),
+          number: explicit,
           lines:
             mode === "full"
               ? null
@@ -261,6 +275,7 @@ export function InvoiceCreditNotes({
       onCompleted: () => {
         setOpen(false);
         setReason("");
+        setNumber("");
         setLines([emptyLine()]);
         setMode("lines");
       },
@@ -303,7 +318,7 @@ export function InvoiceCreditNotes({
             <CreditNoteRow
               key={note.id}
               note={note}
-              clientEmail={data.project.clientEmail ?? null}
+              clientEmail={data.project.client.email ?? null}
             />
           ))}
         </ul>
@@ -335,6 +350,23 @@ export function InvoiceCreditNotes({
                 />
               </FormField>
             </div>
+            {isOwner && (
+              <div className="w-48">
+                <FormField label="Number (optional)" htmlFor="credit-number">
+                  <TextInput
+                    id="credit-number"
+                    type="number"
+                    min={1}
+                    value={number}
+                    onChange={(e) => setNumber(e.target.value)}
+                    placeholder="Next in sequence"
+                  />
+                </FormField>
+                <p className="mt-1 text-xs text-ink-muted">
+                  For importing an existing credit note.
+                </p>
+              </div>
+            )}
           </div>
           <fieldset className="flex flex-wrap gap-4 text-sm text-ink">
             <legend className="sr-only">What to credit</legend>
@@ -437,8 +469,8 @@ export function InvoiceCreditNotes({
             {formatCents(remaining)} still uncredited.
           </p>
           <p className="text-sm text-amber-700 dark:text-amber-400">
-            A credit note gets the next credit note number and can&apos;t be
-            edited or deleted. This cannot be undone.
+            A credit note gets the next credit note number (or the one given)
+            and can&apos;t be edited or deleted. This cannot be undone.
           </p>
           {error && (
             <p role="alert" className="text-sm text-red-600 dark:text-red-400">

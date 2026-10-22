@@ -217,8 +217,9 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) 
         .create_project(
             &instance.id,
             &db::ProjectFields {
+                client_id: fictional_client(db, &instance.id, "Fictional Client Pty Ltd", None)
+                    .await,
                 name: "Fictional Job".into(),
-                client_name: "Fictional Client Pty Ltd".into(),
                 ..Default::default()
             },
         )
@@ -544,8 +545,9 @@ async fn an_archived_project_takes_no_new_items() {
         &project_id,
         db::ProjectUpdateShape::Fields {
             fields: &db::ProjectFields {
+                client_id: fictional_client(&db, &instance_id, "Fictional Client Pty Ltd", None)
+                    .await,
                 name: "Fictional Job".into(),
-                client_name: "Fictional Client Pty Ltd".into(),
                 ..Default::default()
             },
             archived: true,
@@ -635,8 +637,8 @@ async fn pagination_across_pages_with_the_filter_applied() {
         .create_project(
             &instance_id,
             &db::ProjectFields {
+                client_id: fictional_client(&db, &instance_id, "Other Client", None).await,
                 name: "Other Job".into(),
-                client_name: "Other Client".into(),
                 ..Default::default()
             },
         )
@@ -837,4 +839,24 @@ async fn invalid_input_is_rejected() {
     )
     .await;
     assert!(!bad_cursor.errors.is_empty());
+}
+
+/// A fictional client of `instance_id` for a project to bill; its id.
+async fn fictional_client(
+    db: &impl db::Handler,
+    instance_id: &str,
+    name: &str,
+    email: Option<&str>,
+) -> String {
+    db.create_client(
+        instance_id,
+        &db::ClientFields {
+            name: name.into(),
+            email: email.map(str::to_string),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create_client")
+    .id
 }

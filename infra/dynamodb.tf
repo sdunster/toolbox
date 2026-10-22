@@ -510,8 +510,45 @@ resource "aws_dynamodb_table" "api_token" {
   }
 }
 
+# ── client ───────────────────────────────────────────────────────────────────
+# Who a finance instance bills: the bill-to name, ABN, address, email and
+# payment terms every invoice of its projects prints (frozen into the
+# invoice's snapshot at finalization). Finance-only, like project.
+
+resource "aws_dynamodb_table" "client" {
+  name                        = "${var.db_prefix}_client"
+  billing_mode                = "PAY_PER_REQUEST"
+  hash_key                    = "id"
+  deletion_protection_enabled = true
+
+  point_in_time_recovery {
+    enabled                 = true
+    recovery_period_in_days = 35
+  }
+
+  attribute {
+    name = "id"
+    type = "S"
+  }
+  attribute {
+    name = "instance_id"
+    type = "S"
+  }
+
+  # The clients list: every client of one instance. ALL, unpaginated — the
+  # same reasoning as project's instance_id-index.
+  global_secondary_index {
+    name = "instance_id-index"
+    key_schema {
+      attribute_name = "instance_id"
+      key_type       = "HASH"
+    }
+    projection_type = "ALL"
+  }
+}
+
 # ── project ──────────────────────────────────────────────────────────────────
-# A client/job a finance instance bills against — see CLAUDE.md's
+# A job a finance instance bills one client for — see CLAUDE.md's
 # "Finance" house rule. Finance-only: every write path rejects a support
 # instance.
 
@@ -719,10 +756,48 @@ resource "aws_dynamodb_table" "invoice" {
     name = "created_at"
     type = "N"
   }
+  attribute {
+    name = "list_key"
+    type = "S"
+  }
 
-  # The instance-wide invoices list. ALL: every field the list needs (status,
-  # number, total, project) is projected, and the DRAFT/UNPAID/PAID filter
-  # runs as a FilterExpression over the projected rows.
+  # The instance-wide invoices list, by `list_key` — `{issue_date}#{number}`
+  # once finalized, `{created date}#draft#…` before — so it runs in issue-date
+  # order however the invoices were entered. ALL: every field the list needs
+  # (status, number, total, project) is projected, and the
+  # DRAFT/UNPAID/PAID filter runs as a FilterExpression over the projected
+  # rows.
+  global_secondary_index {
+    name = "instance_id-list_key-index"
+    key_schema {
+      attribute_name = "instance_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "list_key"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+
+  # One project's invoices — the project page's list. ALL for the same
+  # reason.
+  global_secondary_index {
+    name = "project_id-list_key-index"
+    key_schema {
+      attribute_name = "project_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "list_key"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+
+  # Superseded by the two list_key indexes above and no longer read; kept
+  # only so the code deployed before them keeps working until this change is
+  # live. Removed by a follow-up change.
   global_secondary_index {
     name = "instance_id-created_at-index"
     key_schema {
@@ -736,8 +811,7 @@ resource "aws_dynamodb_table" "invoice" {
     projection_type = "ALL"
   }
 
-  # One project's invoices — the project page's list. ALL for the same
-  # reason.
+  # Superseded, as above.
   global_secondary_index {
     name = "project_id-created_at-index"
     key_schema {
@@ -787,9 +861,44 @@ resource "aws_dynamodb_table" "credit_note" {
     name = "created_at"
     type = "N"
   }
+  attribute {
+    name = "list_key"
+    type = "S"
+  }
 
   # The instance-wide list, and the GST report / CSV export (every credit
-  # note in the instance). ALL: every field is rendered or summed.
+  # note in the instance), by `list_key` (`{issue_date}#{number}`). ALL:
+  # every field is rendered or summed.
+  global_secondary_index {
+    name = "instance_id-list_key-index"
+    key_schema {
+      attribute_name = "instance_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "list_key"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+
+  # One invoice's credit notes — the invoice page.
+  global_secondary_index {
+    name = "invoice_id-list_key-index"
+    key_schema {
+      attribute_name = "invoice_id"
+      key_type       = "HASH"
+    }
+    key_schema {
+      attribute_name = "list_key"
+      key_type       = "RANGE"
+    }
+    projection_type = "ALL"
+  }
+
+  # Superseded by the two list_key indexes above and no longer read; kept
+  # only so the code deployed before them keeps working until this change is
+  # live. Removed by a follow-up change.
   global_secondary_index {
     name = "instance_id-created_at-index"
     key_schema {
@@ -803,7 +912,7 @@ resource "aws_dynamodb_table" "credit_note" {
     projection_type = "ALL"
   }
 
-  # One invoice's credit notes — the invoice page.
+  # Superseded, as above.
   global_secondary_index {
     name = "invoice_id-created_at-index"
     key_schema {

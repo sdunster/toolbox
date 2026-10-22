@@ -77,13 +77,30 @@ async fn set_business_name(w: &World) {
         .unwrap();
 }
 
+/// A client created through `create_client`, with `extra` merged into the
+/// arguments; its id.
+async fn client(w: &World, extra: Value) -> String {
+    let mut args = json!({"instanceId": w.instance, "name": "Acme Pty Ltd",
+                          "abn": "12 345 678 901"});
+    for (k, v) in extra.as_object().unwrap() {
+        args[k] = v.clone();
+    }
+    call_tool(&w.f, &w.member_token, "create_client", args)
+        .await
+        .unwrap()["client"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 async fn project(w: &World, name: &str) -> String {
+    let client_id = client(w, json!({})).await;
     let p = call_tool(
         &w.f,
         &w.member_token,
         "create_project",
-        json!({"instanceId": w.instance, "name": name, "clientName": "Acme Pty Ltd",
-               "clientAbn": "12 345 678 901", "reference": "PO-1"}),
+        json!({"instanceId": w.instance, "name": name, "clientId": client_id,
+               "reference": "PO-1"}),
     )
     .await
     .unwrap();
@@ -386,21 +403,44 @@ async fn update_project_merges_and_archiving_blocks_new_items() {
     .await
     .unwrap();
     assert_eq!(p["project"]["reference"], "PO-2");
-    assert_eq!(p["project"]["clientName"], "Acme Pty Ltd");
-    assert_eq!(p["project"]["clientAbn"], "12 345 678 901");
+    assert_eq!(p["project"]["client"]["name"], "Acme Pty Ltd");
     assert_eq!(p["project"]["archived"], false);
+    let client_id = p["project"]["client"]["id"].as_str().unwrap().to_string();
 
-    // An empty string clears an optional field.
+    // An empty string clears an optional field; the rest is kept.
     let cleared = call_tool(
         &w.f,
         t,
         "update_project",
-        json!({"id": pid, "clientAbn": ""}),
+        json!({"id": pid, "reference": ""}),
     )
     .await
     .unwrap();
-    assert!(cleared["project"]["clientAbn"].is_null());
-    assert_eq!(cleared["project"]["reference"], "PO-2");
+    assert!(cleared["project"]["reference"].is_null());
+    assert_eq!(cleared["project"]["client"]["id"], client_id.as_str());
+
+    // update_client merges the same way.
+    let c = call_tool(
+        &w.f,
+        t,
+        "update_client",
+        json!({"id": client_id, "abn": "", "email": "Accounts@Acme.Example.com"}),
+    )
+    .await
+    .unwrap();
+    assert!(c["client"]["abn"].is_null());
+    assert_eq!(c["client"]["name"], "Acme Pty Ltd");
+    assert_eq!(c["client"]["email"], "accounts@acme.example.com");
+    let listed = call_tool(&w.f, t, "list_clients", json!({"instanceId": w.instance}))
+        .await
+        .unwrap();
+    assert!(
+        listed["clients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == client_id.as_str())
+    );
 
     // Archived: hidden by default, and takes no new items.
     call_tool(
@@ -476,7 +516,7 @@ async fn boundaries_match_the_site() {
             &w.f,
             o,
             "create_project",
-            json!({"instanceId": w.instance, "name": "x", "clientName": "y"})
+            json!({"instanceId": w.instance, "name": "x", "clientId": "y"})
         )
         .await
         .is_err()
@@ -541,6 +581,10 @@ async fn finance_tools_are_listed_and_finalize_warns() {
     let list = rpc(&w.f, &w.member_token, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
     for expected in [
+        "list_clients",
+        "create_client",
+        "update_client",
+        "update_invoice_details",
         "list_projects",
         "create_project",
         "update_project",
@@ -799,6 +843,53 @@ async fn owner_can_import_an_invoice_with_its_original_number_and_dates() {
         .clone();
     assert_eq!(older_fin["displayNumber"], "998");
 
+    // A credit note can be imported under its own number too — owner only.
+    let denied = call_tool(
+        &w.f,
+        &w.member_token,
+        "issue_credit_note",
+        json!({"invoiceId": id(&older_inv), "issueDate": "2018-07-15",
+               "reason": "Returned", "number": 12}),
+    )
+    .await
+    .unwrap_err();
+    assert!(denied.contains("owner"), "{denied}");
+    let note = call_tool(
+        &w.f,
+        &owner_token,
+        "issue_credit_note",
+        json!({"invoiceId": id(&older_inv), "issueDate": "2018-07-15",
+               "reason": "Returned", "number": 12,
+               "lines": [{"description": "Returned part", "amountCents": 1_000}]}),
+    )
+    .await
+    .unwrap()["creditNote"]
+        .clone();
+    assert_eq!(note["displayNumber"], "CN-012");
+    let reused = call_tool(
+        &w.f,
+        &owner_token,
+        "issue_credit_note",
+        json!({"invoiceId": id(&older_inv), "issueDate": "2018-07-16",
+               "reason": "Again", "number": 12,
+               "lines": [{"description": "Again", "amountCents": 1_000}]}),
+    )
+    .await
+    .unwrap_err();
+    assert!(reused.contains("already used"), "{reused}");
+    // The automatic sequence carries on after the highest one used.
+    let next = call_tool(
+        &w.f,
+        &w.member_token,
+        "issue_credit_note",
+        json!({"invoiceId": id(&older_inv), "issueDate": "2018-07-17",
+               "reason": "More", "lines": [{"description": "More", "amountCents": 1_000}]}),
+    )
+    .await
+    .unwrap()["creditNote"]
+        .clone();
+    assert_eq!(next["displayNumber"], "CN-013");
+
     let paid = call_tool(
         &w.f,
         &owner_token,
@@ -827,12 +918,16 @@ async fn payments_credit_notes_sending_and_reports() {
     let Some(w) = world().await else { return };
     let t = &w.member_token;
     set_business_name(&w).await;
+    let client_id = client(
+        &w,
+        json!({"email": "accounts@acme.example.com", "paymentTermsDays": 7}),
+    )
+    .await;
     let pid = call_tool(
         &w.f,
         t,
         "create_project",
-        json!({"instanceId": w.instance, "name": "Fitout", "clientName": "Acme Pty Ltd",
-               "clientEmail": "accounts@acme.example", "paymentTermsDays": 7,
+        json!({"instanceId": w.instance, "name": "Fitout", "clientId": client_id,
                "defaultUnitPriceCents": 10_000}),
     )
     .await
@@ -910,7 +1005,7 @@ async fn payments_credit_notes_sending_and_reports() {
     assert!(sent["sentAt"].is_i64());
     assert_eq!(
         w.f.app.mail.sent_raw().last().unwrap().to,
-        vec!["accounts@acme.example"]
+        vec!["accounts@acme.example.com"]
     );
 
     let report = call_tool(
@@ -989,11 +1084,12 @@ async fn brands_are_listed_and_update_project_keeps_the_brand() {
     assert_eq!(names, ["Fictional Trading Co", "Positive Rate"]);
     assert_eq!(listed["brands"][0]["brandId"], "default");
 
+    let client_id = client(&w, json!({})).await;
     let p = call_tool(
         &w.f,
         t,
         "create_project",
-        json!({"instanceId": w.instance, "name": "Branded", "clientName": "Acme Pty Ltd",
+        json!({"instanceId": w.instance, "name": "Branded", "clientId": client_id,
                "brandId": brand.id}),
     )
     .await
@@ -1021,4 +1117,158 @@ async fn brands_are_listed_and_update_project_keeps_the_brand() {
     .await
     .unwrap();
     assert_eq!(p["project"]["brand"]["brandId"], "default");
+}
+
+#[tokio::test]
+async fn discounts_units_and_invoice_details() {
+    let Some(w) = world().await else { return };
+    let t = &w.member_token;
+    set_business_name(&w).await;
+    let pid = project(&w, "Discounted").await;
+    let hours = call_tool(
+        &w.f,
+        t,
+        "create_billable_item",
+        json!({"projectId": pid, "date": "2026-09-01", "description": "Labour",
+               "quantity": "2.5", "unit": "hrs", "unitPriceCents": 10_000}),
+    )
+    .await
+    .unwrap()["item"]
+        .clone();
+    assert_eq!(hours["unit"], "hrs");
+    assert_eq!(hours["kind"], "CHARGE");
+    let discount = call_tool(
+        &w.f,
+        t,
+        "create_billable_item",
+        json!({"projectId": pid, "date": "2026-09-01", "description": "Loyalty discount",
+               "kind": "DISCOUNT", "quantity": "1", "unitPriceCents": 5_000}),
+    )
+    .await
+    .unwrap()["item"]
+        .clone();
+    assert_eq!(discount["amountCents"], -5_000);
+    // A discount names its own amount, and has no unit.
+    assert!(
+        call_tool(
+            &w.f,
+            t,
+            "create_billable_item",
+            json!({"projectId": pid, "date": "2026-09-01", "description": "x",
+                   "kind": "DISCOUNT", "quantity": "1", "unitPriceCents": 100, "unit": "hrs"}),
+        )
+        .await
+        .is_err()
+    );
+
+    let inv = call_tool(
+        &w.f,
+        t,
+        "create_invoice",
+        json!({"projectId": pid, "itemIds": [id(&hours), id(&discount)],
+               "reference": "PO 777", "notes": "Thank you"}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert_eq!(inv["reference"], "PO 777");
+    assert_eq!(inv["ownReference"], "PO 777");
+    assert_eq!(inv["notes"], "Thank you");
+    assert_eq!(inv["subtotalCents"], 20_000);
+    assert_eq!(inv["gstCents"], 2_000);
+    assert!(inv["totalsProblem"].is_null());
+    let discount_line = inv["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["discount"] == true)
+        .unwrap()
+        .clone();
+    assert_eq!(discount_line["amountCents"], -5_000);
+
+    // Clearing the details falls back to the project's reference.
+    let updated = call_tool(
+        &w.f,
+        t,
+        "update_invoice_details",
+        json!({"invoiceId": id(&inv), "notes": "Paid by card"}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert_eq!(updated["reference"], "PO-1");
+    assert!(updated["ownReference"].is_null());
+    assert_eq!(updated["notes"], "Paid by card");
+
+    // A discount bigger than the charges can't be finalized.
+    let big = call_tool(
+        &w.f,
+        t,
+        "create_billable_item",
+        json!({"projectId": pid, "date": "2026-09-02", "description": "Write-off",
+               "kind": "DISCOUNT", "quantity": "1", "unitPriceCents": 50_000}),
+    )
+    .await
+    .unwrap()["item"]
+        .clone();
+    let added = call_tool(
+        &w.f,
+        t,
+        "add_invoice_items",
+        json!({"invoiceId": id(&inv), "itemIds": [id(&big)]}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert!(added["totalsProblem"].is_string());
+    let refused = call_tool(
+        &w.f,
+        t,
+        "finalize_invoice",
+        json!({"invoiceId": id(&inv), "issueDate": "2026-09-03"}),
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.contains("discounts"), "{refused}");
+    call_tool(
+        &w.f,
+        t,
+        "remove_invoice_items",
+        json!({"invoiceId": id(&inv), "itemIds": [id(&big)]}),
+    )
+    .await
+    .unwrap();
+    let fin = call_tool(
+        &w.f,
+        t,
+        "finalize_invoice",
+        json!({"invoiceId": id(&inv), "issueDate": "2026-09-03"}),
+    )
+    .await
+    .unwrap()["invoice"]
+        .clone();
+    assert_eq!(fin["totalCents"], 22_000);
+    assert_eq!(fin["notes"], "Paid by card");
+    // Details are frozen with the rest.
+    assert!(
+        call_tool(
+            &w.f,
+            t,
+            "update_invoice_details",
+            json!({"invoiceId": id(&inv), "notes": "Changed"}),
+        )
+        .await
+        .is_err()
+    );
+    // A full credit carries the discount across and nets to the total.
+    let note = call_tool(
+        &w.f,
+        t,
+        "issue_credit_note",
+        json!({"invoiceId": id(&inv), "issueDate": "2026-09-04", "reason": "Cancelled"}),
+    )
+    .await
+    .unwrap()["creditNote"]
+        .clone();
+    assert_eq!(note["totalCents"], 22_000);
 }

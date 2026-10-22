@@ -75,10 +75,10 @@ fn build_snapshot(gst_registered: bool, lines: Vec<InvoiceSnapshotLine>) -> Invo
         subtotal_cents,
         gst_cents,
         total_cents: subtotal_cents + gst_cents,
+        notes: None,
         payment_details: Some(fictional_payment_details()),
         due_date: Some("2026-09-02".into()),
         credit_note: None,
-        no_gst_note: !gst_registered,
     }
 }
 
@@ -90,6 +90,8 @@ fn simple_line(desc: &str, qty_hundredths: i64, price_cents: i64) -> InvoiceSnap
         quantity_hundredths: qty_hundredths,
         unit_price_cents: price_cents,
         amount_cents: money::line_amount_cents(qty_hundredths, price_cents),
+        unit: None,
+        discount: false,
         gst_free: false,
     }
 }
@@ -165,7 +167,6 @@ fn main() -> anyhow::Result<()> {
             let mut snap = single_page_sample();
             snap.title = "Tax Invoice".into();
             snap.gst_registered = true;
-            snap.no_gst_note = false;
             snap.gst_cents = money::gst_cents(snap.subtotal_cents);
             snap.total_cents = snap.subtotal_cents + snap.gst_cents;
             snap

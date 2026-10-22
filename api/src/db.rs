@@ -449,6 +449,81 @@ pub struct Instance {
     /// JSON string attribute (`brands`), absent when empty. The instance's
     /// own finance settings are the default brand and are not in here.
     pub brands: Vec<Brand>,
+    /// How invoice and credit-note numbers print (finance instances only).
+    pub number_format: NumberFormat,
+}
+
+/// How a finance instance prints its document numbers: an optional prefix
+/// per sequence and a zero-padding width shared by both. Three optional
+/// `instance` attributes (`invoice_number_prefix`, `credit_note_number_prefix`,
+/// `number_padding`), each absent when at its default. Only the *display*
+/// changes — numbers stay integers, unique per instance — and a document's
+/// display number is frozen onto its row when it is issued, so changing the
+/// format never relabels one already issued.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NumberFormat {
+    /// Absent means no prefix (`"042"`).
+    pub invoice_prefix: Option<String>,
+    /// Absent means [`DEFAULT_CREDIT_NOTE_PREFIX`].
+    pub credit_note_prefix: Option<String>,
+    /// Absent means [`DEFAULT_NUMBER_PADDING`].
+    pub padding: Option<u32>,
+}
+
+/// What a credit note's number is prefixed with when the instance sets none.
+pub const DEFAULT_CREDIT_NOTE_PREFIX: &str = "CN-";
+/// Zero-padding width when the instance sets none (`"042"`).
+pub const DEFAULT_NUMBER_PADDING: u32 = 3;
+/// Widest zero-padding `setNumberFormat` accepts.
+pub const MAX_NUMBER_PADDING: u32 = 8;
+/// Longest prefix `setNumberFormat` accepts.
+pub const MAX_NUMBER_PREFIX_LEN: usize = 12;
+
+impl NumberFormat {
+    pub fn padding_or_default(&self) -> u32 {
+        self.padding.unwrap_or(DEFAULT_NUMBER_PADDING)
+    }
+
+    pub fn invoice_prefix_or_default(&self) -> &str {
+        self.invoice_prefix.as_deref().unwrap_or("")
+    }
+
+    pub fn credit_note_prefix_or_default(&self) -> &str {
+        self.credit_note_prefix
+            .as_deref()
+            .unwrap_or(DEFAULT_CREDIT_NOTE_PREFIX)
+    }
+
+    /// `"INV-0042"` for prefix `INV-`, padding 4, number 42.
+    pub fn invoice(&self, number: u32) -> String {
+        let width = self.padding_or_default() as usize;
+        format!("{}{number:0width$}", self.invoice_prefix_or_default())
+    }
+
+    /// `"CN-001"` by default.
+    pub fn credit_note(&self, number: u32) -> String {
+        let width = self.padding_or_default() as usize;
+        format!("{}{number:0width$}", self.credit_note_prefix_or_default())
+    }
+}
+
+/// Validate a number prefix: at most [`MAX_NUMBER_PREFIX_LEN`] characters of
+/// letters, digits, space, `.`, `_` and `-` — it ends up in a PDF filename,
+/// an S3 key and an email subject, so nothing that needs escaping. An empty
+/// string is valid (no prefix).
+pub fn validate_number_prefix(prefix: &str) -> std::result::Result<(), String> {
+    if prefix.chars().count() > MAX_NUMBER_PREFIX_LEN {
+        return Err(format!(
+            "A number prefix can be at most {MAX_NUMBER_PREFIX_LEN} characters"
+        ));
+    }
+    if !prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+    {
+        return Err("A number prefix can only use letters, digits, spaces and . _ -".to_string());
+    }
+    Ok(())
 }
 
 /// The id the API gives the default brand — the instance's own finance
@@ -591,6 +666,10 @@ pub enum InstanceUpdateShape<'a> {
         /// `None` `REMOVE`s it (back to [`DEFAULT_PAYMENT_TERMS_DAYS`]).
         payment_terms_days: Option<u32>,
     },
+    /// `setNumberFormat`'s write: full replace of [`NumberFormat`]'s three
+    /// attributes, each `SET` when `Some` and `REMOVE`d when `None` (its
+    /// default). The caller maps a default value to `None`.
+    SetNumberFormat(&'a NumberFormat),
 }
 
 /// Reject an instance whose `kind` isn't the one an operation requires — the
@@ -635,23 +714,65 @@ pub fn validate_currency_code(code: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-/// A `project` row — a client/job a finance instance bills against.
+/// A `client` row — who a finance instance bills: the bill-to identity
+/// every invoice for one of its [`Project`]s prints (frozen into the
+/// invoice's snapshot at finalization). Finance-only, like projects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Client {
+    pub id: String,
+    pub instance_id: String,
+    pub fields: ClientFields,
+    /// Only ever written `true`. An archived client takes no new projects
+    /// and is hidden from pickers; there is no delete.
+    pub archived: bool,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// Every editable `client` attribute — `createClient`'s input and
+/// `updateClient`'s full replace (which adds `archived`). Already trimmed
+/// and validated; `None` means absent (create) or `REMOVE` (update).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct ClientFields {
+    pub name: String,
+    pub abn: Option<String>,
+    /// Multi-line (e.g. a street address across several lines).
+    pub address: Option<String>,
+    /// Where `sendInvoice`/`sendCreditNote` mail by default.
+    pub email: Option<String>,
+    /// Overrides [`Instance::payment_terms_days`] for this client's invoices.
+    pub payment_terms_days: Option<u32>,
+}
+
+impl Client {
+    /// The payment terms this client's invoices get: its own override, else
+    /// the instance's (which has its own default).
+    pub fn payment_terms_days(&self, instance: &Instance) -> u32 {
+        self.fields
+            .payment_terms_days
+            .unwrap_or_else(|| instance.payment_terms_days_or_default())
+    }
+}
+
+impl HasID for Client {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// A `project` row — a job a finance instance bills one [`Client`] for.
 /// Finance-only: every write path that creates or updates one rejects a
 /// support instance via [`require_instance_kind`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct Project {
     pub id: String,
     pub instance_id: String,
+    /// The [`Client`] its invoices bill. Required. Changing it changes what
+    /// its drafts bill; a finalized invoice froze its bill-to.
+    pub client_id: String,
     pub name: String,
-    pub client_name: String,
-    pub client_abn: Option<String>,
-    /// Multi-line (e.g. a street address across several lines).
-    pub client_address: Option<String>,
+    /// Printed on its invoices, unless an invoice sets its own.
     pub reference: Option<String>,
-    /// Where `sendInvoice`/`sendCreditNote` mail by default.
-    pub client_email: Option<String>,
-    /// Overrides [`Instance::payment_terms_days`] for this project's invoices.
-    pub payment_terms_days: Option<u32>,
     /// The GST-exclusive rate a new billable item on this project gets when
     /// it doesn't name one.
     pub default_unit_price_cents: Option<i64>,
@@ -667,27 +788,14 @@ pub struct Project {
     pub updated_at: u64,
 }
 
-impl Project {
-    /// The payment terms this project's invoices get: its own override, else
-    /// the instance's (which has its own default).
-    pub fn payment_terms_days(&self, instance: &Instance) -> u32 {
-        self.payment_terms_days
-            .unwrap_or_else(|| instance.payment_terms_days_or_default())
-    }
-}
-
 /// Every editable `project` attribute — `createProject`'s input and
 /// `updateProject`'s full replace (which adds `archived`). Already trimmed
 /// and validated; `None` means absent (create) or `REMOVE` (update).
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct ProjectFields {
+    pub client_id: String,
     pub name: String,
-    pub client_name: String,
-    pub client_abn: Option<String>,
-    pub client_address: Option<String>,
-    pub client_email: Option<String>,
     pub reference: Option<String>,
-    pub payment_terms_days: Option<u32>,
     pub default_unit_price_cents: Option<i64>,
     pub brand_id: Option<String>,
 }
@@ -729,13 +837,18 @@ pub struct BillableItem {
     pub description: String,
     /// Quantity × 100: `150` is 1.5. `0 < q ≤ 100_000_000`.
     pub quantity_hundredths: i64,
-    /// GST-exclusive, `0 ≤ p ≤ 1_000_000_000`.
+    /// GST-exclusive, `0 ≤ p ≤ 1_000_000_000`. Always positive for a
+    /// discount, whose sign comes from [`Self::discount`].
     pub unit_price_cents: i64,
-    /// The invoice this item is on, if any — absent means unbilled. Nothing
-    /// sets it yet: invoices (and the transactional attach/detach that writes
-    /// this) arrive in the next PR of the finance stack. Until then every
-    /// item is unbilled, and the update/delete paths already refuse an item
-    /// that has one.
+    /// What the quantity counts (`hrs`, `ea`, `m²`), printed after it.
+    /// Never set on a discount. **`unit` is a DynamoDB reserved word** —
+    /// aliased `#unit` in any expression.
+    pub unit: Option<String>,
+    /// A fixed-amount discount line: stored as `kind = "discount"` (absent
+    /// for an ordinary charge), always quantity 1 with the discount as its
+    /// unit price, and counted negative — see [`Self::amount_cents`].
+    pub discount: bool,
+    /// The invoice this item is on, if any — absent means unbilled.
     pub invoice_id: Option<String>,
     /// No GST is charged on this line even when the instance is
     /// GST-registered. Only ever written `true`.
@@ -747,6 +860,19 @@ pub struct BillableItem {
     pub created_by_user_id: String,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+impl BillableItem {
+    /// The line's signed amount in cents: quantity × unit price (round
+    /// half-up), negative for a discount. Never stored, so it can't drift
+    /// from its inputs.
+    pub fn amount_cents(&self) -> i64 {
+        let amount = crate::finance::money::line_amount_cents(
+            self.quantity_hundredths,
+            self.unit_price_cents,
+        );
+        if self.discount { -amount } else { amount }
+    }
 }
 
 impl HasID for BillableItem {
@@ -765,6 +891,8 @@ pub enum BillableItemUpdateShape<'a> {
         description: &'a str,
         quantity_hundredths: i64,
         unit_price_cents: i64,
+        unit: Option<&'a str>,
+        discount: bool,
         gst_free: bool,
     },
 }
@@ -779,6 +907,8 @@ pub struct NewBillableItem<'a> {
     pub description: &'a str,
     pub quantity_hundredths: i64,
     pub unit_price_cents: i64,
+    pub unit: Option<&'a str>,
+    pub discount: bool,
     pub gst_free: bool,
     pub created_by_user_id: &'a str,
 }
@@ -938,10 +1068,17 @@ pub enum ExpenseDetail {
     /// Something bought, from a receipt.
     Purchase {
         supplier: String,
-        /// GST-inclusive — what was actually paid.
-        amount_cents: i64,
-        /// The GST included in `amount_cents`; absent for a GST-free purchase.
+        /// GST-inclusive — what was actually paid. Stored as `total_cents`.
+        total_cents: i64,
+        /// The GST included in `total_cents`; absent for a GST-free purchase.
         gst_cents: Option<i64>,
+        /// The share of the purchase that was for the business, `1..=99`;
+        /// `None` (absent) means wholly for the business. Scales both the
+        /// amount the reports count and the GST they claim.
+        business_use_percent: Option<u32>,
+        /// The GST was paid but can't be claimed back (entertainment, or
+        /// bought before GST registration). Only ever written `true`.
+        gst_not_claimable: bool,
     },
     /// A business trip claimed by the ATO's cents-per-km method. Carries no
     /// GST. The amount is derived, never stored —
@@ -986,8 +1123,10 @@ pub struct Expense {
     /// set and cleared only together with that item's `source_expense_id`.
     /// An expense that has been re-billed can't be deleted.
     pub billable_item_id: Option<String>,
-    /// The uploaded receipt, if any.
-    pub receipt: Option<ExpenseReceipt>,
+    /// Uploaded receipt files, oldest first, at most
+    /// [`MAX_EXPENSE_RECEIPTS`]. Stored as one JSON string attribute
+    /// (`receipts`), absent when empty.
+    pub receipts: Vec<ExpenseReceipt>,
     /// Whoever logged it — for a vehicle trip, also whose 5,000 km running
     /// total it counts toward.
     pub created_by_user_id: String,
@@ -995,14 +1134,20 @@ pub struct Expense {
     pub updated_at: u64,
 }
 
+/// Most receipt files one expense may carry.
+pub const MAX_EXPENSE_RECEIPTS: usize = 10;
+
 /// A receipt file attached to an expense — stored under
-/// `receipts/{instance_id}/{expense_id}/…` in the mail bucket.
-#[derive(Clone, Debug, PartialEq)]
+/// `receipts/{instance_id}/{expense_id}/…` in the mail bucket. `id` is a
+/// nanoid, unique within the expense — what `removeExpenseReceipt` names.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExpenseReceipt {
+    pub id: String,
     pub s3_key: String,
     pub filename: String,
     pub content_type: String,
     pub size: u64,
+    pub uploaded_at: u64,
 }
 
 impl Expense {
@@ -1017,14 +1162,14 @@ impl Expense {
 
     /// What the expense cost before GST.
     pub fn amount_ex_gst_cents(&self) -> i64 {
-        self.amount_cents() - self.gst_cents()
+        self.total_cents() - self.gst_cents()
     }
 
     /// What the expense cost, in cents: the GST-inclusive amount paid for a
     /// purchase, or distance × rate for a trip.
-    pub fn amount_cents(&self) -> i64 {
+    pub fn total_cents(&self) -> i64 {
         match &self.fields.detail {
-            ExpenseDetail::Purchase { amount_cents, .. } => *amount_cents,
+            ExpenseDetail::Purchase { total_cents, .. } => *total_cents,
             ExpenseDetail::VehicleKm {
                 distance_tenths_km,
                 rate_cents_per_km,
@@ -1032,6 +1177,48 @@ impl Expense {
                 crate::finance::vehicle::trip_amount_cents(*distance_tenths_km, *rate_cents_per_km)
             }
         }
+    }
+
+    /// The business share, `1..=100` — always 100 for a vehicle trip (its
+    /// distance is already only the business kilometres).
+    pub fn business_use_percent(&self) -> u32 {
+        match &self.fields.detail {
+            ExpenseDetail::Purchase {
+                business_use_percent,
+                ..
+            } => business_use_percent.unwrap_or(100),
+            ExpenseDetail::VehicleKm { .. } => 100,
+        }
+    }
+
+    /// The business share of [`Self::total_cents`], rounded half-up.
+    pub fn business_total_cents(&self) -> i64 {
+        crate::finance::report::apportion(
+            self.total_cents(),
+            i64::from(self.business_use_percent()),
+            100,
+        )
+    }
+
+    /// The GST the business can claim back: none when it isn't claimable,
+    /// else the business share of [`Self::gst_cents`], rounded half-up.
+    pub fn claimable_gst_cents(&self) -> i64 {
+        match &self.fields.detail {
+            ExpenseDetail::Purchase {
+                gst_not_claimable: true,
+                ..
+            } => 0,
+            _ => crate::finance::report::apportion(
+                self.gst_cents(),
+                i64::from(self.business_use_percent()),
+                100,
+            ),
+        }
+    }
+
+    /// Whether this is a cents-per-km vehicle trip rather than a purchase.
+    pub fn is_vehicle_trip(&self) -> bool {
+        matches!(self.fields.detail, ExpenseDetail::VehicleKm { .. })
     }
 }
 
@@ -1069,8 +1256,8 @@ pub struct ListExpensesPage {
 
 /// `invoice.status`. **Strictly one-way**: `Finalized` never reverts to
 /// `Draft` — no void, no un-finalize, per CLAUDE.md's "Finance" house
-/// rule. The only thing that changes on a finalized invoice afterward is
-/// `paid_date`.
+/// rule. Afterward a finalized invoice only takes payments, credit notes
+/// and sends, none of which change what it prints.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InvoiceStatus {
     Draft,
@@ -1120,16 +1307,29 @@ pub struct Invoice {
     pub created_by_user_id: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// The listing GSIs' sort key — see [`invoice_list_key`] and
+    /// [`draft_list_key`]. Set when the draft is created and replaced at
+    /// finalization, so lists run in issue-date order however the invoices
+    /// were entered.
+    pub list_key: String,
+    /// A PO number or reference for this invoice alone, printed in place of
+    /// its project's `reference`. Editable only on a draft.
+    pub reference: Option<String>,
+    /// Free text printed above the payment details. Editable only on a
+    /// draft.
+    pub notes: Option<String>,
     /// Assigned once, at finalization, from the per-instance
-    /// `next_invoice_number` counter. Absent for a draft. Displayed
-    /// zero-padded to 3 digits (`db::Invoice::display_number`); it simply
-    /// grows past 999.
+    /// `last_invoice_number` counter or an owner's explicit choice. Absent
+    /// for a draft.
     pub number: Option<u32>,
+    /// `number` as printed, in the instance's [`NumberFormat`] at
+    /// finalization — frozen with the snapshot, so a later format change
+    /// never relabels it. Absent for a draft.
+    pub display_number: Option<String>,
     /// `YYYY-MM-DD`. Absent for a draft; set once, at finalization, never
     /// changed afterward.
     pub issue_date: Option<String>,
-    /// Frozen JSON (`finance::snapshot::InvoiceSnapshot`, `schema_version:
-    /// 1`) of everything the invoice prints — set once, at finalization.
+    /// Frozen JSON (`finance::snapshot::InvoiceSnapshot`) of everything the invoice prints — set once, at finalization.
     /// Absent for a draft, whose printable content is instead built live
     /// (`finance::snapshot::build_snapshot`) from the project/instance/
     /// items as they stand right now.
@@ -1139,9 +1339,10 @@ pub struct Invoice {
     pub total_cents: Option<i64>,
     pub finalized_at: Option<u64>,
     pub finalized_by_user_id: Option<String>,
-    /// Absent means unpaid. Any member may set or clear this on a finalized
-    /// invoice; it is never printed on the invoice itself.
-    pub paid_date: Option<String>,
+    /// `YYYY-MM-DD` the balance reached zero (by payments, credit notes or
+    /// both — `finance::ledger::settled_date`); absent while anything is
+    /// owed. Never printed on the invoice itself.
+    pub settled_date: Option<String>,
     /// The S3 key of this invoice's rendered PDF, once
     /// `downloadInvoicePdf` has rendered it for the first time. Absent for
     /// a draft, and absent for a finalized invoice that has never been
@@ -1190,6 +1391,30 @@ pub fn invoice_number_reservation_id(instance_id: &str, number: u32) -> String {
     format!("{instance_id}#invoice#{number}")
 }
 
+/// The credit-note counterpart of [`invoice_number_reservation_id`]:
+/// `{instance_id}#credit_note#{number}`, written by every credit note's
+/// issuing transaction.
+pub fn credit_note_number_reservation_id(instance_id: &str, number: u32) -> String {
+    format!("{instance_id}#credit_note#{number}")
+}
+
+/// The `list_key` of an issued document (a finalized invoice, or any credit
+/// note): `{issue_date}#{number:010}`, so a listing read newest-first runs by
+/// issue date and, within a day, by number.
+pub fn issued_list_key(issue_date: &str, number: u32) -> String {
+    format!("{issue_date}#{number:010}")
+}
+
+/// A draft invoice's `list_key`: `{created date}#draft#{created_at:012}`. On
+/// its creation day it sorts above every invoice issued that day (`d` sorts
+/// after the digits), so a new draft shows first.
+pub fn draft_list_key(created_at: u64) -> String {
+    let date = chrono::DateTime::from_timestamp(i64::try_from(created_at).unwrap_or(0), 0)
+        .unwrap_or_default()
+        .format("%Y-%m-%d");
+    format!("{date}#draft#{created_at:012}")
+}
+
 impl Invoice {
     /// Every payment recorded against this invoice, summed.
     pub fn paid_cents(&self) -> i64 {
@@ -1206,11 +1431,11 @@ impl Invoice {
         }
     }
 
-    /// Unpaid (no `paid_date`), with a due date before `today`
+    /// Unsettled (no `settled_date`), with a due date before `today`
     /// (`YYYY-MM-DD`). A draft is never overdue.
     pub fn is_overdue(&self, today: &str) -> bool {
         self.status == InvoiceStatus::Finalized
-            && self.paid_date.is_none()
+            && self.settled_date.is_none()
             && self.due_date.as_deref().is_some_and(|d| d < today)
     }
 }
@@ -1231,7 +1456,7 @@ pub struct InvoicePayment {
 }
 
 /// A `credit_note` row — an adjustment note against one finalized invoice.
-/// Like an invoice it is numbered (its own `next_credit_note_number`
+/// Like an invoice it is numbered (its own `last_credit_note_number`
 /// sequence) and its printable content is frozen in `snapshot` at the moment
 /// it is issued; unlike an invoice it has no draft stage and can never be
 /// changed or deleted. See CLAUDE.md's "Credit notes" house rule.
@@ -1243,8 +1468,13 @@ pub struct CreditNote {
     /// Denormalised from the invoice so a project's figures need no join.
     pub project_id: String,
     pub number: u32,
+    /// `number` as printed (`CN-001`), in the instance's [`NumberFormat`]
+    /// at issue — frozen, like an invoice's.
+    pub display_number: String,
     /// `YYYY-MM-DD`.
     pub issue_date: String,
+    /// [`issued_list_key`] — the listing GSIs' sort key.
+    pub list_key: String,
     pub reason: String,
     /// Frozen `finance::snapshot::InvoiceSnapshot` JSON, with its
     /// `credit_note` block set.
@@ -1267,22 +1497,24 @@ impl HasID for CreditNote {
     }
 }
 
-impl CreditNote {
-    /// `CN-001` — zero-padded like an invoice number, prefixed so the two
-    /// sequences can't be confused on paper.
-    pub fn display_number(&self) -> String {
-        credit_note_display_number(self.number)
-    }
-}
-
-pub fn credit_note_display_number(number: u32) -> String {
-    format!("CN-{number:03}")
+/// A new draft invoice — `create_invoice`'s input.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewInvoice<'a> {
+    pub instance_id: &'a str,
+    pub project_id: &'a str,
+    /// Non-empty; see [`Handler::create_invoice`].
+    pub item_ids: &'a [String],
+    pub created_by_user_id: &'a str,
+    pub brand_id: Option<&'a str>,
+    pub reference: Option<&'a str>,
+    pub notes: Option<&'a str>,
 }
 
 /// What `finalize_invoice` freezes onto the row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FinalizeInvoice<'a> {
     pub number: u32,
+    pub display_number: &'a str,
     pub issue_date: &'a str,
     pub due_date: &'a str,
     pub snapshot_json: &'a str,
@@ -1587,7 +1819,7 @@ pub enum CreditNoteScope<'a> {
 /// Keyset cursor for a credit-note listing — same shape as [`InvoiceCursor`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreditNoteCursor {
-    pub created_at: u64,
+    pub list_key: String,
     pub id: String,
 }
 
@@ -1617,15 +1849,15 @@ pub enum InvoiceListFilter {
     Overdue { today: String },
 }
 
-/// Keyset cursor for an invoice listing: `{created_at}:{id}`, mirroring
-/// [`BillableItemCursor`]/[`TicketCursor`].
+/// Keyset cursor for an invoice listing: `{list_key}:{id}`, mirroring
+/// [`BillableItemCursor`]/[`TicketCursor`]. A `list_key` never contains `:`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvoiceCursor {
-    pub created_at: u64,
+    pub list_key: String,
     pub id: String,
 }
 
-/// Forward-only (`first`/`after`), newest `created_at` first — mirrors
+/// Forward-only (`first`/`after`), newest `list_key` first — mirrors
 /// [`ListBillableItemsPage`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListInvoicesPage {
@@ -2481,6 +2713,31 @@ pub trait Handler: Sync {
     /// marker to set instead.
     fn delete_api_token(&self, id: &str) -> impl Future<Output = Result<()>> + Send;
 
+    // ── client ────────────────────────────────────────────────────────────
+    fn create_client(
+        &self,
+        instance_id: &str,
+        fields: &ClientFields,
+    ) -> impl Future<Output = Result<Client>> + Send;
+    fn get_clients<T: AsRef<str> + Sync>(
+        &self,
+        ids: &[T],
+    ) -> impl Future<Output = Result<Vec<Option<Client>>>> + Send;
+    /// Every client of one instance, via `instance_id-index` — unpaginated,
+    /// like [`Self::list_projects_by_instance`].
+    fn list_clients_by_instance(
+        &self,
+        instance_id: &str,
+    ) -> impl Future<Output = Result<Vec<Client>>> + Send;
+    /// Full replace of every editable attribute plus `archived` (`SET` when
+    /// `true`, `REMOVE`d when `false`), conditioned on `attribute_exists(id)`.
+    fn update_client(
+        &self,
+        id: &str,
+        fields: &ClientFields,
+        archived: bool,
+    ) -> impl Future<Output = Result<()>> + Send;
+
     // ── project ───────────────────────────────────────────────────────────
     #[allow(clippy::too_many_arguments)]
     fn create_project(
@@ -2616,12 +2873,15 @@ pub trait Handler: Sync {
     /// `Ok(false)` when the row no longer exists, or has been re-billed
     /// (`attribute_not_exists(billable_item_id)` is part of the condition).
     fn delete_expense(&self, id: &str) -> impl Future<Output = Result<bool>> + Send;
-    /// Set (`Some`) or `REMOVE` (`None`) an expense's receipt attributes.
-    /// `Ok(false)` when the row no longer exists.
-    fn set_expense_receipt(
+    /// Replace an expense's `receipts` (JSON; `REMOVE`d when empty),
+    /// conditioned on the stored list still being `expected` (absent when
+    /// empty) — the `set_brands` pattern, so two uploads at once can't lose
+    /// one. `Ok(false)` when the row is gone or the list changed.
+    fn set_expense_receipts(
         &self,
         id: &str,
-        receipt: Option<&ExpenseReceipt>,
+        expected: &[ExpenseReceipt],
+        receipts: &[ExpenseReceipt],
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Every expense in `instance_id` dated `from..=to` (`YYYY-MM-DD`),
     /// oldest first — the reports' and CSV export's source.
@@ -2702,12 +2962,20 @@ pub trait Handler: Sync {
     /// write, since the pre-check already covers the ordinary case.
     fn create_invoice(
         &self,
-        instance_id: &str,
-        project_id: &str,
-        item_ids: &[String],
-        created_by_user_id: &str,
-        brand_id: Option<&str>,
+        invoice: &NewInvoice<'_>,
     ) -> impl Future<Output = Result<Option<Invoice>>> + Send;
+    /// `updateInvoiceDetails`' write: `SET` (or `REMOVE`, when `None`) a
+    /// draft's `reference` and `notes`, bumping `version`, conditioned on
+    /// `status = draft AND version = expected_version` — so a finalize that
+    /// read the older version fails instead of freezing stale details.
+    /// `Ok(false)` on a condition failure.
+    fn update_invoice_details(
+        &self,
+        invoice_id: &str,
+        expected_version: u64,
+        reference: Option<&str>,
+        notes: Option<&str>,
+    ) -> impl Future<Output = Result<bool>> + Send;
     /// Add `item_ids` to a draft invoice: one `TransactWriteItems` that `ADD`s
     /// them to the invoice's `item_ids` set and bumps `version` (conditioned
     /// on `status = draft AND version = expected_version`), plus, for each
@@ -2749,7 +3017,8 @@ pub trait Handler: Sync {
     /// The finalize write — step 6 of CLAUDE.md's "finalize algorithm". A
     /// `TransactWriteItems` of two updates: the invoice itself, conditioned
     /// on `status = draft AND version = expected_version`, setting
-    /// `status=finalized`, `number`, `issue_date`, `snapshot`,
+    /// `status=finalized`, `number`, `display_number`, `list_key`,
+    /// `issue_date`, `snapshot`,
     /// `total_cents`, `finalized_at`, `finalized_by_user_id`, and bumping
     /// `version`; and the number's reservation row in `counter`
     /// ([`invoice_number_reservation_id`]), created conditioned on
@@ -2776,7 +3045,7 @@ pub trait Handler: Sync {
         finalized: &FinalizeInvoice<'_>,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Replace a finalized invoice's `payments` (JSON; `REMOVE`d when empty)
-    /// and set (`Some`) or `REMOVE` (`None`) its `paid_date`, bumping
+    /// and set (`Some`) or `REMOVE` (`None`) its `settled_date`, bumping
     /// `version`. Conditioned on `status = finalized AND version =
     /// expected_version`, so two people recording payments at once can't
     /// lose one. `Ok(false)` on a condition failure.
@@ -2785,7 +3054,7 @@ pub trait Handler: Sync {
         invoice_id: &str,
         expected_version: u64,
         payments: &[InvoicePayment],
-        paid_date: Option<&str>,
+        settled_date: Option<&str>,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Record that `sendInvoice` mailed this (finalized) invoice to `to`.
     fn set_invoice_sent(
@@ -2807,13 +3076,15 @@ pub trait Handler: Sync {
     // `number` and `snapshot` are reserved words, as on `invoice`.
     //
     /// Issue a credit note, in one `TransactWriteItems`: `Put` the note
-    /// (`attribute_not_exists(id)`) and, on its invoice, `ADD
+    /// (`attribute_not_exists(id)`); on its invoice, `ADD
     /// credited_cents`/`credited_gst_cents` plus `version`, and `SET
-    /// paid_date = settled_date` when `settled_date` is `Some` (the credit
-    /// settles the invoice) — conditioned on `status = finalized AND version
-    /// = invoice_expected_version`. `Ok(false)` (nothing written) on a
-    /// condition failure; the credit-note number, allocated before this, is
-    /// then a gap, like an invoice number.
+    /// settled_date` when `settled_date` is `Some` (the credit settles the
+    /// invoice) — conditioned on `status = finalized AND version =
+    /// invoice_expected_version`; and the number's reservation row in
+    /// `counter` ([`credit_note_number_reservation_id`],
+    /// `attribute_not_exists(id)`). `Ok(false)` (nothing written) when any
+    /// condition fails; a counter-allocated number is then a gap, like an
+    /// invoice number.
     fn create_credit_note(
         &self,
         note: &CreditNote,
@@ -2828,7 +3099,7 @@ pub trait Handler: Sync {
         &self,
         id: &str,
     ) -> impl Future<Output = Result<Option<CreditNote>>> + Send;
-    /// One page, newest `created_at` first — [`Self::list_invoices`]'s shape.
+    /// One page, newest `list_key` first — [`Self::list_invoices`]'s shape.
     fn list_credit_notes(
         &self,
         scope: CreditNoteScope<'_>,
@@ -2840,12 +3111,32 @@ pub trait Handler: Sync {
         &self,
         scope: CreditNoteScope<'_>,
     ) -> impl Future<Output = Result<Vec<CreditNote>>> + Send;
-    /// `ADD next_credit_note_number 1` on the instance's `counter` row —
+    /// `ADD last_credit_note_number 1` on the instance's `counter` row —
     /// the credit-note counterpart of [`Self::increment_invoice_counter`].
     fn increment_credit_note_counter(
         &self,
         instance_id: &str,
     ) -> impl Future<Output = Result<u64>> + Send;
+    /// The credit-note counterpart of [`Self::get_invoice_counter`].
+    fn get_credit_note_counter(
+        &self,
+        instance_id: &str,
+    ) -> impl Future<Output = Result<u64>> + Send;
+    /// The credit-note counterpart of [`Self::set_last_invoice_number`]:
+    /// forward-only.
+    fn set_last_credit_note_number(
+        &self,
+        instance_id: &str,
+        new_value: u64,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// Whether `number` is already used by a credit note in this instance:
+    /// a consistent `GetItem` of its reservation row. Advisory, like
+    /// [`Self::invoice_number_used`].
+    fn credit_note_number_used(
+        &self,
+        instance_id: &str,
+        number: u32,
+    ) -> impl Future<Output = Result<bool>> + Send;
     fn set_credit_note_pdf_key(
         &self,
         id: &str,
@@ -2884,7 +3175,7 @@ pub trait Handler: Sync {
         brand_id: Option<&str>,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Atomically allocate the next invoice number via `UpdateItem ADD` on
-    /// `counter` (`id = instance_id`, attribute `next_invoice_number`) —
+    /// `counter` (`id = instance_id`, attribute `last_invoice_number`) —
     /// the finance counterpart of [`Self::increment_ticket_counter`], same
     /// gap-not-duplicate reasoning.
     fn increment_invoice_counter(
@@ -2896,31 +3187,27 @@ pub trait Handler: Sync {
     /// `FinanceSettingsInfo.nextInvoiceNumber` (`= this + 1`), read lazily
     /// by that one field's resolver rather than on every `Instance` fetch.
     fn get_invoice_counter(&self, instance_id: &str) -> impl Future<Output = Result<u64>> + Send;
-    /// `setNextInvoiceNumber`'s write path: set `next_invoice_number =
-    /// new_value`, conditioned on `attribute_not_exists(next_invoice_number)
-    /// OR next_invoice_number <= :new_value` — forward-only. `Ok(false)`
+    /// `setNextInvoiceNumber`'s write path: set `last_invoice_number =
+    /// new_value`, conditioned on `attribute_not_exists(last_invoice_number)
+    /// OR last_invoice_number <= :new_value` — forward-only. `Ok(false)`
     /// when the condition fails ("can only move forward").
-    fn set_next_invoice_number(
+    fn set_last_invoice_number(
         &self,
         instance_id: &str,
         new_value: u64,
     ) -> impl Future<Output = Result<bool>> + Send;
     /// Whether `number` is already used by an invoice in this instance — the
     /// check behind `finalizeInvoice(number:)`, which may claim any unused
-    /// number, lower ones included. First a consistent `GetItem` of its
+    /// number, lower ones included: a consistent `GetItem` of its
     /// reservation row ([`invoice_number_reservation_id`], written by every
-    /// [`Self::finalize_invoice`]); then, for invoices finalized before
-    /// reservation rows existed, a query of the instance's invoices for that
-    /// `number`. The query is eventually consistent, which only matters for
-    /// an invoice finalized in the last moment — and every such invoice has a
-    /// reservation row. Advisory: the reservation's condition inside
-    /// `finalize_invoice` is what actually prevents a duplicate.
+    /// [`Self::finalize_invoice`]). Advisory: the reservation's condition
+    /// inside `finalize_invoice` is what actually prevents a duplicate.
     fn invoice_number_used(
         &self,
         instance_id: &str,
         number: u32,
     ) -> impl Future<Output = Result<bool>> + Send;
-    /// One page of an invoice listing, newest `created_at` first — mirrors
+    /// One page of an invoice listing, newest `list_key` first — mirrors
     /// [`Self::list_billable_items`] exactly, including the "no `Limit` on a
     /// filtered query" rule.
     fn list_invoices(
@@ -3548,6 +3835,7 @@ mod tests {
             payment_terms_days: None,
             broadcast_senders: Vec::new(),
             brands: Vec::new(),
+            number_format: NumberFormat::default(),
         };
         assert!(require_instance_kind(&instance, InstanceKind::Finance).is_ok());
         assert!(require_instance_kind(&instance, InstanceKind::Support).is_err());
@@ -3576,6 +3864,7 @@ mod tests {
             payment_terms_days: None,
             broadcast_senders: Vec::new(),
             brands: Vec::new(),
+            number_format: NumberFormat::default(),
         };
         assert_eq!(instance.currency_or_default(), "AUD");
         instance.currency = Some("USD".to_string());

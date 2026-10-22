@@ -48,7 +48,20 @@ use toolbox::mockstorage;
 
 type TestApp =
     app::MyApp<dynamodb::Handler, mockmail::Handler, mockstorage::Storage, mockqueue::Queue>;
-type TestSchema = graphql::ToolboxSchema<TestApp>;
+/// The schema plus the per-request dataloader the server attaches
+/// (`server.rs`) — `Project.client` resolves through it.
+struct TestSchema {
+    app: Arc<TestApp>,
+    schema: graphql::ToolboxSchema<TestApp>,
+}
+
+impl TestSchema {
+    async fn execute(&self, request: Request) -> Response {
+        self.schema
+            .execute(request.data(graphql::get_dataloader(self.app.clone())))
+            .await
+    }
+}
 
 /// See `tests/auth_dynamodb_local.rs`'s identically-named helper for the full
 /// rationale.
@@ -169,7 +182,10 @@ fn build_app_and_schema(db: dynamodb::Handler) -> (Arc<TestApp>, TestSchema) {
         0,
     ));
     let webauthn = Arc::new(app::build_webauthn().expect("WebAuthn build failed"));
-    let schema = graphql::build_schema(my_app.clone(), webauthn);
+    let schema = TestSchema {
+        app: my_app.clone(),
+        schema: graphql::build_schema(my_app.clone(), webauthn),
+    };
     (my_app, schema)
 }
 
@@ -228,10 +244,34 @@ async fn setup_support_instance(db: &dynamodb::Handler, label: &str) -> (String,
     (instance.id, owner.id)
 }
 
+const CREATE_CLIENT_MUTATION: &str = r#"
+    mutation($instanceId: ID!, $input: ClientInput!) {
+        createClient(instanceId: $instanceId, input: $input) {
+            id name abn address email paymentTermsDays effectivePaymentTermsDays archived
+        }
+    }
+"#;
+
+const UPDATE_CLIENT_MUTATION: &str = r#"
+    mutation($id: ID!, $input: ClientInput!, $archived: Boolean!) {
+        updateClient(id: $id, input: $input, archived: $archived) {
+            id name abn address email paymentTermsDays archived
+        }
+    }
+"#;
+
+const CLIENTS_QUERY: &str = r#"
+    query($instanceId: ID!, $includeArchived: Boolean!) {
+        clients(instanceId: $instanceId, includeArchived: $includeArchived) {
+            id name projects { id name }
+        }
+    }
+"#;
+
 const CREATE_PROJECT_MUTATION: &str = r#"
     mutation($instanceId: ID!, $input: CreateProjectInput!) {
         createProject(instanceId: $instanceId, input: $input) {
-            id name clientName clientAbn clientAddress reference archived
+            id name reference archived client { id name abn address }
         }
     }
 "#;
@@ -239,7 +279,7 @@ const CREATE_PROJECT_MUTATION: &str = r#"
 const UPDATE_PROJECT_MUTATION: &str = r#"
     mutation($id: ID!, $input: UpdateProjectInput!) {
         updateProject(id: $id, input: $input) {
-            id name clientName clientAbn clientAddress reference archived
+            id name reference archived client { id name abn address }
         }
     }
 "#;
@@ -283,28 +323,56 @@ const CREATE_API_TOKEN_MUTATION: &str = r#"
 
 const PUBLIC_INSTANCES_QUERY: &str = "{ publicInstances { slug } }";
 
-fn default_project_input(name: &str) -> Value {
+fn default_client_input() -> Value {
     json!({
-        "name": name,
-        "clientName": "Fictional Client Pty Ltd",
-        "clientAbn": "12 345 678 901",
-        "clientAddress": "1 Example St\nSomewhere",
-        "reference": "Site A",
+        "name": "Fictional Client Pty Ltd",
+        "abn": "12 345 678 901",
+        "address": "1 Example St\nSomewhere",
     })
 }
 
+async fn create_client(
+    schema: &TestSchema,
+    instance_id: &str,
+    input: Value,
+    auth: AuthInfo,
+) -> Response {
+    schema
+        .execute(
+            Request::new(CREATE_CLIENT_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "instanceId": instance_id,
+                    "input": input,
+                })))
+                .data(auth),
+        )
+        .await
+}
+
+/// Create a client and then a project billing it, both as `auth`. When the
+/// client can't be created (the caller isn't allowed to), the project is
+/// attempted with a made-up client id, so the response is
+/// `createProject`'s own refusal.
 async fn create_project(
     schema: &TestSchema,
     instance_id: &str,
     name: &str,
     auth: AuthInfo,
 ) -> Response {
+    let client = create_client(schema, instance_id, default_client_input(), auth.clone()).await;
+    let client_id = client
+        .data
+        .clone()
+        .into_json()
+        .ok()
+        .and_then(|d| d["createClient"]["id"].as_str().map(str::to_string))
+        .unwrap_or_else(|| "NoSuchClient".to_string());
     schema
         .execute(
             Request::new(CREATE_PROJECT_MUTATION)
                 .variables(Variables::from_json(json!({
                     "instanceId": instance_id,
-                    "input": default_project_input(name),
+                    "input": { "clientId": client_id, "name": name, "reference": "Site A" },
                 })))
                 .data(auth),
         )
@@ -327,9 +395,11 @@ async fn owner_and_agent_can_create_update_and_list_projects() {
     .await;
     let created = expect_data(&created, "createProject");
     assert_eq!(created["name"], "Zeta Job");
-    assert_eq!(created["clientName"], "Fictional Client Pty Ltd");
+    assert_eq!(created["client"]["name"], "Fictional Client Pty Ltd");
+    assert_eq!(created["client"]["abn"], "12 345 678 901");
     assert_eq!(created["archived"], json!(false));
     let project_id = created["id"].as_str().unwrap().to_string();
+    let client_id = created["client"]["id"].as_str().unwrap().to_string();
 
     // The agent can also create one, and can update the owner's project.
     let created_by_agent = create_project(
@@ -347,10 +417,8 @@ async fn owner_and_agent_can_create_update_and_list_projects() {
                 .variables(Variables::from_json(json!({
                     "id": project_id,
                     "input": {
+                        "clientId": client_id,
                         "name": "Zeta Job (renamed)",
-                        "clientName": "Fictional Client Pty Ltd",
-                        "clientAbn": null,
-                        "clientAddress": "1 Example St\nSomewhere",
                         "reference": null,
                         "archived": false,
                     }
@@ -360,7 +428,7 @@ async fn owner_and_agent_can_create_update_and_list_projects() {
         .await;
     let updated = expect_data(&update_response, "updateProject");
     assert_eq!(updated["name"], "Zeta Job (renamed)");
-    assert_eq!(updated["clientAbn"], Value::Null);
+    assert_eq!(updated["client"]["id"], client_id.as_str());
     assert_eq!(updated["reference"], Value::Null);
 
     // Sorted by name case-insensitively: "Alpha Job" before "Zeta Job (renamed)".
@@ -406,10 +474,8 @@ async fn archiving_hides_a_project_unless_include_archived_is_set() {
                 .variables(Variables::from_json(json!({
                     "id": project_id,
                     "input": {
+                        "clientId": created["client"]["id"],
                         "name": "To Archive",
-                        "clientName": "Fictional Client Pty Ltd",
-                        "clientAbn": null,
-                        "clientAddress": null,
                         "reference": null,
                         "archived": true,
                     }
@@ -463,6 +529,7 @@ async fn a_non_member_cannot_reach_projects() {
         .as_str()
         .unwrap()
         .to_string();
+    let client_id = expect_data(&created, "createProject.client.id");
 
     // A user with no membership at all: `Member` guard rejects `createProject`.
     let outsider_create = create_project(
@@ -487,10 +554,8 @@ async fn a_non_member_cannot_reach_projects() {
                 .variables(Variables::from_json(json!({
                     "id": project_id,
                     "input": {
+                        "clientId": client_id,
                         "name": "Stolen",
-                        "clientName": "Fictional Client Pty Ltd",
-                        "clientAbn": null,
-                        "clientAddress": null,
                         "reference": null,
                         "archived": false,
                     }
@@ -573,6 +638,138 @@ async fn a_superuser_with_no_membership_cannot_reach_projects() {
         )
         .await;
     assert_eq!(expect_data(&read_response, "project"), Value::Null);
+}
+
+#[tokio::test]
+async fn clients_are_created_updated_listed_and_archived() {
+    let prefix = require_local_db!();
+    let db = dynamodb::Handler::new(&prefix, false).await;
+    let (instance_id, owner_id, agent_id) = setup_finance_instance(&db, "clients").await;
+    let (elsewhere, elsewhere_owner, _) = setup_finance_instance(&db, "clients-elsewhere").await;
+    let (_my_app, schema) = build_app_and_schema(db);
+    let agent = || agent_auth(&agent_id, &instance_id);
+
+    // Any member can add a client; blank optional fields are left out.
+    let created = create_client(
+        &schema,
+        &instance_id,
+        json!({ "name": "  Zed Holdings  ", "abn": " ", "email": "Accounts@Zed.Example.com", "paymentTermsDays": 30 }),
+        agent(),
+    )
+    .await;
+    let created = expect_data(&created, "createClient");
+    assert_eq!(created["name"], "Zed Holdings");
+    assert_eq!(created["abn"], Value::Null);
+    assert_eq!(created["email"], "accounts@zed.example.com");
+    assert_eq!(created["effectivePaymentTermsDays"], 30);
+    let zed = created["id"].as_str().unwrap().to_string();
+
+    let other = create_client(&schema, &instance_id, default_client_input(), agent()).await;
+    let other = expect_data(&other, "createClient.id");
+
+    // A project bills one of them; the client lists its projects.
+    let project = schema
+        .execute(
+            Request::new(CREATE_PROJECT_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "instanceId": instance_id,
+                    "input": { "clientId": zed, "name": "Fit-out" },
+                })))
+                .data(agent()),
+        )
+        .await;
+    let project = expect_data(&project, "createProject");
+    assert_eq!(project["client"]["name"], "Zed Holdings");
+
+    let list = schema
+        .execute(
+            Request::new(CLIENTS_QUERY)
+                .variables(Variables::from_json(
+                    json!({ "instanceId": instance_id, "includeArchived": false }),
+                ))
+                .data(agent()),
+        )
+        .await;
+    let list = expect_data(&list, "clients");
+    let names: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["Fictional Client Pty Ltd", "Zed Holdings"]);
+    assert_eq!(list[1]["projects"][0]["name"], "Fit-out");
+
+    // Archived: hidden from the list, and takes no new projects — but its
+    // existing project can still be edited.
+    let archived = schema
+        .execute(
+            Request::new(UPDATE_CLIENT_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "id": zed,
+                    "input": { "name": "Zed Holdings" },
+                    "archived": true,
+                })))
+                .data(owner_auth(&owner_id, &instance_id)),
+        )
+        .await;
+    let archived = expect_data(&archived, "updateClient");
+    assert_eq!(archived["archived"], json!(true));
+    assert_eq!(archived["email"], Value::Null);
+    let refused = schema
+        .execute(
+            Request::new(CREATE_PROJECT_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "instanceId": instance_id,
+                    "input": { "clientId": zed, "name": "Another" },
+                })))
+                .data(agent()),
+        )
+        .await;
+    assert!(
+        !refused.errors.is_empty(),
+        "an archived client takes no new projects"
+    );
+    let edited = schema
+        .execute(
+            Request::new(UPDATE_PROJECT_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "id": project["id"],
+                    "input": { "clientId": zed, "name": "Fit-out (stage 2)", "archived": false },
+                })))
+                .data(agent()),
+        )
+        .await;
+    expect_data(&edited, "updateProject");
+
+    // Moving the project to the other client works too.
+    let moved = schema
+        .execute(
+            Request::new(UPDATE_PROJECT_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "id": project["id"],
+                    "input": { "clientId": other, "name": "Fit-out (stage 2)", "archived": false },
+                })))
+                .data(agent()),
+        )
+        .await;
+    assert_eq!(
+        expect_data(&moved, "updateProject.client.name"),
+        "Fictional Client Pty Ltd"
+    );
+
+    // A client of another instance is NOT_FOUND, like a missing one.
+    let foreign = schema
+        .execute(
+            Request::new(CREATE_PROJECT_MUTATION)
+                .variables(Variables::from_json(json!({
+                    "instanceId": elsewhere,
+                    "input": { "clientId": zed, "name": "Poached" },
+                })))
+                .data(owner_auth(&elsewhere_owner, &elsewhere)),
+        )
+        .await;
+    assert_eq!(expect_error_code(&foreign), "NOT_FOUND");
 }
 
 #[tokio::test]

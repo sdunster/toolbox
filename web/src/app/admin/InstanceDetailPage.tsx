@@ -13,6 +13,7 @@ import { InboundAddressesSection } from "./InboundAddressesSection";
 import { ApiTokensSection } from "./ApiTokensSection";
 import { FinanceSettingsForm } from "../finance/FinanceSettingsForm";
 import { InvoiceNumberingForm } from "../finance/InvoiceNumberingForm";
+import { NumberFormatForm } from "../finance/NumberFormatForm";
 import { BrandsSection } from "../finance/BrandsSection";
 
 const instanceDetailPageQuery = graphql`
@@ -23,6 +24,7 @@ const instanceDetailPageQuery = graphql`
       ...InstanceEditForm_instance
       ...FinanceSettingsForm_instance
       ...InvoiceNumberingForm_instance
+      ...NumberFormatForm_instance
       ...BrandsSection_instance
       ...InstanceDeleteControl_instance
       ...MembersSection_instance
@@ -74,6 +76,7 @@ function Content({ id }: { id: string }) {
           <FinanceSettingsForm instance={data.adminInstance} />
           <BrandsSection instance={data.adminInstance} />
           <InvoiceNumberingForm instance={data.adminInstance} />
+          <NumberFormatForm instance={data.adminInstance} />
         </>
       )}
       <MembersSection instance={data.adminInstance} query={data} />

@@ -207,7 +207,7 @@ mod tests {
 
     fn snapshot() -> InvoiceSnapshot {
         InvoiceSnapshot {
-            schema_version: 2,
+            schema_version: crate::finance::snapshot::SCHEMA_VERSION,
             title: "Tax Invoice".into(),
             display_number: Some("008".into()),
             issue_date: Some("2026-08-19".into()),
@@ -231,10 +231,10 @@ mod tests {
             subtotal_cents: 10_000,
             gst_cents: 1_000,
             total_cents: 11_000,
+            notes: None,
             payment_details: Some("BSB 000-000 Acc 0000".into()),
             due_date: Some("2026-09-02".into()),
             credit_note: None,
-            no_gst_note: false,
         }
     }
 

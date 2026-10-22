@@ -26,8 +26,10 @@ const invoicePreviewFragment = graphql`
     lines {
       description
       quantity
+      unit
       unitPriceCents
       amountCents
+      discount
       gstFree
     }
     subtotalCents
@@ -35,6 +37,7 @@ const invoicePreviewFragment = graphql`
     totalCents
     currency
     gstRegistered
+    notes
     paymentDetails
   }
 `;
@@ -183,11 +186,13 @@ export function InvoicePreview({
                     <p className="text-xs text-neutral-600">(GST-free)</p>
                   )}
                 </td>
+                {/* A discount prints its amount only. */}
                 <td className="py-2 pr-3 text-right tabular-nums">
-                  {line.quantity}
+                  {!line.discount &&
+                    `${line.quantity}${line.unit ? ` ${line.unit}` : ""}`}
                 </td>
                 <td className="py-2 pr-3 text-right tabular-nums">
-                  {formatCents(line.unitPriceCents)}
+                  {!line.discount && formatCents(line.unitPriceCents)}
                 </td>
                 <td className="py-2 text-right tabular-nums">
                   {formatCents(line.amountCents)}
@@ -229,6 +234,12 @@ export function InvoicePreview({
       {!data.gstRegistered && (
         <p className="mt-4 text-sm text-neutral-600">
           No GST has been charged.
+        </p>
+      )}
+
+      {data.notes && (
+        <p className="mt-6 text-sm whitespace-pre-line text-neutral-700">
+          {data.notes}
         </p>
       )}
 

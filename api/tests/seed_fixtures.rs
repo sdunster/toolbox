@@ -151,11 +151,31 @@ fn synthetic_references_resolve() {
         );
     }
 
+    // A project's client must belong to the project's own instance.
+    let client_instances: std::collections::HashMap<String, String> = rows(&doc, "client")
+        .iter()
+        .map(|c| (id(c), s(c, "instance_id").unwrap_or_default()))
+        .collect();
+    for client in rows(&doc, "client") {
+        let instance_id = s(client, "instance_id").expect("client.instance_id");
+        assert!(
+            instances.contains(&instance_id),
+            "client {} points at missing instance {instance_id}",
+            id(client)
+        );
+    }
     for project in rows(&doc, "project") {
         let instance_id = s(project, "instance_id").expect("project.instance_id");
         assert!(
             instances.contains(&instance_id),
             "project {} points at missing instance {instance_id}",
+            id(project)
+        );
+        let client_id = s(project, "client_id").expect("project.client_id");
+        assert_eq!(
+            client_instances.get(&client_id),
+            Some(&instance_id),
+            "project {} must point at an existing client in the same instance",
             id(project)
         );
     }

@@ -7,11 +7,11 @@ import { Card } from "../../components/ui/Card";
 import { Button } from "../../components/ui/Button";
 import { FormField } from "../../components/ui/FormField";
 import TextInput from "../../components/ui/TextInput";
-import { inputBase } from "../../components/ui/inputStyles";
 import { ProjectBillingFields } from "./ProjectBillingFields";
 import { billingInput, initialBillingValues } from "../../lib/projectBilling";
 import { DEFAULT_BRAND_ID } from "../../lib/brands";
 import { InstanceBrandSelect } from "./BrandSelect";
+import { ClientSelect } from "./ClientSelect";
 
 /**
  * Create a project in the selected finance instance, then go straight to
@@ -29,9 +29,7 @@ export function CreateProjectForm({
 }) {
   const navigate = useNavigate();
   const [name, setName] = useState("");
-  const [clientName, setClientName] = useState("");
-  const [clientAbn, setClientAbn] = useState("");
-  const [clientAddress, setClientAddress] = useState("");
+  const [clientId, setClientId] = useState("");
   const [reference, setReference] = useState("");
   const [billing, setBilling] = useState(() => initialBillingValues());
   const [brandId, setBrandId] = useState(DEFAULT_BRAND_ID);
@@ -61,10 +59,8 @@ export function CreateProjectForm({
       variables: {
         instanceId,
         input: {
+          clientId,
           name: name.trim(),
-          clientName: clientName.trim(),
-          clientAbn: clientAbn.trim(),
-          clientAddress: clientAddress.trim(),
           reference: reference.trim(),
           ...parsed.input,
           brandId,
@@ -93,33 +89,12 @@ export function CreateProjectForm({
             required
           />
         </FormField>
-        <FormField label="Client name" htmlFor="new-project-client-name">
-          <TextInput
-            id="new-project-client-name"
-            value={clientName}
-            onChange={(e) => setClientName(e.target.value)}
-            maxLength={200}
-            required
-          />
-        </FormField>
-        <FormField label="Client ABN" htmlFor="new-project-client-abn">
-          <TextInput
-            id="new-project-client-abn"
-            value={clientAbn}
-            onChange={(e) => setClientAbn(e.target.value)}
-            maxLength={200}
-          />
-        </FormField>
-        <FormField label="Client address" htmlFor="new-project-client-address">
-          <textarea
-            id="new-project-client-address"
-            className={inputBase}
-            rows={3}
-            value={clientAddress}
-            onChange={(e) => setClientAddress(e.target.value)}
-            maxLength={2000}
-          />
-        </FormField>
+        <ClientSelect
+          instanceId={instanceId}
+          id="new-project-client"
+          value={clientId}
+          onChange={setClientId}
+        />
         <FormField label="Reference" htmlFor="new-project-reference">
           <TextInput
             id="new-project-reference"
@@ -128,6 +103,10 @@ export function CreateProjectForm({
             maxLength={200}
             placeholder="e.g. the site address"
           />
+          <p className="mt-1 text-xs text-ink-muted">
+            Printed on its invoices, unless an invoice has its own (a PO
+            number).
+          </p>
         </FormField>
         <InstanceBrandSelect
           slug={slug}

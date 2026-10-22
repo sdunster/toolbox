@@ -33,11 +33,12 @@ use super::auth::{AuthGuard, AuthRequirement, is_member, is_owner};
 use super::error::ApiError;
 use super::finance::{CreditNote, CreditNoteInput, RecordPaymentInput, SendDocumentInput};
 use super::query::{
-    ApiTokenInfo, BillableItem, BillableItemInput, BrandInput, Broadcast, CreateProjectInput,
-    CreatedApiToken, Expense, ExpenseInput, FinanceSettingsInput, InboundAddressInfo, Instance,
-    InstanceKindType, Invoice, MembershipInfo, MembershipRoleType, NotificationSettingsInput,
-    PasskeyInfo, Project, SaveBroadcastDraftInput, SendBroadcastInput, Ticket, TicketMessage,
-    TicketStatusType, UpdateProjectInput, User,
+    ApiTokenInfo, BillableItem, BillableItemInput, BillableItemKindType, BrandInput, Broadcast,
+    Client, ClientInput, CreateProjectInput, CreatedApiToken, Expense, ExpenseInput,
+    FinanceSettingsInput, InboundAddressInfo, Instance, InstanceKindType, Invoice, MembershipInfo,
+    MembershipRoleType, NotificationSettingsInput, PasskeyInfo, Project, SaveBroadcastDraftInput,
+    SendBroadcastInput, Ticket, TicketMessage, TicketStatusType, UpdateProjectInput, User,
+    load_invoice_parties,
 };
 
 /// One code per address per this many seconds — cheap anti-spam for
@@ -204,9 +205,8 @@ async fn require_project_member<A: App + HasDb + Send + Sync>(
     Ok(project)
 }
 
-/// Trim and length-check a required project field (`name`/`clientName`) —
-/// `createProject`/`updateProject`'s validation for the two non-optional
-/// fields. Matches [`MAX_PROJECT_FIELD_LEN`].
+/// Trim and length-check a project's or client's `name` — the one required
+/// string field of each. Matches [`MAX_PROJECT_FIELD_LEN`].
 fn require_project_name(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -220,20 +220,7 @@ fn require_project_name(raw: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn require_project_client_name(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("clientName cannot be empty"));
-    }
-    if trimmed.chars().count() > MAX_PROJECT_FIELD_LEN {
-        return Err(anyhow!(
-            "clientName cannot be longer than {MAX_PROJECT_FIELD_LEN} characters"
-        ));
-    }
-    Ok(trimmed.to_string())
-}
-
-/// Trim an optional project field (`clientAbn`/`clientAddress`/`reference`);
+/// Trim an optional project or client field (`reference`, `abn`, …);
 /// a blank result is `None` (the caller `REMOVE`s the attribute), matching
 /// the omit-optional-attributes house rule. `field_name` names the argument
 /// in the error message; `max_len` is [`MAX_PROJECT_FIELD_LEN`] or
@@ -370,6 +357,8 @@ async fn validate_expense<A: App + HasDb + Send + Sync>(
         supplier: input.supplier.as_deref(),
         amount_cents: input.amount_cents,
         gst_cents: input.gst_cents,
+        business_use_percent: input.business_use_percent,
+        gst_not_claimable: input.gst_not_claimable,
         distance_km: input.distance_km.as_deref(),
     })
     .map_err(|e| anyhow!(e))
@@ -408,6 +397,39 @@ fn invoice_number_used(number: u32) -> ApiError {
     ApiError::conflict(format!(
         "Invoice number {number} is already used in this instance"
     ))
+}
+
+fn credit_note_number_used(number: u32) -> ApiError {
+    ApiError::conflict(format!(
+        "Credit note number {number} is already used in this instance"
+    ))
+}
+
+/// An explicit document `number` (`finalizeInvoice`/`issueCreditNote`):
+/// `None` when omitted, else at least 1 and only from an owner of the
+/// instance — choosing a number is for importing existing documents.
+fn explicit_number(
+    ctx: &Context<'_>,
+    instance_id: &str,
+    number: Option<i32>,
+    what: &str,
+) -> Result<Option<u32>> {
+    let Some(n) = number else {
+        return Ok(None);
+    };
+    let Some(AuthInfo::User { memberships, .. }) = ctx.data_opt::<AuthInfo>() else {
+        return Err(ApiError::forbidden("Must be authenticated as a user").into());
+    };
+    if !is_owner(memberships, instance_id) {
+        return Err(ApiError::forbidden(format!(
+            "Only an owner of this instance can choose {what} number"
+        ))
+        .into());
+    }
+    if n < 1 {
+        return Err(anyhow!("number must be at least 1"));
+    }
+    Ok(Some(u32::try_from(n).unwrap_or(0)))
 }
 
 /// Validate a set of billable-item ids to add to an invoice
@@ -500,9 +522,11 @@ fn check_invoice_total_within_safe_integer(
     items: &[db::BillableItem],
     gst_registered: bool,
 ) -> Result<()> {
+    // Charges only: a discount can only bring the total down.
     let subtotal: i64 = items
         .iter()
-        .map(|it| finance::money::line_amount_cents(it.quantity_hundredths, it.unit_price_cents))
+        .filter(|it| !it.discount)
+        .map(db::BillableItem::amount_cents)
         .sum();
     let gst = if gst_registered {
         finance::money::gst_cents(subtotal)
@@ -520,64 +544,67 @@ struct ValidBillableItem {
     description: String,
     quantity_hundredths: i64,
     unit_price_cents: i64,
+    unit: Option<String>,
+    discount: bool,
 }
 
 /// `unit_price_cents` is the price the caller resolved — the input's own,
 /// else the project's default (create) or the item's current one (update).
+/// A discount takes quantity `"1"`, a price above zero (the amount off) and
+/// no unit — see `BillableItemInput`'s doc comment.
 fn validate_billable_item_input(
     input: &BillableItemInput,
     unit_price_cents: i64,
 ) -> Result<ValidBillableItem> {
+    let discount = input.kind == BillableItemKindType::Discount;
+    let quantity_hundredths =
+        finance::money::parse_quantity(&input.quantity).map_err(|e| anyhow!(e))?;
+    let unit = finance::validate_unit(input.unit.as_deref()).map_err(|e| anyhow!(e))?;
+    let unit_price_cents =
+        finance::validate_unit_price_cents(unit_price_cents).map_err(|e| anyhow!(e))?;
+    if discount {
+        if quantity_hundredths != 100 {
+            return Err(anyhow!("A discount's quantity is always 1"));
+        }
+        if unit.is_some() {
+            return Err(anyhow!("A discount has no unit"));
+        }
+        if unit_price_cents == 0 {
+            return Err(anyhow!("A discount must take something off"));
+        }
+    }
     Ok(ValidBillableItem {
         date: finance::validate_item_date(&input.date).map_err(|e| anyhow!(e))?,
         description: finance::validate_description(&input.description).map_err(|e| anyhow!(e))?,
-        quantity_hundredths: finance::money::parse_quantity(&input.quantity)
-            .map_err(|e| anyhow!(e))?,
-        unit_price_cents: finance::validate_unit_price_cents(unit_price_cents)
-            .map_err(|e| anyhow!(e))?,
+        quantity_hundredths,
+        unit_price_cents,
+        unit,
+        discount,
     })
 }
 
-/// `createProject`/`updateProject`'s raw fields, before validation.
+/// `createProject`/`updateProject`'s raw fields, before validation. The
+/// client is checked separately ([`require_project_client`]), since that
+/// needs a read.
 struct ProjectFieldsInput<'a> {
     instance: &'a db::Instance,
     /// The project's brand before this update, which stays choosable even
     /// once archived.
     current_brand_id: Option<&'a str>,
     brand_id: Option<&'a ID>,
+    client_id: &'a str,
     name: &'a str,
-    client_name: &'a str,
-    client_abn: Option<&'a str>,
-    client_address: Option<&'a str>,
-    client_email: Option<&'a str>,
     reference: Option<&'a str>,
-    payment_terms_days: Option<i32>,
     default_unit_price_cents: Option<i64>,
 }
 
 /// Trim and validate every project field; blank optional strings become
 /// `None` (absent / `REMOVE`d).
 fn validate_project_fields(input: ProjectFieldsInput<'_>) -> Result<db::ProjectFields> {
-    let client_email =
-        normalize_project_field(input.client_email, "clientEmail", MAX_PROJECT_FIELD_LEN)?
-            .map(|e| db::normalize_user_email(&e).map_err(|e| anyhow!(e)))
-            .transpose()?;
     Ok(db::ProjectFields {
+        client_id: input.client_id.to_string(),
         name: require_project_name(input.name)?,
-        client_name: require_project_client_name(input.client_name)?,
-        client_abn: normalize_project_field(input.client_abn, "clientAbn", MAX_PROJECT_FIELD_LEN)?,
-        client_address: normalize_project_field(
-            input.client_address,
-            "clientAddress",
-            MAX_PROJECT_LONG_FIELD_LEN,
-        )?,
-        client_email,
         reference: normalize_project_field(input.reference, "reference", MAX_PROJECT_FIELD_LEN)?,
-        payment_terms_days: input
-            .payment_terms_days
-            .map(finance::validate_payment_terms_days)
-            .transpose()
-            .map_err(|e| anyhow!(e))?,
         default_unit_price_cents: input
             .default_unit_price_cents
             .map(finance::validate_unit_price_cents)
@@ -590,6 +617,95 @@ fn validate_project_fields(input: ProjectFieldsInput<'_>) -> Result<db::ProjectF
         )
         .map_err(|e| anyhow!(e))?,
     })
+}
+
+/// The client a project is being pointed at: one of the instance's
+/// (`NOT_FOUND` otherwise, missing and not-yours alike), and not archived —
+/// unless it's the client the project already has (`current`), so editing a
+/// project of a since-archived client still works.
+async fn require_project_client<A: App + HasDb + Send + Sync>(
+    app: &A,
+    instance_id: &str,
+    client_id: &str,
+    current: Option<&str>,
+) -> Result<db::Client> {
+    let client = app
+        .db()
+        .get_clients(&[client_id])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .filter(|c| c.instance_id == instance_id)
+        .ok_or_else(|| ApiError::not_found("Client", client_id))?;
+    if client.archived && current != Some(client.id.as_str()) {
+        return Err(anyhow!(
+            "Client is archived — un-archive it to give it new projects"
+        ));
+    }
+    Ok(client)
+}
+
+/// Trim and validate every client field; blank optional strings become
+/// `None` (absent / `REMOVE`d).
+fn validate_client_fields(input: &ClientInput) -> Result<db::ClientFields> {
+    let email = normalize_project_field(input.email.as_deref(), "email", MAX_PROJECT_FIELD_LEN)?
+        .map(|e| db::normalize_user_email(&e).map_err(|e| anyhow!(e)))
+        .transpose()?;
+    Ok(db::ClientFields {
+        name: require_project_name(&input.name)?,
+        abn: normalize_project_field(input.abn.as_deref(), "abn", MAX_PROJECT_FIELD_LEN)?,
+        address: normalize_project_field(
+            input.address.as_deref(),
+            "address",
+            MAX_PROJECT_LONG_FIELD_LEN,
+        )?,
+        email,
+        payment_terms_days: input
+            .payment_terms_days
+            .map(finance::validate_payment_terms_days)
+            .transpose()
+            .map_err(|e| anyhow!(e))?,
+    })
+}
+
+/// The per-record authorization check for a client — the shape of
+/// [`require_project_member`]: `NOT_FOUND` for a missing client and for one
+/// the caller isn't a member of, alike.
+async fn require_client_member<A: App + HasDb + Send + Sync>(
+    ctx: &Context<'_>,
+    app: &A,
+    id: &str,
+) -> Result<db::Client> {
+    let Some(AuthInfo::User { memberships, .. }) = ctx.data_opt::<AuthInfo>() else {
+        return Err(ApiError::forbidden("Must be authenticated as a user").into());
+    };
+    let client = app
+        .db()
+        .get_clients(&[id])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Client", id))?;
+    if !is_member(memberships, &client.instance_id) {
+        return Err(ApiError::not_found("Client", id).into());
+    }
+    Ok(client)
+}
+
+/// Longest invoice note, in characters — the same bound as a description.
+const MAX_INVOICE_NOTES_LEN: usize = finance::MAX_DESCRIPTION_LEN;
+
+/// Trim an invoice's own `reference` and `notes`; blank means none.
+fn validate_invoice_details(
+    reference: Option<&str>,
+    notes: Option<&str>,
+) -> Result<(Option<String>, Option<String>)> {
+    Ok((
+        normalize_project_field(reference, "reference", MAX_PROJECT_FIELD_LEN)?,
+        normalize_project_field(notes, "notes", MAX_INVOICE_NOTES_LEN)?,
+    ))
 }
 
 /// Longest credit-note reason, in characters.
@@ -615,24 +731,24 @@ fn new_payment(
     }
 }
 
-/// Write a finalized invoice's new `payments` list, recomputing `paid_date`
+/// Write a finalized invoice's new `payments` list, recomputing `settled_date`
 /// (`finance::ledger::settled_date`) in the same conditional write, and
 /// return the updated invoice. An invoice that was already settled keeps
-/// its `paid_date` if it still is; one newly settled is dated by its latest
+/// its `settled_date` if it still is; one newly settled is dated by its latest
 /// payment. `CONFLICT` if it changed since `invoice` was read.
 async fn write_payments<A: App + HasDb + Send + Sync>(
     app: &A,
     invoice: db::Invoice,
     payments: Vec<db::InvoicePayment>,
 ) -> Result<Invoice<A>> {
-    let fallback = invoice.paid_date.clone().unwrap_or_default();
-    let paid_date = finance::ledger::settled_date(
+    let fallback = invoice.settled_date.clone().unwrap_or_default();
+    let settled_date = finance::ledger::settled_date(
         invoice.total_cents.unwrap_or(0),
         invoice.credited_cents,
         &payments,
         &fallback,
     )
-    .map(|d| match &invoice.paid_date {
+    .map(|d| match &invoice.settled_date {
         Some(existing) => existing.clone(),
         None => d,
     })
@@ -650,7 +766,7 @@ async fn write_payments<A: App + HasDb + Send + Sync>(
             &invoice.id,
             invoice.version,
             &payments,
-            paid_date.as_deref(),
+            settled_date.as_deref(),
         )
         .await?;
     if !committed {
@@ -660,7 +776,7 @@ async fn write_payments<A: App + HasDb + Send + Sync>(
     }
     Ok(Invoice::new(db::Invoice {
         payments,
-        paid_date,
+        settled_date,
         version: invoice.version + 1,
         updated_at: crate::clock::now_sec(),
         ..invoice
@@ -730,16 +846,36 @@ fn credit_note_snapshot(note: &db::CreditNote) -> Result<finance::snapshot::Invo
 
 /// `Invoice-008.pdf`.
 fn invoice_pdf_filename(invoice: &db::Invoice) -> String {
-    let display_number = invoice
-        .number
-        .map(|n| format!("{n:03}"))
-        .unwrap_or_else(|| "unknown".to_string());
-    format!("Invoice-{display_number}.pdf")
+    let display_number = invoice.display_number.as_deref().unwrap_or("unknown");
+    crate::storage::sanitize_download_filename(&format!("Invoice-{display_number}.pdf"))
 }
 
 /// `Credit-Note-CN-001.pdf`.
 fn credit_note_pdf_filename(note: &db::CreditNote) -> String {
-    format!("Credit-Note-{}.pdf", note.display_number())
+    crate::storage::sanitize_download_filename(&format!("Credit-Note-{}.pdf", note.display_number))
+}
+
+/// The email address a project's documents go to by default: its client's.
+async fn project_client_email<A: App + HasDb + Send + Sync>(
+    app: &A,
+    project_id: &str,
+) -> Result<Option<String>> {
+    let project = app
+        .db()
+        .get_projects(&[project_id])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Project", project_id))?;
+    Ok(app
+        .db()
+        .get_clients(&[project.client_id.as_str()])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(|c| c.fields.email))
 }
 
 /// A frozen document's PDF: the cached object at `cached_key` when there is
@@ -4333,6 +4469,52 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         save_brands(&*self.app, instance, brands).await
     }
 
+    // ── Clients ───────────────────────────────────────────────────────────────
+
+    /// Create a client in a finance instance. Member, like `createProject`;
+    /// rejects a support instance. See `ClientInput`.
+    #[graphql(guard = "AuthGuard::new(AuthRequirement::Member(instance_id.to_string()))")]
+    async fn create_client(&self, instance_id: ID, input: ClientInput) -> Result<Client<A>> {
+        let instance = self
+            .app
+            .db()
+            .get_instances(&[instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+        db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
+        let fields = validate_client_fields(&input)?;
+        let created = self.app.db().create_client(&instance.id, &fields).await?;
+        Ok(Client::new(created))
+    }
+
+    /// Update a client — full replace, including `archived`. Id-only,
+    /// authorised like `updateProject` (`NOT_FOUND` for missing or not
+    /// yours). A change reaches its projects' drafts; a finalized invoice
+    /// froze its bill-to.
+    async fn update_client(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        input: ClientInput,
+        #[graphql(default)] archived: bool,
+    ) -> Result<Client<A>> {
+        let client = require_client_member(ctx, &*self.app, id.as_str()).await?;
+        let fields = validate_client_fields(&input)?;
+        self.app
+            .db()
+            .update_client(&client.id, &fields, archived)
+            .await?;
+        Ok(Client::new(db::Client {
+            fields,
+            archived,
+            updated_at: crate::clock::now_sec(),
+            ..client
+        }))
+    }
+
     // ── Projects ──────────────────────────────────────────────────────────────
 
     /// Create a project in a finance instance. Member (owner or agent) —
@@ -4355,18 +4537,15 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .flatten()
             .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
         db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
+        require_project_client(&*self.app, &instance.id, input.client_id.as_str(), None).await?;
 
         let fields = validate_project_fields(ProjectFieldsInput {
             instance: &instance,
             current_brand_id: None,
             brand_id: input.brand_id.as_ref(),
+            client_id: input.client_id.as_str(),
             name: &input.name,
-            client_name: &input.client_name,
-            client_abn: input.client_abn.as_deref(),
-            client_address: input.client_address.as_deref(),
-            client_email: input.client_email.as_deref(),
             reference: input.reference.as_deref(),
-            payment_terms_days: input.payment_terms_days,
             default_unit_price_cents: input.default_unit_price_cents,
         })?;
         let created = self
@@ -4399,17 +4578,20 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .next()
             .flatten()
             .ok_or_else(|| ApiError::not_found("Project", id.as_str()))?;
+        require_project_client(
+            &*self.app,
+            &instance.id,
+            input.client_id.as_str(),
+            Some(&project.client_id),
+        )
+        .await?;
         let fields = validate_project_fields(ProjectFieldsInput {
             instance: &instance,
             current_brand_id: project.brand_id.as_deref(),
             brand_id: input.brand_id.as_ref(),
+            client_id: input.client_id.as_str(),
             name: &input.name,
-            client_name: &input.client_name,
-            client_abn: input.client_abn.as_deref(),
-            client_address: input.client_address.as_deref(),
-            client_email: input.client_email.as_deref(),
             reference: input.reference.as_deref(),
-            payment_terms_days: input.payment_terms_days,
             default_unit_price_cents: input.default_unit_price_cents,
         })?;
         self.app
@@ -4447,13 +4629,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         }
 
         Ok(Project::new(db::Project {
+            client_id: fields.client_id,
             name: fields.name,
-            client_name: fields.client_name,
-            client_abn: fields.client_abn,
-            client_address: fields.client_address,
-            client_email: fields.client_email,
             reference: fields.reference,
-            payment_terms_days: fields.payment_terms_days,
             default_unit_price_cents: fields.default_unit_price_cents,
             brand_id: fields.brand_id,
             archived: input.archived,
@@ -4485,10 +4663,21 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 "Project is archived — un-archive it to add billable items"
             ));
         }
-        let unit_price_cents = input
-            .unit_price_cents
-            .or(project.default_unit_price_cents)
-            .ok_or_else(|| anyhow!("Unit price is required — this project has no default rate"))?;
+        // A discount names its own amount; the project's rate is for charges.
+        let default_price = match input.kind {
+            BillableItemKindType::Charge => project.default_unit_price_cents,
+            BillableItemKindType::Discount => None,
+        };
+        let unit_price_cents =
+            input
+                .unit_price_cents
+                .or(default_price)
+                .ok_or_else(|| match input.kind {
+                    BillableItemKindType::Charge => {
+                        anyhow!("Unit price is required — this project has no default rate")
+                    }
+                    BillableItemKindType::Discount => anyhow!("Give the discount's amount"),
+                })?;
         let fields = validate_billable_item_input(&input, unit_price_cents)?;
         let created = self
             .app
@@ -4500,6 +4689,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 description: &fields.description,
                 quantity_hundredths: fields.quantity_hundredths,
                 unit_price_cents: fields.unit_price_cents,
+                unit: fields.unit.as_deref(),
+                discount: fields.discount,
                 gst_free: input.gst_free,
                 created_by_user_id: user_id,
             })
@@ -4550,6 +4741,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             &input,
             input.unit_price_cents.unwrap_or(item.unit_price_cents),
         )?;
+        if fields.discount && item.source_expense_id.is_some() {
+            return Err(anyhow!("A re-billed expense can't be made a discount"));
+        }
         let written = self
             .app
             .db()
@@ -4561,6 +4755,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                     description: &fields.description,
                     quantity_hundredths: fields.quantity_hundredths,
                     unit_price_cents: fields.unit_price_cents,
+                    unit: fields.unit.as_deref(),
+                    discount: fields.discount,
                     gst_free: input.gst_free,
                 },
             )
@@ -4707,17 +4903,22 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// may be finance final work on a job you've since archived). Every
     /// id in `itemIds` must belong to this project and be currently
     /// unbilled (`CONFLICT`/`NOT_FOUND` otherwise), 1–50 of them
-    /// (`MAX_INVOICE_ITEMS`), no duplicates.
+    /// (`MAX_INVOICE_ITEMS`), no duplicates. `reference` (a PO number,
+    /// printed in place of the project's) and `notes` are optional — see
+    /// `updateInvoiceDetails`.
     async fn create_invoice(
         &self,
         ctx: &Context<'_>,
         project_id: ID,
         item_ids: Vec<ID>,
+        reference: Option<String>,
+        notes: Option<String>,
     ) -> Result<Invoice<A>> {
         let project = require_project_member(ctx, &*self.app, project_id.as_str()).await?;
         let Some(AuthInfo::User { id: user_id, .. }) = ctx.data_opt::<AuthInfo>() else {
             return Err(ApiError::forbidden("Must be authenticated as a user").into());
         };
+        let (reference, notes) = validate_invoice_details(reference.as_deref(), notes.as_deref())?;
         let ids = validate_new_invoice_item_ids(&item_ids, &[])?;
         let items = fetch_eligible_items(&*self.app, &project.id, &ids).await?;
 
@@ -4735,14 +4936,16 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         let created = self
             .app
             .db()
-            .create_invoice(
-                &project.instance_id,
-                &project.id,
-                &ids,
-                user_id,
-                finance::brand::find(&instance, project.brand_id.as_deref())
+            .create_invoice(&db::NewInvoice {
+                instance_id: &project.instance_id,
+                project_id: &project.id,
+                item_ids: &ids,
+                created_by_user_id: user_id,
+                brand_id: finance::brand::find(&instance, project.brand_id.as_deref())
                     .map(|b| b.id.as_str()),
-            )
+                reference: reference.as_deref(),
+                notes: notes.as_deref(),
+            })
             .await?
             .ok_or_else(|| {
                 ApiError::conflict(
@@ -4750,6 +4953,50 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 )
             })?;
         Ok(Invoice::new(created))
+    }
+
+    /// Set a draft's own `reference` (a PO number, printed in place of its
+    /// project's) and `notes` (printed above the payment details) — a full
+    /// replace: blank or omitted clears one. `CONFLICT` once finalized, or
+    /// if it changed concurrently; bumps `version`, so a finalize that read
+    /// the draft before this fails rather than freezing stale details.
+    async fn update_invoice_details(
+        &self,
+        ctx: &Context<'_>,
+        invoice_id: ID,
+        reference: Option<String>,
+        notes: Option<String>,
+    ) -> Result<Invoice<A>> {
+        let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
+        if invoice.status != db::InvoiceStatus::Draft {
+            return Err(ApiError::conflict(
+                "Invoice is finalized — its details can no longer change",
+            )
+            .into());
+        }
+        let (reference, notes) = validate_invoice_details(reference.as_deref(), notes.as_deref())?;
+        let written = self
+            .app
+            .db()
+            .update_invoice_details(
+                &invoice.id,
+                invoice.version,
+                reference.as_deref(),
+                notes.as_deref(),
+            )
+            .await?;
+        if !written {
+            return Err(
+                ApiError::conflict("Invoice changed concurrently — reload and try again").into(),
+            );
+        }
+        Ok(Invoice::new(db::Invoice {
+            reference,
+            notes,
+            version: invoice.version + 1,
+            updated_at: crate::clock::now_sec(),
+            ..invoice
+        }))
     }
 
     /// Add unbilled items to a draft invoice, in one transaction
@@ -4917,25 +5164,10 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         due_date: Option<String>,
     ) -> Result<Invoice<A>> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
-        let Some(AuthInfo::User {
-            id: user_id,
-            memberships,
-            ..
-        }) = ctx.data_opt::<AuthInfo>()
-        else {
+        let Some(AuthInfo::User { id: user_id, .. }) = ctx.data_opt::<AuthInfo>() else {
             return Err(ApiError::forbidden("Must be authenticated as a user").into());
         };
-        let explicit_number = match number {
-            None => None,
-            Some(_) if !is_owner(memberships, &invoice.instance_id) => {
-                return Err(ApiError::forbidden(
-                    "Only an owner of this instance can choose an invoice number",
-                )
-                .into());
-            }
-            Some(n) if n < 1 => return Err(anyhow!("number must be at least 1")),
-            Some(n) => Some(u32::try_from(n).unwrap_or(0)),
-        };
+        let explicit_number = explicit_number(ctx, &invoice.instance_id, number, "an invoice")?;
         if invoice.status != db::InvoiceStatus::Draft {
             return Err(ApiError::conflict("Invoice is already finalized").into());
         }
@@ -4968,25 +5200,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             resolved_items.push(item);
         }
 
-        // Step 3: project + instance, requiring business_name.
-        let project = self
-            .app
-            .db()
-            .get_projects(&[invoice.project_id.as_str()])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| ApiError::not_found("Project", invoice.project_id.as_str()))?;
-        let instance = self
-            .app
-            .db()
-            .get_instances(&[invoice.instance_id.as_str()])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| ApiError::not_found("Instance", invoice.instance_id.as_str()))?;
+        // Step 3: instance + project + client, requiring business_name.
+        let (instance, project, client) = load_invoice_parties(&*self.app, &invoice).await?;
         if instance
             .business_name
             .as_deref()
@@ -4999,12 +5214,25 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
 
         let due_date = match due_date.as_deref() {
             Some(d) => finance::validate_item_date(d).map_err(|e| anyhow!(e))?,
-            None => finance::add_days(&issue_date, project.payment_terms_days(&instance))
+            None => finance::add_days(&issue_date, client.payment_terms_days(&instance))
                 .map_err(|e| anyhow!(e))?,
         };
         if due_date < issue_date {
             return Err(anyhow!("The due date can't be before the issue date"));
         }
+        let source = finance::snapshot::SnapshotSource {
+            instance: &instance,
+            client: &client,
+            project: &project,
+            reference: invoice.reference.as_deref(),
+            notes: invoice.notes.as_deref(),
+            items: &resolved_items,
+        };
+        // Before a number is spent on it.
+        finance::snapshot::check_discounts(&finance::snapshot::build_snapshot(
+            &source, None, None, None,
+        ))
+        .map_err(|e| anyhow!(e))?;
 
         // Step 4: allocate the number — the counter's next, or the caller's
         // explicit choice.
@@ -5030,7 +5258,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 // counter; above it, keeps the automatic sequence clear of `n`.
                 self.app
                     .db()
-                    .set_next_invoice_number(&invoice.instance_id, u64::from(n))
+                    .set_last_invoice_number(&invoice.instance_id, u64::from(n))
                     .await?;
                 n
             }
@@ -5038,13 +5266,12 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
 
         // Step 5: build the snapshot.
         let snapshot = finance::snapshot::build_snapshot(
-            &instance,
-            &project,
-            &resolved_items,
+            &source,
             Some(number),
             Some(&issue_date),
             Some(&due_date),
         );
+        let display_number = snapshot.display_number.clone().unwrap_or_default();
         finance::validate_total_within_safe_integer(snapshot.total_cents)
             .map_err(|e| anyhow!(e))?;
         let snapshot_json = serde_json::to_string(&snapshot)
@@ -5066,6 +5293,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                 invoice.version,
                 &db::FinalizeInvoice {
                     number,
+                    display_number: &display_number,
                     issue_date: &issue_date,
                     due_date: &due_date,
                     snapshot_json: &snapshot_json,
@@ -5095,7 +5323,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         Ok(Invoice::new(db::Invoice {
             status: db::InvoiceStatus::Finalized,
             version: invoice.version + 1,
+            list_key: db::issued_list_key(&issue_date, number),
             number: Some(number),
+            display_number: Some(display_number),
             issue_date: Some(issue_date),
             due_date: Some(due_date),
             snapshot: Some(snapshot_json),
@@ -5224,16 +5454,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         if invoice.status != db::InvoiceStatus::Finalized {
             return Err(ApiError::conflict("Only a finalized invoice can be sent").into());
         }
-        let project = self
-            .app
-            .db()
-            .get_projects(&[invoice.project_id.as_str()])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| ApiError::not_found("Project", invoice.project_id.as_str()))?;
-        let (to, cc, message) = resolve_send_input(&input, project.client_email.as_deref())?;
+        let client_email = project_client_email(&*self.app, &invoice.project_id).await?;
+        let (to, cc, message) = resolve_send_input(&input, client_email.as_deref())?;
         refuse_suppressed_recipients(&*self.app, &to, &cc, "sendInvoice").await?;
         let snapshot = invoice_snapshot(&invoice)?;
         let filename = invoice_pdf_filename(&invoice);
@@ -5397,9 +5619,11 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             }
         };
         // Check the total against what's left before spending a number on it.
+        let explicit_number =
+            explicit_number(ctx, &invoice.instance_id, input.number, "a credit note")?;
         let trial = finance::snapshot::build_credit_note_snapshot(
             &invoice_snap,
-            0,
+            "",
             &issue_date,
             &reason,
             &lines,
@@ -5413,15 +5637,47 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             ));
         }
 
-        let number = self
+        let instance = self
             .app
             .db()
-            .increment_credit_note_counter(&invoice.instance_id)
-            .await?;
-        let number = u32::try_from(number).unwrap_or(u32::MAX);
+            .get_instances(&[invoice.instance_id.as_str()])
+            .await?
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| ApiError::not_found("Instance", invoice.instance_id.as_str()))?;
+
+        // The counter's next, or the owner's explicit choice — the same
+        // rules as `finalizeInvoice(number:)`.
+        let number = match explicit_number {
+            None => {
+                let n = self
+                    .app
+                    .db()
+                    .increment_credit_note_counter(&invoice.instance_id)
+                    .await?;
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }
+            Some(n) => {
+                if self
+                    .app
+                    .db()
+                    .credit_note_number_used(&invoice.instance_id, n)
+                    .await?
+                {
+                    return Err(credit_note_number_used(n).into());
+                }
+                self.app
+                    .db()
+                    .set_last_credit_note_number(&invoice.instance_id, u64::from(n))
+                    .await?;
+                n
+            }
+        };
+        let display_number = instance.number_format.credit_note(number);
         let snapshot = finance::snapshot::build_credit_note_snapshot(
             &invoice_snap,
-            number,
+            &display_number,
             &issue_date,
             &reason,
             &lines,
@@ -5432,7 +5688,9 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             invoice_id: invoice.id.clone(),
             project_id: invoice.project_id.clone(),
             number,
+            display_number,
             issue_date: issue_date.clone(),
+            list_key: db::issued_list_key(&issue_date, number),
             reason,
             snapshot: serde_json::to_string(&snapshot)
                 .map_err(|e| anyhow!("Failed to serialize credit note snapshot: {e}"))?,
@@ -5446,7 +5704,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             sent_to: Vec::new(),
             brand_id: invoice.brand_id.clone(),
         };
-        let settled = if invoice.paid_date.is_none() {
+        let settled = if invoice.settled_date.is_none() {
             finance::ledger::settled_date(
                 invoice.total_cents.unwrap_or(0),
                 invoice.credited_cents + note.total_cents,
@@ -5462,8 +5720,16 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             .create_credit_note(&note, invoice.version, settled.as_deref())
             .await?;
         if !committed {
-            // The number is now a gap, never a duplicate — like an invoice
-            // number lost to a failed finalize.
+            // A counter-allocated number is now a gap, never a duplicate —
+            // like an invoice number lost to a failed finalize.
+            if self
+                .app
+                .db()
+                .credit_note_number_used(&invoice.instance_id, number)
+                .await?
+            {
+                return Err(credit_note_number_used(number).into());
+            }
             return Err(
                 ApiError::conflict("Invoice changed concurrently — reload and try again").into(),
             );
@@ -5513,16 +5779,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         #[graphql(default)] input: SendDocumentInput,
     ) -> Result<CreditNote<A>> {
         let note = require_credit_note_member(ctx, &*self.app, credit_note_id.as_str()).await?;
-        let project = self
-            .app
-            .db()
-            .get_projects(&[note.project_id.as_str()])
-            .await?
-            .into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| ApiError::not_found("Project", note.project_id.as_str()))?;
-        let (to, cc, message) = resolve_send_input(&input, project.client_email.as_deref())?;
+        let client_email = project_client_email(&*self.app, &note.project_id).await?;
+        let (to, cc, message) = resolve_send_input(&input, client_email.as_deref())?;
         refuse_suppressed_recipients(&*self.app, &to, &cc, "sendCreditNote").await?;
         let snapshot = credit_note_snapshot(&note)?;
         let filename = credit_note_pdf_filename(&note);
@@ -5634,6 +5892,8 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
                     description: &description,
                     quantity_hundredths: 100,
                     unit_price_cents,
+                    unit: None,
+                    discount: false,
                     gst_free,
                     created_by_user_id: &user_id,
                 },
@@ -5699,52 +5959,62 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
             "" => "application/octet-stream".to_string(),
             t => t.chars().take(100).collect(),
         };
-        let receipt = db::ExpenseReceipt {
+        if expense.receipts.len() >= db::MAX_EXPENSE_RECEIPTS {
+            return Err(anyhow!(
+                "An expense can have at most {} receipts",
+                db::MAX_EXPENSE_RECEIPTS
+            ));
+        }
+        if expense.receipts.iter().any(|r| r.s3_key == key) {
+            return Err(ApiError::conflict("That receipt is already attached").into());
+        }
+        let mut receipts = expense.receipts.clone();
+        receipts.push(db::ExpenseReceipt {
+            id: crate::dynamodb::new_id(),
             s3_key: key,
             filename,
             content_type,
             size,
-        };
-        if !self
-            .app
-            .db()
-            .set_expense_receipt(&expense.id, Some(&receipt))
-            .await?
-        {
-            return Err(ApiError::not_found("Expense", expense_id.as_str()).into());
-        }
-        Ok(Expense::new(db::Expense {
-            receipt: Some(receipt),
-            updated_at: crate::clock::now_sec(),
-            ..expense
-        }))
+            uploaded_at: crate::clock::now_sec(),
+        });
+        save_receipts(&*self.app, expense, receipts).await
     }
 
-    /// Detach an expense's receipt.
+    /// Detach one of an expense's receipts. The file stays in storage, like
+    /// every receipt: it may back a tax claim.
     async fn remove_expense_receipt(
         &self,
         ctx: &Context<'_>,
         expense_id: ID,
+        receipt_id: ID,
     ) -> Result<Expense<A>> {
         let expense = require_expense_member(ctx, &*self.app, expense_id.as_str()).await?;
-        if !self.app.db().set_expense_receipt(&expense.id, None).await? {
-            return Err(ApiError::not_found("Expense", expense_id.as_str()).into());
+        if !expense.receipts.iter().any(|r| r.id == receipt_id.as_str()) {
+            return Err(ApiError::not_found("Receipt", receipt_id.as_str()).into());
         }
-        Ok(Expense::new(db::Expense {
-            receipt: None,
-            updated_at: crate::clock::now_sec(),
-            ..expense
-        }))
+        let receipts = expense
+            .receipts
+            .iter()
+            .filter(|r| r.id != receipt_id.as_str())
+            .cloned()
+            .collect();
+        save_receipts(&*self.app, expense, receipts).await
     }
 
-    /// A presigned download URL for an expense's receipt. `NOT_FOUND` when
-    /// it has none.
-    async fn download_expense_receipt(&self, ctx: &Context<'_>, expense_id: ID) -> Result<String> {
+    /// A presigned download URL for one of an expense's receipts.
+    /// `NOT_FOUND` when it has no such receipt.
+    async fn download_expense_receipt(
+        &self,
+        ctx: &Context<'_>,
+        expense_id: ID,
+        receipt_id: ID,
+    ) -> Result<String> {
         let expense = require_expense_member(ctx, &*self.app, expense_id.as_str()).await?;
         let receipt = expense
-            .receipt
-            .as_ref()
-            .ok_or_else(|| ApiError::not_found("Receipt", expense_id.as_str()))?;
+            .receipts
+            .iter()
+            .find(|r| r.id == receipt_id.as_str())
+            .ok_or_else(|| ApiError::not_found("Receipt", receipt_id.as_str()))?;
         self.app
             .storage()
             .presign_get_download(&receipt.s3_key, &receipt.filename)
@@ -5752,7 +6022,7 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     }
 
     /// Owner-or-superuser: set the next invoice number to be assigned by
-    /// `finalizeInvoice` (`db::Handler::set_next_invoice_number` writes
+    /// `finalizeInvoice` (`db::Handler::set_last_invoice_number` writes
     /// `next - 1` to the counter). Forward-only — `CONFLICT` if `next`
     /// would move the counter backward. `next` must be at least 1.
     #[graphql(
@@ -5776,13 +6046,137 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         let committed = self
             .app
             .db()
-            .set_next_invoice_number(&instance.id, new_value)
+            .set_last_invoice_number(&instance.id, new_value)
             .await?;
         if !committed {
             return Err(ApiError::conflict("The next invoice number can only move forward").into());
         }
         Ok(Instance::new(instance))
     }
+
+    /// Owner-or-superuser: the credit-note counterpart of
+    /// `setNextInvoiceNumber` — forward-only, `next` at least 1.
+    #[graphql(
+        guard = "AuthGuard::new(AuthRequirement::InstanceOwnerOrSuperuser(instance_id.to_string()))"
+    )]
+    async fn set_next_credit_note_number(&self, instance_id: ID, next: i32) -> Result<Instance<A>> {
+        let instance = require_finance_instance_for_settings(&*self.app, &instance_id).await?;
+        if next < 1 {
+            return Err(anyhow!("next must be at least 1"));
+        }
+        let new_value = u64::try_from(next - 1).unwrap_or(0);
+        if !self
+            .app
+            .db()
+            .set_last_credit_note_number(&instance.id, new_value)
+            .await?
+        {
+            return Err(
+                ApiError::conflict("The next credit note number can only move forward").into(),
+            );
+        }
+        Ok(Instance::new(instance))
+    }
+
+    /// Owner-or-superuser: how invoice and credit-note numbers print — a
+    /// prefix for each (≤ 12 characters of letters, digits, spaces and
+    /// `. _ -`; the invoice prefix may be blank, the credit-note one may
+    /// not, so the two sequences can't be confused) and a zero-padding
+    /// width (`1..=8`). Applies to documents issued from now on: each
+    /// document's number is frozen as it was printed.
+    #[graphql(
+        guard = "AuthGuard::new(AuthRequirement::InstanceOwnerOrSuperuser(instance_id.to_string()))"
+    )]
+    async fn set_number_format(
+        &self,
+        instance_id: ID,
+        invoice_prefix: String,
+        credit_note_prefix: String,
+        padding: i32,
+    ) -> Result<Instance<A>> {
+        let instance = require_finance_instance_for_settings(&*self.app, &instance_id).await?;
+        let invoice_prefix = invoice_prefix.trim();
+        let credit_note_prefix = credit_note_prefix.trim();
+        db::validate_number_prefix(invoice_prefix).map_err(|e| anyhow!(e))?;
+        db::validate_number_prefix(credit_note_prefix).map_err(|e| anyhow!(e))?;
+        if credit_note_prefix.is_empty() {
+            return Err(anyhow!(
+                "Give credit notes a prefix, so their numbers can't be mistaken for invoices'"
+            ));
+        }
+        if credit_note_prefix == invoice_prefix {
+            return Err(anyhow!("Invoices and credit notes need different prefixes"));
+        }
+        let padding = u32::try_from(padding)
+            .ok()
+            .filter(|p| (1..=db::MAX_NUMBER_PADDING).contains(p))
+            .ok_or_else(|| {
+                anyhow!(
+                    "Padding must be between 1 and {} digits",
+                    db::MAX_NUMBER_PADDING
+                )
+            })?;
+        // Defaults are stored as absent attributes.
+        let format = db::NumberFormat {
+            invoice_prefix: (!invoice_prefix.is_empty()).then(|| invoice_prefix.to_string()),
+            credit_note_prefix: (credit_note_prefix != db::DEFAULT_CREDIT_NOTE_PREFIX)
+                .then(|| credit_note_prefix.to_string()),
+            padding: (padding != db::DEFAULT_NUMBER_PADDING).then_some(padding),
+        };
+        self.app
+            .db()
+            .update_instance(
+                &instance.id,
+                db::InstanceUpdateShape::SetNumberFormat(&format),
+            )
+            .await?;
+        Ok(Instance::new(db::Instance {
+            number_format: format,
+            ..instance
+        }))
+    }
+}
+
+/// A finance instance an owner-level settings mutation names — `NOT_FOUND`
+/// when missing, a plain validation error for a support instance.
+async fn require_finance_instance_for_settings<A: App + HasDb + Send + Sync>(
+    app: &A,
+    instance_id: &ID,
+) -> Result<db::Instance> {
+    let instance = app
+        .db()
+        .get_instances(&[instance_id.as_str()])
+        .await?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| ApiError::not_found("Instance", instance_id.as_str()))?;
+    db::require_instance_kind(&instance, db::InstanceKind::Finance).map_err(|e| anyhow!(e))?;
+    Ok(instance)
+}
+
+/// Write an expense's new receipt list, conditioned on the list it was read
+/// with, and return the updated expense. `CONFLICT` if it changed meanwhile.
+async fn save_receipts<A: App + HasDb + Send + Sync>(
+    app: &A,
+    expense: db::Expense,
+    receipts: Vec<db::ExpenseReceipt>,
+) -> Result<Expense<A>> {
+    if !app
+        .db()
+        .set_expense_receipts(&expense.id, &expense.receipts, &receipts)
+        .await?
+    {
+        return Err(ApiError::conflict(
+            "Expense changed (deleted or edited) — reload and try again",
+        )
+        .into());
+    }
+    Ok(Expense::new(db::Expense {
+        receipts,
+        updated_at: crate::clock::now_sec(),
+        ..expense
+    }))
 }
 
 #[cfg(test)]

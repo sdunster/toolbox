@@ -18,7 +18,8 @@ use crate::finance::{self, report};
 use super::ProjectId;
 use super::dataloader::DatabaseLoader;
 use super::query::{
-    Brand, Invoice, InvoiceBillToInfo, InvoiceLineInfo, InvoiceSellerInfo, Project, load_brand,
+    Brand, Client, Invoice, InvoiceBillToInfo, InvoiceLineInfo, InvoiceSellerInfo, Project,
+    load_brand,
 };
 
 /// One payment received against an invoice.
@@ -75,6 +76,10 @@ pub struct CreditNoteInput {
     /// Why — printed on the credit note. Required.
     pub reason: String,
     pub lines: Option<Vec<CreditNoteLineInput>>,
+    /// Owner only: take exactly this number instead of the next in
+    /// sequence — any number no credit note in the instance has, as
+    /// `finalizeInvoice(number:)` does for an invoice. For importing.
+    pub number: Option<i32>,
 }
 
 /// `sendInvoice`/`sendCreditNote`'s argument. An empty `to` means the
@@ -125,9 +130,10 @@ impl<A: App + HasDb + Send + Sync + 'static> CreditNote<A> {
     async fn number(&self) -> i32 {
         self.rec.number as i32
     }
-    /// `CN-001`.
-    async fn display_number(&self) -> String {
-        self.rec.display_number()
+    /// The number as printed (`CN-001`), in the instance's number format
+    /// when it was issued.
+    async fn display_number(&self) -> &str {
+        &self.rec.display_number
     }
     /// `YYYY-MM-DD`.
     async fn issue_date(&self) -> &str {
@@ -259,6 +265,8 @@ pub struct ReceivablesReport<A: App + HasDb + Send + Sync> {
     pub currency: String,
     pub aging: report::Aging,
     pub invoices: Vec<db::Invoice>,
+    /// Outstanding balances per client, with each client's row.
+    pub by_client: Vec<(report::ClientBalance, db::Client)>,
     pub _marker: PhantomData<A>,
 }
 
@@ -293,6 +301,42 @@ impl<A: App + HasDb + Send + Sync + 'static> ReceivablesReport<A> {
     /// Every invoice with a balance owing, most overdue first.
     async fn invoices(&self) -> Vec<Invoice<A>> {
         self.invoices.iter().cloned().map(Invoice::new).collect()
+    }
+    /// What each client owes across all their projects, largest first.
+    async fn by_client(&self) -> Vec<ClientReceivable<A>> {
+        self.by_client
+            .iter()
+            .cloned()
+            .map(|(balance, client)| ClientReceivable {
+                balance,
+                client,
+                _marker: PhantomData,
+            })
+            .collect()
+    }
+}
+
+/// One `ReceivablesReport.byClient` row.
+pub struct ClientReceivable<A: App + HasDb + Send + Sync> {
+    balance: report::ClientBalance,
+    client: db::Client,
+    _marker: PhantomData<A>,
+}
+
+#[Object]
+impl<A: App + HasDb + Send + Sync + 'static> ClientReceivable<A> {
+    async fn client(&self) -> Client<A> {
+        Client::new(self.client.clone())
+    }
+    async fn outstanding_cents(&self) -> i64 {
+        self.balance.outstanding_cents
+    }
+    /// The part of `outstandingCents` past its due date.
+    async fn overdue_cents(&self) -> i64 {
+        self.balance.overdue_cents
+    }
+    async fn invoice_count(&self) -> i32 {
+        self.balance.invoice_count as i32
     }
 }
 
@@ -349,17 +393,23 @@ impl From<CsvExportType> for finance::csv::Export {
 /// `downloadExpenseReceipt`.
 #[derive(SimpleObject, Clone, Debug)]
 pub struct ExpenseReceiptInfo {
+    /// What `downloadExpenseReceipt`/`removeExpenseReceipt` name.
+    pub id: ID,
     pub filename: String,
     pub content_type: String,
     pub size: i64,
+    /// Unix seconds.
+    pub uploaded_at: i64,
 }
 
 impl From<&db::ExpenseReceipt> for ExpenseReceiptInfo {
     fn from(r: &db::ExpenseReceipt) -> Self {
         Self {
+            id: ID(r.id.clone()),
             filename: r.filename.clone(),
             content_type: r.content_type.clone(),
             size: r.size as i64,
+            uploaded_at: r.uploaded_at as i64,
         }
     }
 }

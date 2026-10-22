@@ -10,9 +10,13 @@ import { tw } from "../../lib/tw";
 
 const linkButton = tw`cursor-pointer text-xs font-medium text-accent hover:underline disabled:opacity-60`;
 
+/** Most receipt files one expense takes — the API's `MAX_EXPENSE_RECEIPTS`. */
+const MAX_RECEIPTS = 10;
+
 /**
- * An expense's receipt and re-billing controls, under its details: attach
- * or download a receipt file, and — for an expense on a project — pass the
+ * An expense's receipts and re-billing controls, under its details: attach,
+ * download or remove receipt files (a tax invoice and a card slip, say), and
+ * — for an expense on a project — pass the
  * cost on to the client as a billable item (`rebillExpense`), optionally
  * marked up. A re-billed expense says so, and can't be re-billed again
  * until that item is deleted.
@@ -21,13 +25,13 @@ export function ExpenseExtras({
   expenseId,
   hasProject,
   rebilled,
-  receiptFilename,
+  receipts,
   onChanged,
 }: {
   expenseId: string;
   hasProject: boolean;
   rebilled: boolean;
-  receiptFilename: string | null;
+  receipts: ReadonlyArray<{ readonly id: string; readonly filename: string }>;
   onChanged: () => void;
 }) {
   const [error, setError] = useState<string | null>(null);
@@ -82,8 +86,8 @@ export function ExpenseExtras({
   `);
   const [commitRemove, isRemoving] = useMutation<ExpenseExtrasRemoveMutation>(
     graphql`
-      mutation ExpenseExtrasRemoveMutation($id: ID!) {
-        removeExpenseReceipt(expenseId: $id) {
+      mutation ExpenseExtrasRemoveMutation($id: ID!, $receiptId: ID!) {
+        removeExpenseReceipt(expenseId: $id, receiptId: $receiptId) {
           ...ExpenseRow_expense
         }
       }
@@ -91,8 +95,8 @@ export function ExpenseExtras({
   );
   const [commitDownload, isDownloading] =
     useMutation<ExpenseExtrasDownloadMutation>(graphql`
-      mutation ExpenseExtrasDownloadMutation($id: ID!) {
-        downloadExpenseReceipt(expenseId: $id)
+      mutation ExpenseExtrasDownloadMutation($id: ID!, $receiptId: ID!) {
+        downloadExpenseReceipt(expenseId: $id, receiptId: $receiptId)
       }
     `);
 
@@ -141,47 +145,50 @@ export function ExpenseExtras({
 
   return (
     <div className="mt-1 flex flex-col gap-1">
+      {receipts.map((receipt) => (
+        <div key={receipt.id} className="flex flex-wrap items-center gap-x-3">
+          <button
+            type="button"
+            className={linkButton}
+            disabled={isDownloading}
+            onClick={() =>
+              commitDownload({
+                variables: { id: expenseId, receiptId: receipt.id },
+                onCompleted: (d) =>
+                  window.location.assign(d.downloadExpenseReceipt),
+                onError: (err) =>
+                  setError(
+                    relayMutationErrorMessage(err, "Failed to download."),
+                  ),
+              })
+            }
+          >
+            Receipt: {receipt.filename}
+          </button>
+          <button
+            type="button"
+            className={`${linkButton} text-ink-muted`}
+            disabled={isRemoving}
+            onClick={() =>
+              commitRemove({
+                variables: { id: expenseId, receiptId: receipt.id },
+                onError: (err) =>
+                  setError(relayMutationErrorMessage(err, "Failed to remove.")),
+              })
+            }
+          >
+            Remove
+          </button>
+        </div>
+      ))}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-        {receiptFilename ? (
-          <>
-            <button
-              type="button"
-              className={linkButton}
-              disabled={isDownloading}
-              onClick={() =>
-                commitDownload({
-                  variables: { id: expenseId },
-                  onCompleted: (d) =>
-                    window.location.assign(d.downloadExpenseReceipt),
-                  onError: (err) =>
-                    setError(
-                      relayMutationErrorMessage(err, "Failed to download."),
-                    ),
-                })
-              }
-            >
-              Receipt: {receiptFilename}
-            </button>
-            <button
-              type="button"
-              className={`${linkButton} text-ink-muted`}
-              disabled={isRemoving}
-              onClick={() =>
-                commitRemove({
-                  variables: { id: expenseId },
-                  onError: (err) =>
-                    setError(
-                      relayMutationErrorMessage(err, "Failed to remove."),
-                    ),
-                })
-              }
-            >
-              Remove
-            </button>
-          </>
-        ) : (
+        {receipts.length < MAX_RECEIPTS && (
           <label className={`${linkButton} ${uploading ? "opacity-60" : ""}`}>
-            {uploading ? "Uploading…" : "Attach receipt"}
+            {uploading
+              ? "Uploading…"
+              : receipts.length === 0
+                ? "Attach receipt"
+                : "Attach another"}
             <input
               ref={fileInput}
               type="file"

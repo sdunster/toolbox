@@ -74,8 +74,19 @@ const receivablesQuery = graphql`
         balanceCents
         project {
           name
-          clientName
+          client {
+            name
+          }
         }
+      }
+      byClient {
+        client {
+          id
+          name
+        }
+        outstandingCents
+        overdueCents
+        invoiceCount
       }
     }
   }
@@ -153,8 +164,16 @@ function GstReport({
       <dl className="divide-y divide-line text-sm">
         <Row label="Total sales" hint="G1, incl. GST" cents={r.salesCents} />
         <Row label="GST on sales" hint="1A" cents={r.gstOnSalesCents} />
-        <Row label="Purchases" hint="incl. GST" cents={r.purchasesCents} />
-        <Row label="GST on purchases" hint="1B" cents={r.gstOnPurchasesCents} />
+        <Row
+          label="Purchases"
+          hint="G11, business share incl. GST"
+          cents={r.purchasesCents}
+        />
+        <Row
+          label="GST on purchases"
+          hint="1B, claimable only"
+          cents={r.gstOnPurchasesCents}
+        />
         <Row
           label={r.netGstCents >= 0 ? "GST payable" : "GST refund"}
           hint={r.currency}
@@ -167,7 +186,8 @@ function GstReport({
         {basis === "CASH"
           ? `, ${r.paymentCount} payment${r.paymentCount === 1 ? "" : "s"}`
           : `, ${r.creditNoteCount} credit note${r.creditNoteCount === 1 ? "" : "s"}`}{" "}
-        and {r.expenseCount} expense{r.expenseCount === 1 ? "" : "s"}. A guide,
+        and {r.expenseCount} purchase{r.expenseCount === 1 ? "" : "s"} (vehicle
+        trips aren&apos;t purchases, so they aren&apos;t counted here). A guide,
         not tax advice — check with your accountant before lodging.
       </p>
     </div>
@@ -217,6 +237,36 @@ function Receivables({
         ))}
       </dl>
       <p className="text-xs text-ink-muted">As of {formatDate(r.asOf)}.</p>
+      {r.byClient.length > 0 && (
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs font-medium text-ink-muted uppercase">
+              <th className="py-1 font-medium">Client</th>
+              <th className="py-1 text-right font-medium">Invoices</th>
+              <th className="py-1 text-right font-medium">Overdue</th>
+              <th className="py-1 text-right font-medium">Owed</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-line">
+            {r.byClient.map((c) => (
+              <tr key={c.client.id}>
+                <td className="py-1.5 text-ink-strong">{c.client.name}</td>
+                <td className="py-1.5 text-right tabular-nums">
+                  {c.invoiceCount}
+                </td>
+                <td
+                  className={`py-1.5 text-right tabular-nums ${c.overdueCents > 0 ? "text-red-700 dark:text-red-400" : "text-ink-muted"}`}
+                >
+                  {formatCents(c.overdueCents)}
+                </td>
+                <td className="py-1.5 text-right font-medium tabular-nums">
+                  {formatCents(c.outstandingCents)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
       {r.invoices.length === 0 ? (
         <p className="text-sm text-ink-muted">Nothing owed. 🎉</p>
       ) : (
@@ -230,7 +280,7 @@ function Receivables({
                 <span className="font-medium text-ink-strong">
                   {inv.displayNumber}{" "}
                   <span className="font-normal text-ink-muted">
-                    {inv.project.clientName} · {inv.project.name}
+                    {inv.project.client.name} · {inv.project.name}
                   </span>
                 </span>
                 <span className="flex gap-4">

@@ -19,7 +19,9 @@ const projectDetailPageQuery = graphql`
     project(id: $id) {
       id
       name
-      clientName
+      client {
+        name
+      }
       archived
       defaultUnitPriceCents
       brand {
@@ -80,7 +82,7 @@ function Content({ id }: { id: string }) {
           )}
         </div>
         <p className="mt-1 text-sm text-ink-muted">
-          {project.clientName}
+          {project.client.name}
           {!project.brand.isDefault && <> · Invoiced as {project.brand.name}</>}
         </p>
       </div>

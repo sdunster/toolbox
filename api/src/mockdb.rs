@@ -268,6 +268,36 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
+    // ── client ────────────────────────────────────────────────────────────
+
+    async fn create_client(
+        &self,
+        _instance_id: &str,
+        _fields: &db::ClientFields,
+    ) -> db::Result<db::Client> {
+        Self::unsupported()
+    }
+
+    async fn get_clients<T: AsRef<str> + Sync>(
+        &self,
+        _ids: &[T],
+    ) -> db::Result<Vec<Option<db::Client>>> {
+        Self::unsupported()
+    }
+
+    async fn list_clients_by_instance(&self, _instance_id: &str) -> db::Result<Vec<db::Client>> {
+        Self::unsupported()
+    }
+
+    async fn update_client(
+        &self,
+        _id: &str,
+        _fields: &db::ClientFields,
+        _archived: bool,
+    ) -> db::Result<()> {
+        Self::unsupported()
+    }
+
     // ── project ───────────────────────────────────────────────────────────
 
     async fn create_project(
@@ -380,10 +410,11 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
-    async fn set_expense_receipt(
+    async fn set_expense_receipts(
         &self,
         _id: &str,
-        _receipt: Option<&db::ExpenseReceipt>,
+        _expected: &[db::ExpenseReceipt],
+        _receipts: &[db::ExpenseReceipt],
     ) -> db::Result<bool> {
         Self::unsupported()
     }
@@ -439,12 +470,18 @@ impl db::Handler for Handler {
 
     async fn create_invoice(
         &self,
-        _instance_id: &str,
-        _project_id: &str,
-        _item_ids: &[String],
-        _created_by_user_id: &str,
-        _brand_id: Option<&str>,
+        _invoice: &db::NewInvoice<'_>,
     ) -> db::Result<Option<db::Invoice>> {
+        Self::unsupported()
+    }
+
+    async fn update_invoice_details(
+        &self,
+        _invoice_id: &str,
+        _expected_version: u64,
+        _reference: Option<&str>,
+        _notes: Option<&str>,
+    ) -> db::Result<bool> {
         Self::unsupported()
     }
 
@@ -491,7 +528,7 @@ impl db::Handler for Handler {
         _invoice_id: &str,
         _expected_version: u64,
         _payments: &[db::InvoicePayment],
-        _paid_date: Option<&str>,
+        _settled_date: Option<&str>,
     ) -> db::Result<bool> {
         Self::unsupported()
     }
@@ -532,7 +569,7 @@ impl db::Handler for Handler {
         Self::unsupported()
     }
 
-    async fn set_next_invoice_number(
+    async fn set_last_invoice_number(
         &self,
         _instance_id: &str,
         _new_value: u64,
@@ -593,6 +630,22 @@ impl db::Handler for Handler {
     }
 
     async fn increment_credit_note_counter(&self, _instance_id: &str) -> db::Result<u64> {
+        Self::unsupported()
+    }
+
+    async fn get_credit_note_counter(&self, _instance_id: &str) -> db::Result<u64> {
+        Self::unsupported()
+    }
+
+    async fn set_last_credit_note_number(
+        &self,
+        _instance_id: &str,
+        _new_value: u64,
+    ) -> db::Result<bool> {
+        Self::unsupported()
+    }
+
+    async fn credit_note_number_used(&self, _instance_id: &str, _number: u32) -> db::Result<bool> {
         Self::unsupported()
     }
 

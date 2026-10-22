@@ -155,6 +155,8 @@ struct World {
     slug: String,
     owner_id: String,
     agent_id: String,
+    /// The client every project here bills.
+    client_id: String,
 }
 
 impl World {
@@ -224,6 +226,16 @@ async fn setup_kind(label: &str, kind: db::InstanceKind) -> Option<World> {
     db.create_membership(&agent.id, &instance.id, db::MembershipRole::Agent)
         .await
         .expect("membership agent");
+    let client = db
+        .create_client(
+            &instance.id,
+            &db::ClientFields {
+                name: "Fictional Client Pty Ltd".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create_client");
     let my_app = Arc::new(app::new(
         db,
         mockmail::Handler::new(),
@@ -242,6 +254,7 @@ async fn setup_kind(label: &str, kind: db::InstanceKind) -> Option<World> {
         slug: instance.slug,
         owner_id: owner.id,
         agent_id: agent.id,
+        client_id: client.id,
     })
 }
 
@@ -298,7 +311,7 @@ async fn create_project(w: &World, name: &str, brand_id: Option<&str>) -> Respon
             createProject(instanceId: $i, input: $input) { id brand { brandId name isDefault } }
         }",
         json!({ "i": w.instance_id, "input": {
-            "name": name, "clientName": "Fictional Client Pty Ltd", "brandId": brand_id,
+            "name": name, "clientId": w.client_id, "brandId": brand_id,
         } }),
     )
     .await
@@ -316,7 +329,7 @@ async fn set_project_brand(w: &World, project_id: &str, name: &str, brand_id: Op
                 updateProject(id: $id, input: $input) { id }
             }",
             json!({ "id": project_id, "input": {
-                "name": name, "clientName": "Fictional Client Pty Ltd", "brandId": brand_id,
+                "name": name, "clientId": w.client_id, "brandId": brand_id,
                 "archived": false,
             } }),
         )

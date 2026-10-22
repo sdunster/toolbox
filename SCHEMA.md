@@ -72,7 +72,13 @@ instance record, so projecting more into the index would just be wasted storage.
 - `currency` (S) — finance setting; absent means `"AUD"` (`db::Instance::currency_or_default`).
   A non-blank value must be 3 uppercase ASCII letters (`db::validate_currency_code`).
 - `payment_terms_days` (N) — finance setting, `0..=365`; absent means 14
-  (`db::DEFAULT_PAYMENT_TERMS_DAYS`). A project's own `payment_terms_days` overrides it.
+  (`db::DEFAULT_PAYMENT_TERMS_DAYS`). A client's own `payment_terms_days` overrides it.
+- `invoice_number_prefix`, `credit_note_number_prefix` (S), `number_padding` (N) — finance
+  instances only: how document numbers print (`db::NumberFormat`). Each is absent at its default —
+  no invoice prefix, `CN-`, 3 digits. A prefix is at most 12 characters of letters, digits, space,
+  `.`, `_` and `-`; padding is `1..=8`. Written by `setNumberFormat` (owner-or-superuser). Only the
+  display changes — numbers stay integers — and each invoice's and credit note's
+  `display_number` is frozen when it's issued, so a format change never relabels one.
 - `broadcast_senders` (S) — support instances only: JSON list of saved broadcast senders
   (`db::BroadcastSender` — `{id, name, address}`), at most 20, absent when empty. Written whole by
   `set_broadcast_senders`, conditioned on the stored string still being the one the caller read
@@ -313,28 +319,35 @@ nanoid, which never contains `#`, so it can't collide with a counter row), with 
 and `created_at` (N). It is created by the same `TransactWriteItems` that finalizes the invoice,
 conditioned on `attribute_not_exists(id)` — the guarantee that no two invoices in an instance share
 a number, now that `finalizeInvoice(number:)` can take one below the counter. Never removed, like
-the finalized invoice it records. Invoices finalized before reservation rows existed have none;
-`db::Handler::invoice_number_used` also queries the instance's invoices to cover them.
+the finalized invoice it records. Every finalized invoice has one, and
+`db::Handler::invoice_number_used` reads only it.
 
 **Non-obvious attributes:**
 
 - `next_ticket_number` (N) — incremented with an atomic `UpdateItem ADD`, never read-then-written;
   see "Known issues and risks" below for what happens if that rule is broken
-- `next_invoice_number` (N) — the finance counterpart, same atomic-`ADD`-only rule, incremented
-  by `finalizeInvoice` (`db::Handler::increment_invoice_counter`) and settable forward-only via
-  `setNextInvoiceNumber` (`db::Handler::set_next_invoice_number`, condition
-  `attribute_not_exists(next_invoice_number) OR next_invoice_number <= :new_value`). An owner's
+- `last_invoice_number` (N) — the finance counterpart: the last invoice number handed out (so
+  the next is this + 1). Same atomic-`ADD`-only rule, incremented by `finalizeInvoice`
+  (`db::Handler::increment_invoice_counter`) and settable forward-only via `setNextInvoiceNumber`
+  (`db::Handler::set_last_invoice_number`, condition
+  `attribute_not_exists(last_invoice_number) OR last_invoice_number <= :new_value`). An owner's
   `finalizeInvoice(number:)` (importing an existing invoice under its original number) doesn't
   `ADD`: it moves the counter up to that number through the same forward-only write — a no-op
   for a number at or below it — so automatic numbering continues after the highest number used
-  and never lands on a claimed one. Absent means
-  `0` (no invoice finalized yet, and `nextInvoiceNumber` has never been set) —
-  `FinanceSettingsInfo.nextInvoiceNumber` reads this lazily (a single `GetItem`, not carried on
-  every `Instance` fetch) and reports `this + 1`. See "Known issues and risks" for the same
-  gap-not-duplicate reasoning as `next_ticket_number`.
-- `next_credit_note_number` (N) — the credit-note sequence (`CN-001`, …), incremented by
-  `issueCreditNote` (`db::Handler::increment_credit_note_counter`) before its transaction, so a
-  failed issue leaves a gap, never a duplicate — the same rule as `next_invoice_number`.
+  and never lands on a claimed one. Absent means `0` — `FinanceSettingsInfo.nextInvoiceNumber`
+  reads this lazily (a single `GetItem`, not carried on every `Instance` fetch) and reports
+  `this + 1`. See "Known issues and risks" for the same gap-not-duplicate reasoning as
+  `next_ticket_number`.
+- `last_credit_note_number` (N) — the credit-note sequence, under exactly the same rules:
+  incremented by `issueCreditNote` (`db::Handler::increment_credit_note_counter`) before its
+  transaction, so a failed issue leaves a gap, never a duplicate; moved forward by
+  `setNextCreditNoteNumber` or an owner's `issueCreditNote(input: { number })`.
+
+The table also holds one **credit-note number reservation row** per credit note,
+`id = {instance_id}#credit_note#{number}` (`db::credit_note_number_reservation_id`), with
+`credit_note_id` (S) and `created_at` (N), created by the credit note's issuing transaction
+conditioned on `attribute_not_exists(id)` — the same guarantee, and the same shape, as the
+invoice reservation rows above.
 
 ---
 
@@ -516,19 +529,15 @@ user-generated table, and every field is rendered directly from the list.
 **Non-obvious attributes:**
 
 - `name` (S) — required
-- `client_name` (S) — required
-- `client_abn` (S) — optional
-- `client_address` (S) — optional, multi-line
+- `client_id` (S) — required; the `{prefix}_client` row it bills. The client supplies the invoice's
+  bill-to details, the default send address and the payment terms; a project holds none of them.
+  `createProject`/`updateProject` refuse an archived client for a project that isn't already on it.
 - `reference` (S) — optional (e.g. a site address distinct from the client's billing address).
   **Note for any future direct `UpdateExpression` on this table:** `reference` is a DynamoDB
   reserved keyword and must be aliased via `ExpressionAttributeNames` (`#ref`) in any update/
   condition/projection expression — a literal `reference = :v` fails with
   `ValidationException: ... reserved keyword: reference`. `update_project` already does this;
   don't regress it.
-- `client_email` (S) — optional; normalized lowercase. Where `sendInvoice`/`sendCreditNote` mail
-  when not given recipients.
-- `payment_terms_days` (N) — optional, `0..=365`; overrides `instance.payment_terms_days` for this
-  project's invoices.
 - `default_unit_price_cents` (N) — optional; the GST-exclusive rate a new billable item on this
   project gets when `createBillableItem` names no price.
 - `brand_id` (S) — optional; the `instance.brands` entry its invoices go out under. Absent means
@@ -541,6 +550,41 @@ user-generated table, and every field is rendered directly from the list.
 Any member (owner or agent) of the finance instance can create/update a project — day-to-day
 work, not an owner-only setting, unlike the instance's own finance settings above. Superusers get
 no access (they don't pass `Member`) — the same superuser boundary tickets have always had.
+
+---
+
+### `{prefix}_client`
+
+Who a finance instance bills: one row per client, shared by all of that client's projects.
+
+| Attribute     | Type | Role                     |
+| ------------- | ---- | ------------------------ |
+| `id`          | S    | Hash key (PK) — nanoid   |
+| `instance_id` | S    | GSI hash key             |
+
+**GSIs:**
+
+| GSI                 | Hash key      | Sort key | Projection | Purpose                              |
+| ------------------- | ------------- | -------- | ---------- | ------------------------------------- |
+| `instance_id-index` | `instance_id` | —        | ALL        | The clients list and the client picker |
+
+`ALL`, unpaginated (`list_clients_by_instance`) — same reasoning as `project`'s.
+
+**Non-obvious attributes:**
+
+- `name` (S) — required; printed as the invoice's bill-to name.
+- `abn` (S), `address` (S, multi-line) — optional; printed under it.
+- `email` (S) — optional; normalized lowercase. Where `sendInvoice`/`sendCreditNote` mail when not
+  given recipients.
+- `payment_terms_days` (N) — optional, `0..=365`; overrides `instance.payment_terms_days` for this
+  client's invoices.
+- `archived` (Bool) — only ever written `true`. An archived client takes no new projects; there is
+  no delete.
+- `created_at`, `updated_at` (N)
+
+`updateClient` is a full replace (a blank optional field `REMOVE`s the attribute). A draft invoice
+shows its client's details live; a finalized one has them frozen in its snapshot. Same guards as
+`project`: any member, `NOT_FOUND` for missing and not-yours alike, superusers get nothing.
 
 ---
 
@@ -586,6 +630,13 @@ page is full or the index is exhausted, and `billable_items_dynamodb_local.rs` p
   `- ` render as bullets on the invoice)
 - `quantity_hundredths` (N) — quantity × 100 (`150` = 1.5), `0 < q ≤ 100,000,000`
 - `unit_price_cents` (N) — GST-exclusive, `0 ≤ p ≤ 1,000,000,000`
+- `unit` (S) — optional, ≤ 20 chars (`hrs`, `m²`); printed after the quantity. **A DynamoDB
+  reserved word** — aliased `#unit`.
+- `kind` (S) — optional; only ever `discount`, absent for an ordinary charge. A discount line is a
+  fixed amount off: stored as `quantity_hundredths = 100` and a positive `unit_price_cents` (the
+  amount), with no `unit`; `db::BillableItem::amount_cents` returns it negative, and it reduces the
+  GST base unless it's `gst_free`. Finalizing refuses an invoice whose subtotal or taxable
+  subtotal would go below zero (`finance::snapshot::check_discounts`).
 - `invoice_id` (S) — optional; absent means unbilled. Set by the transactional attach path
   (`createInvoice`/`addInvoiceItems`, `db::Handler`'s `create_invoice`/`add_invoice_items`) and
   cleared by the transactional detach path (`removeInvoiceItems`/`deleteInvoice`), always together
@@ -603,7 +654,7 @@ page is full or the index is exhausted, and `billable_items_dynamodb_local.rs` p
 - `created_by_user_id` (S), `created_at`, `updated_at` (N)
 
 The line amount is **not stored** — the API derives it (round-half-up of `quantity_hundredths ×
-unit_price_cents / 100`) on every read. At the bounds it reaches 10^15 cents, above GraphQL's
+unit_price_cents / 100`, negated for a discount) on every read. At the bounds it reaches 10^15 cents, above GraphQL's
 32-bit `Int` but exact as a JSON number in JS (under 2^53); it is served as a JSON number.
 
 Any member (owner or agent) of the finance instance can create/update/delete items; superusers get
@@ -621,17 +672,22 @@ domain rules (snapshot-on-finalize, strict finality, the transactional attach/de
 | `id`          | S    | Hash key (PK) — nanoid                          |
 | `instance_id` | S    | GSI hash key                                    |
 | `project_id`  | S    | GSI hash key                                    |
-| `created_at`  | N    | GSI sort key (both GSIs)                        |
+| `list_key`    | S    | GSI sort key (both GSIs)                        |
 
 **GSIs:**
 
-| GSI                          | Hash key      | Sort key     | Projection | Purpose                                   |
-| ----------------------------- | ------------- | ------------ | ---------- | ------------------------------------------ |
-| `instance_id-created_at-index` | `instance_id` | `created_at` | ALL        | The instance-wide invoices list            |
-| `project_id-created_at-index`  | `project_id`  | `created_at` | ALL        | One project's invoices (project page)      |
+| GSI                          | Hash key      | Sort key   | Projection | Purpose                                   |
+| ---------------------------- | ------------- | ---------- | ---------- | ------------------------------------------ |
+| `instance_id-list_key-index` | `instance_id` | `list_key` | ALL        | The instance-wide invoices list            |
+| `project_id-list_key-index`  | `project_id`  | `list_key` | ALL        | One project's invoices (project page)      |
 
-Both read newest `created_at` first (`ScanIndexForward = false`), keyset-paginated with a
-`{created_at}:{id}` cursor — the same shape as `billable_item`'s `{date}:{id}`. `ALL`: the list's
+`list_key` orders invoices by **issue date**, so an imported invoice dated last year lands where it
+belongs rather than at the top: `{issue_date}#{number:010}` once finalized
+(`db::issued_list_key`), and `{created YYYY-MM-DD}#draft#{created_at:012}` for a draft
+(`db::draft_list_key`), rewritten by the finalize write. Both read newest first
+(`ScanIndexForward = false`), keyset-paginated with a `{list_key}:{id}` cursor (`list_key` holds no
+`:`). The old `*-created_at-index` GSIs are still defined in Terraform but nothing reads them; a
+follow-up drops them. `ALL`: the list's
 DRAFT/UNPAID/PAID filter (below) runs as a `FilterExpression` over the projected rows, and
 `list_invoices` follows `list_billable_items`'s "no `Limit` on a filtered query, keep querying
 until the page is full or the index is exhausted" rule for the same reason.
@@ -644,8 +700,8 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
 **Non-obvious attributes:**
 
 - `status` (S) — `draft` or `finalized`. **Strictly one-way**: nothing ever writes `finalized` ->
-  `draft` — no void, no un-finalize. The only field a finalized invoice's row can still change is
-  `paid_date`.
+  `draft` — no void, no un-finalize. What a finalized invoice's row can still change is listed
+  under `pdf_s3_key` below.
 - `version` (N) — optimistic-concurrency counter, starting at 1. Bumped by every write that touches
   `item_ids` (attach/detach) and by editing an item that sits on this (draft) invoice
   (`update_billable_item`'s transactional path) — so a `finalizeInvoice` that read a `version`
@@ -659,10 +715,17 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   versa — enforced structurally by the transactional writes, never by a separate consistency pass.
 - `created_by_user_id` (S), `created_at`, `updated_at` (N)
 - `number` (N) — optional; absent for a draft. Assigned exactly once, at finalization, from
-  `{prefix}_counter`'s `next_invoice_number` (see that table's entry) — the next in sequence, or
+  `{prefix}_counter`'s `last_invoice_number` (see that table's entry) — the next in sequence, or
   any unused number an owner gives `finalizeInvoice(number:)`. Unique per instance, enforced by the
-  number's reservation row in `{prefix}_counter`. Displayed zero-padded to 3
-  digits (`financeSettings`'s convention; it simply grows past 999).
+  number's reservation row in `{prefix}_counter`.
+- `display_number` (S) — optional; absent for a draft. The number as printed, formatted by the
+  instance's number format (`db::NumberFormat::invoice`, e.g. `INV-0042`) and frozen at
+  finalization, so a later format change never relabels it.
+- `reference` (S) — optional; the client's PO or reference for this invoice, editable on a draft
+  (`createInvoice`, `updateInvoiceDetails`). The snapshot prints it, else the project's
+  `reference`. A reserved word (`#ref`).
+- `notes` (S) — optional, ≤ 2000 chars; printed above the payment details. Editable on a draft only.
+  `updateInvoiceDetails` is conditioned on `status = draft` and bumps `version`.
 - `issue_date` (S) — optional; `YYYY-MM-DD`. Absent for a draft; set once, at finalization, never
   changed afterward.
 - `snapshot` (S) — optional; JSON (`finance::snapshot::InvoiceSnapshot`, see `schema_version` below).
@@ -673,8 +736,8 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
 - `total_cents` (N) — optional; absent for a draft. Denormalised from the snapshot (rather than
   parsed out of the JSON on every list read) so the invoices list can show/sort by it cheaply.
 - `finalized_at` (N), `finalized_by_user_id` (S) — optional; absent for a draft.
-- `paid_date` (S) — optional; `YYYY-MM-DD`. Absent means unpaid. Set/cleared by `setInvoicePaid`
-  (condition `status = finalized`); never printed on the invoice itself.
+- `settled_date` (S) — optional; `YYYY-MM-DD`. Absent means a balance is still owed. See below;
+  never printed on the invoice itself.
 - `pdf_s3_key` (S) — optional; absent until `downloadInvoicePdf` has rendered this invoice's PDF at
   least once. Set exactly once, by `db::Handler::set_invoice_pdf_key` (condition `status =
   finalized`), to `invoices/{instance_id}/{id}/Invoice-{displayNumber}.pdf` — see `storage.rs`'s
@@ -682,8 +745,8 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   count — not quite the file's raw bytes; see `api/src/finance/pdf.rs`'s doc comment for why),
   so this is an unconditional `SET`, not an `attribute_not_exists` guard: a concurrent
   double-render just writes the same key twice, with two equally correct renderings of the same
-  invoice, never a real race. Along with `paid_date`, the only attributes that may still change on
-  a finalized invoice.
+  invoice, never a real race. Along with `settled_date`, `payments`, `credited_*`, `version` and
+  `sent_*`, the only attributes that may still change on a finalized invoice.
 
 - `due_date` (S) — optional; `YYYY-MM-DD`, set once at finalization (explicit, or issue date +
   payment terms) and frozen into the snapshot too. Drives the OVERDUE filter
@@ -693,7 +756,7 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
 - `payments` (S) — optional; a JSON array of `db::InvoicePayment` (`id`, `date`, `amount_cents`,
   `note`, `recorded_by_user_id`, `recorded_at`), absent when there are none. Written only by
   `set_invoice_payments`, conditioned on `status = finalized AND version = :expected` and bumping
-  `version`, together with the recomputed `paid_date`. At most 100 entries.
+  `version`, together with the recomputed `settled_date`. At most 100 entries.
 - `credited_cents`, `credited_gst_cents` (N) — optional (absent = 0); the GST-inclusive total and
   GST of every credit note against this invoice, `ADD`ed by `create_credit_note`'s transaction.
 - `sent_at` (N), `sent_to` (SS) — optional; when `sendInvoice` last mailed it, and to whom.
@@ -704,12 +767,16 @@ attribute names in an `Item`/`Key`/`ExclusiveStartKey` map need no alias, same e
   `invoices(brandId:)` filters on (a `FilterExpression`); a draft's displayed brand is read live
   from its project.
 
-**`paid_date` now means "settled"**: present exactly when `total_cents − credited_cents − Σ
-payments ≤ 0`, dated by whatever settled it — see CLAUDE.md's "Due dates, payments and credit
-notes" house rule. Snapshot `schema_version` 2 added `due_date`, per-line `gst_free`, and the
-`credit_note` block a credit note's snapshot carries; 3 adds `seller.legal_name`, set when the
-invoice went out under a brand whose name differs from the legal name. Older snapshots still parse
-(every added field is optional).
+**`settled_date`**: present exactly when `total_cents − credited_cents − Σ payments ≤ 0`, dated
+by whatever settled it — see CLAUDE.md's "Due dates, payments and credit notes" house rule. Every
+UNPAID/PAID/OVERDUE filter reads it.
+
+Snapshot `schema_version` is 4. It carries `due_date`, per-line `gst_free`, `unit` and `discount`,
+`seller.legal_name` (set when the invoice went out under a brand whose name differs from the legal
+name), the invoice's `notes`, and the `credit_note` block a credit note's snapshot carries. Earlier
+versions never reached production data that survives (the finance tables were wiped when 4
+shipped), so nothing parses them specially; v4 also dropped `no_gst_note`, which renderers derive
+from `gst_registered`.
 
 **Attach/detach/finalize/delete use `TransactWriteItems`** (`Put`/`Update`/`Delete` items only — IAM has no
 `TransactWriteItems` action; each item is authorised by the existing `PutItem`/`UpdateItem`/
@@ -719,7 +786,9 @@ across this table and
 DynamoDB transactions in this codebase. `finalizeInvoice`'s write is a transaction too, but not
 with the items — by the time it runs, every item's `invoice_id` already points at this invoice
 (from the moment it was attached) — with the number's reservation row in `{prefix}_counter` (see
-that table's entry). Both are `Update` items, so `UpdateItem` grants authorise it.
+that table's entry). Both are `Update` items, so `UpdateItem` grants authorise it. The same write
+sets `number`, `display_number`, `issue_date`, `due_date`, `snapshot`, the totals and the issued
+`list_key`.
 
 Any member (owner or agent) of the finance instance can create/attach/detach/delete a draft, and
 finalize or mark paid; superusers get no access — same boundary as `project`/`billable_item`.
@@ -737,34 +806,41 @@ send; never deleted.
 | `id`          | S    | Hash key (PK) — nanoid                 |
 | `instance_id` | S    | GSI hash key                           |
 | `invoice_id`  | S    | GSI hash key                           |
-| `created_at`  | N    | GSI sort key (both GSIs)               |
+| `list_key`    | S    | GSI sort key (both GSIs)               |
 
 **GSIs:**
 
-| GSI                           | Hash key      | Sort key     | Projection | Purpose                                        |
-| ----------------------------- | ------------- | ------------ | ---------- | ---------------------------------------------- |
-| `instance_id-created_at-index` | `instance_id` | `created_at` | ALL        | The instance-wide list; reports and CSV export |
-| `invoice_id-created_at-index`  | `invoice_id`  | `created_at` | ALL        | One invoice's credit notes (the invoice page)   |
+| GSI                          | Hash key      | Sort key   | Projection | Purpose                                        |
+| ---------------------------- | ------------- | ---------- | ---------- | ---------------------------------------------- |
+| `instance_id-list_key-index` | `instance_id` | `list_key` | ALL        | The instance-wide list; reports and CSV export |
+| `invoice_id-list_key-index`  | `invoice_id`  | `list_key` | ALL        | One invoice's credit notes (the invoice page)   |
+
+`list_key` is `{issue_date}#{number:010}`, as for a finalized invoice. The old
+`*-created_at-index` GSIs are unused and dropped in a follow-up.
 
 **Non-obvious attributes:**
 
 - `project_id` (S) — denormalised from the invoice.
-- `number` (N) — from `counter.next_credit_note_number`; displayed `CN-001`. A reserved word
-  (`#num`).
+- `number` (N) — from `counter.last_credit_note_number`, or any unused number an owner gives
+  `issueCreditNote(input: { number })`. Unique per instance through its reservation row in
+  `{prefix}_counter`, written in the same transaction. A reserved word (`#num`).
+- `display_number` (S) — the number as printed (`db::NumberFormat::credit_note`, default
+  `CN-001`), frozen at issue.
 - `issue_date` (S) — `YYYY-MM-DD`, not before the invoice's issue date.
 - `reason` (S) — required, ≤ 500 chars; printed.
 - `snapshot` (S) — frozen `InvoiceSnapshot` JSON with its `credit_note` block set, built from the
   invoice's own snapshot. A reserved word (`#snap`).
 - `subtotal_cents`, `gst_cents`, `total_cents` (N) — denormalised from the snapshot.
-- `pdf_s3_key` (S) — optional; `credit-notes/{instance_id}/{id}/Credit-Note-CN-{n}.pdf` once
+- `pdf_s3_key` (S) — optional; `credit-notes/{instance_id}/{id}/Credit-Note-{display_number}.pdf` once
   rendered.
 - `sent_at` (N), `sent_to` (SS) — optional; the last `sendCreditNote`.
 - `created_by_user_id` (S), `created_at` (N)
 - `brand_id` (S) — optional (absent = the default brand); copied from its invoice's at issue,
   never changed.
 
-Written by `create_credit_note` in one `TransactWriteItems` with the invoice's `Update` (`Put` +
-`Update`, no `ConditionCheck`, so the existing IAM grants cover it).
+Written by `create_credit_note` in one `TransactWriteItems` with the invoice's `Update` and the
+number's reservation row (`Put` + two `Update`s, no `ConditionCheck`, so the existing IAM grants
+cover it).
 
 ---
 
@@ -899,12 +975,18 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
 - `date` (S) — canonical `YYYY-MM-DD` (`finance::validate_item_date`); a reserved word, aliased `#d`.
 - `category` (S) — one of a fixed list (`db::ExpenseCategory::as_str`, e.g. `materials`,
   `vehicle_km`). `vehicle_km` decides the row's shape: a trip carries `distance_tenths_km` and
-  `rate_cents_per_km` and never `supplier`/`amount_cents`/`gst_cents`; every other category is the
+  `rate_cents_per_km` and never `supplier`/`total_cents`/`gst_cents`/`business_use_percent`/
+  `gst_not_claimable`; every other category is the
   reverse. `updateExpense` can change category, and `REMOVE`s whichever set no longer applies.
 - `supplier` (S) — purchases only; trimmed, ≤ 200 chars.
-- `amount_cents` (N) — purchases only; **GST-inclusive** (what was paid), `0 < a ≤ 1,000,000,000`.
-- `gst_cents` (N) — optional, purchases only; the GST included in `amount_cents`,
-  `0 ≤ g ≤ amount_cents`. Absent means GST-free.
+- `total_cents` (N) — purchases only; **GST-inclusive** (what was paid), `0 < a ≤ 1,000,000,000`.
+- `gst_cents` (N) — optional, purchases only; the GST included in `total_cents`,
+  `0 ≤ g ≤ total_cents`. Absent means GST-free.
+- `business_use_percent` (N) — optional, purchases only, `1..=99`; absent means 100% business use.
+  The GST report counts only this share of the purchase (G11) and of its GST (1B).
+- `gst_not_claimable` (Bool) — optional, purchases only, only ever written `true`: GST was paid but
+  can't be claimed (e.g. entertainment). Its purchase still counts in G11; its GST never counts in
+  1B.
 - `distance_tenths_km` (N) — trips only; km × 10, `0 < d ≤ 50,000` (5,000 km).
 - `rate_cents_per_km` (N) — trips only; the ATO rate for the trip date's financial year
   (`finance::vehicle::ATO_RATES`), looked up on every write and stored, so a later table change
@@ -917,8 +999,11 @@ created_by_user_id = :me`) — bounded by one person's trips in one year.
   `FilterExpression`, ANDed with the category filter.
 - `billable_item_id` (S) — optional; the item `rebillExpense` made from it (see
   `billable_item.source_expense_id`). `delete_expense` is conditioned on its absence.
-- `receipt_s3_key`, `receipt_filename`, `receipt_content_type` (S), `receipt_size` (N) — optional,
-  all present or all absent; the attached receipt (`receipts/{instance_id}/{id}/…`).
+- `receipts` (S) — optional; a JSON array of `db::ExpenseReceipt` (`id`, `s3_key`, `filename`,
+  `content_type`, `size`, `uploaded_at`), at most `db::MAX_EXPENSE_RECEIPTS` (10), absent when
+  empty. Each file is at `receipts/{instance_id}/{id}/…`. Written only by
+  `set_expense_receipts`, conditioned on the stored string the caller read (`CONFLICT` otherwise),
+  like `instance.brands`.
 - `created_by_user_id` (S) — whoever logged it; also whose km running total a trip counts toward.
 - `created_at`, `updated_at` (N)
 
@@ -1050,7 +1135,7 @@ if one ever does, that is the bug to look for first.
 
 #### `counter` — finalizing an invoice can leave a gap in the numbering, never a duplicate
 
-`finalizeInvoice`'s algorithm allocates `next_invoice_number` (the same atomic `ADD`, same
+`finalizeInvoice`'s algorithm allocates `last_invoice_number` (the same atomic `ADD`, same
 gap-not-duplicate guarantee as `next_ticket_number` above) *before* it knows whether the
 conditional `UpdateItem` that actually finalizes the invoice will succeed. If that write's
 condition fails — the draft's `version` no longer matches, because another edit or another
@@ -1200,7 +1285,7 @@ not available on GSIs. This is expected to affect, once the relevant steps land:
   wrong — the reply is stored, just under the wrong ticket — but it produces a visible duplicate.
 - **`ticket_message.rfc_message_id-index`** — the same failure mode as above, for `In-Reply-To`/
   `References` threading of a fast follow-up reply.
-- **`invoice.project_id-created_at-index`** — `updateProject` finds the drafts to re-stamp with a
+- **`invoice.project_id-list_key-index`** — `updateProject` finds the drafts to re-stamp with a
   new brand through this index, so a draft created in the same instant as the brand change (or by a
   `createInvoice` that read the project just before it) can keep the old `brand_id`. Only the
   `invoices(brandId:)` filter is affected — the draft still *shows* its project's brand, and

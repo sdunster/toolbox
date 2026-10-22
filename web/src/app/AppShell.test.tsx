@@ -118,6 +118,7 @@ describe("AppShell — kind-aware nav", () => {
     await screen.findByRole("link", { name: "Projects" });
     expect(navLinkNames()).toEqual([
       "Invoices",
+      "Clients",
       "Projects",
       "Billable items",
       "Expenses",
@@ -133,6 +134,7 @@ describe("AppShell — kind-aware nav", () => {
     await screen.findByRole("link", { name: "Projects" });
     expect(navLinkNames()).toEqual([
       "Invoices",
+      "Clients",
       "Projects",
       "Billable items",
       "Expenses",

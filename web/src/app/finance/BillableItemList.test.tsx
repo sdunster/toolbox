@@ -304,9 +304,11 @@ describe("BillableItemList", () => {
     expect(updateVariables).toEqual({
       id: "item-1",
       input: {
+        kind: "CHARGE",
         date: "2026-08-19",
         description: "Front-end build",
         quantity: "2",
+        unit: "",
         unitPriceCents: 150000,
         gstFree: false,
       },

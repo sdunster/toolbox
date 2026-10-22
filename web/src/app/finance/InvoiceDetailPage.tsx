@@ -93,7 +93,7 @@ function Content({ id, isOwner }: { id: string; isOwner: boolean }) {
         <>
           <InvoicePaidControl invoice={invoice} />
           <InvoiceSendPanel invoice={invoice} />
-          <InvoiceCreditNotes invoice={invoice} />
+          <InvoiceCreditNotes invoice={invoice} isOwner={isOwner} />
         </>
       )}
     </div>

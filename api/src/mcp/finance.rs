@@ -1,5 +1,5 @@
-//! MCP tools for finance instances: projects, billable items, invoices and
-//! expenses.
+//! MCP tools for finance instances: clients, projects, billable items,
+//! invoices and expenses.
 //! Every tool runs one fixed GraphQL document as the caller (see
 //! [`super::tool`]), so authorization is the site's: only a real member of an
 //! **finance** instance can use them, a superuser without a membership sees
@@ -17,7 +17,7 @@
 //! `issueDate` and `paidDate` all accept any past date, and `finalize_invoice`
 //! takes an optional owner-only `number` — any number not already used in the
 //! instance — so an imported invoice keeps its original number and date in the
-//! same irreversible call.
+//! same irreversible call. `issue_credit_note` takes one the same way.
 //!
 //! **Brands** (`list_brands`): an instance can issue under more than one name
 //! (see CLAUDE.md's "Brands" entry). A project's `brandId` picks the name its
@@ -26,10 +26,11 @@
 //! changing a brand (`addBrand`/`updateBrand`) is owner-level instance
 //! settings and deliberately not a tool.
 //!
-//! **Deliberately not exposed:** `updateFinanceSettings` and
-//! `setNextInvoiceNumber` (owner-level instance settings — change them in the
-//! web app; `finalize_invoice`'s `number` covers what an import needs) and the
-//! raw invoice snapshot.
+//! **Deliberately not exposed:** `updateFinanceSettings`,
+//! `setNextInvoiceNumber`/`setNextCreditNoteNumber` and `setNumberFormat`
+//! (owner-level instance settings — change them in the web app;
+//! `finalize_invoice`'s and `issue_credit_note`'s `number` cover what an import
+//! needs), receipt files, and the raw invoice snapshot.
 //!
 //! Money is integers: `unitPriceCents` is GST-exclusive cents, and a quantity is
 //! a decimal **string** with at most 2 decimal places (`"1.5"`) that only the
@@ -41,25 +42,28 @@ use crate::app::{App, HasDb, HasMail, HasQueue, HasStorage};
 
 use super::tool::{ToolContext, ToolOutcome, missing_argument};
 
-const PROJECT_FIELDS: &str = "id name clientName clientAbn clientAddress clientEmail reference \
-     paymentTermsDays effectivePaymentTermsDays defaultUnitPriceCents archived createdAt updatedAt \
-     brand { brandId name }";
+const CLIENT_FIELDS: &str = "id name abn address email paymentTermsDays \
+     effectivePaymentTermsDays archived createdAt updatedAt";
+
+const PROJECT_FIELDS: &str = "id name reference defaultUnitPriceCents archived createdAt updatedAt \
+     client { id name email } brand { brandId name }";
 
 const BRAND_FIELDS: &str = "brandId name email phone address paymentDetails archived isDefault";
 
 const BRAND_FILTER_DESCRIPTION: &str = "Only this brand's (an id from list_brands; \
      \"default\" for the default brand).";
 
-const ITEM_FIELDS: &str = "id date description quantity unitPriceCents amountCents gstFree status \
-     project { id name }";
+const ITEM_FIELDS: &str = "id kind date description quantity unit unitPriceCents amountCents \
+     gstFree status project { id name }";
 
 const EXPENSE_FIELDS: &str = "id date category description supplier amountCents gstCents \
-     distanceKm rateCentsPerKm project { id name } brand { brandId name } rebilledItem { id status } \
-     receipt { filename contentType size }";
+     businessUsePercent gstNotClaimable claimableGstCents distanceKm rateCentsPerKm \
+     project { id name } brand { brandId name } rebilledItem { id status } \
+     receipts { id filename contentType size uploadedAt }";
 
 const CREDIT_NOTE_FIELDS: &str = "id displayNumber issueDate reason title subtotalCents gstCents \
      totalCents currency createdAt sentAt sentTo invoice { id displayNumber } brand { brandId name } \
-     lines { description amountCents gstFree }";
+     lines { description amountCents discount gstFree }";
 
 /// `ExpenseCategoryType`'s values, for the tools' input schemas.
 const EXPENSE_CATEGORIES: [&str; 19] = [
@@ -88,8 +92,11 @@ const EXPENSE_WRITE_DESCRIPTION: &str = "Record an expense in a FINANCE instance
      optionally against one of its projects. Two shapes, chosen by `category`: a PURCHASE \
      (every category except VEHICLE_KM) needs `supplier` and `amountCents` (GST-inclusive — \
      what was paid) plus optional `gstCents` (the GST included; omit for a GST-free \
-     purchase); a VEHICLE_KM trip needs `distanceKm` and a `description` of its business \
-     purpose, and must not have supplier/amount/GST — its amount is distance x the ATO \
+     purchase), `businessUsePercent` (1-100, default 100: the share that was for the \
+     business — the GST report counts only that share) and `gstNotClaimable` (GST was paid \
+     but can't be claimed back: entertainment, or bought before GST registration); a \
+     VEHICLE_KM trip needs `distanceKm` and a `description` of its business \
+     purpose, and must not have supplier/amount/GST/business use — its amount is distance x the ATO \
      cents-per-km rate for the trip date's financial year, looked up for you. A car claimed \
      by cents per km can't also claim its fuel (VEHICLE_FUEL). Expenses are never \
      invoiced; one on a project can be passed on to the client with `rebill_expense`. \
@@ -99,20 +106,39 @@ const EXPENSE_WRITE_DESCRIPTION: &str = "Record an expense in a FINANCE instance
 const INVOICE_SUMMARY_FIELDS: &str = "id status number displayNumber issueDate dueDate paidDate \
      overdue daysOverdue title reference subtotalCents gstCents totalCents paidCents \
      creditedCents balanceCents currency createdAt finalizedAt sentAt \
-     project { id name clientName } brand { brandId name }";
+     project { id name client { id name } } brand { brandId name }";
 
 const INVOICE_DETAIL_FIELDS: &str = "id status number displayNumber issueDate dueDate paidDate \
-     overdue daysOverdue title reference subtotalCents gstCents totalCents paidCents \
-     creditedCents balanceCents currency gstRegistered paymentDetails createdAt finalizedAt \
-     sentAt sentTo project { id name clientName clientEmail } brand { brandId name } \
+     overdue daysOverdue title reference ownReference notes totalsProblem subtotalCents \
+     gstCents totalCents paidCents creditedCents balanceCents currency gstRegistered \
+     paymentDetails createdAt finalizedAt sentAt sentTo \
+     project { id name client { id name email } } brand { brandId name } \
      billTo { name abn address } seller { name legalName abn address phone email } \
-     lines { date description quantity unitPriceCents amountCents gstFree } \
-     items { id date description quantity unitPriceCents amountCents gstFree status } \
+     lines { date description quantity unit unitPriceCents amountCents discount gstFree } \
+     items { id kind date description quantity unit unitPriceCents amountCents gstFree status } \
      payments { id date amountCents note } \
      creditNotes { id displayNumber issueDate reason totalCents }";
 
 const DEFAULT_PAGE_SIZE: i64 = 20;
 const MAX_PAGE_SIZE: i64 = 50;
+
+fn client_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "id": { "type": "string" },
+            "name": { "type": "string", "description": "Printed as the invoice's \"Invoice to\"." },
+            "abn": { "type": ["string", "null"] },
+            "address": { "type": ["string", "null"] },
+            "email": { "type": ["string", "null"], "description": "Where send_invoice mails by default." },
+            "paymentTermsDays": { "type": ["integer", "null"], "description": "This client's own payment terms; null uses the instance's." },
+            "effectivePaymentTermsDays": { "type": "integer", "description": "The terms its invoices actually get." },
+            "archived": { "type": "boolean" },
+            "createdAt": { "type": "integer", "description": "Unix seconds." },
+            "updatedAt": { "type": "integer", "description": "Unix seconds." },
+        },
+    })
+}
 
 fn project_schema() -> Value {
     json!({
@@ -120,13 +146,8 @@ fn project_schema() -> Value {
         "properties": {
             "id": { "type": "string" },
             "name": { "type": "string" },
-            "clientName": { "type": "string" },
-            "clientAbn": { "type": ["string", "null"] },
-            "clientAddress": { "type": ["string", "null"] },
-            "reference": { "type": ["string", "null"] },
-            "clientEmail": { "type": ["string", "null"], "description": "Where send_invoice mails by default." },
-            "paymentTermsDays": { "type": ["integer", "null"], "description": "This project's own payment terms; null uses the instance's." },
-            "effectivePaymentTermsDays": { "type": "integer", "description": "The terms its invoices actually get." },
+            "client": { "type": "object", "description": "The client its invoices bill (id, name, email)." },
+            "reference": { "type": ["string", "null"], "description": "Printed on its invoices, unless an invoice sets its own." },
             "defaultUnitPriceCents": { "type": ["integer", "null"], "description": "GST-exclusive rate a new item gets when it names no price." },
             "archived": { "type": "boolean" },
             "createdAt": { "type": "integer", "description": "Unix seconds." },
@@ -159,9 +180,11 @@ fn item_schema() -> Value {
             "id": { "type": "string" },
             "date": { "type": "string", "description": "YYYY-MM-DD." },
             "description": { "type": "string" },
+            "kind": { "type": "string", "enum": ["CHARGE", "DISCOUNT"] },
             "quantity": { "type": "string", "description": "Decimal string, e.g. \"1.5\"." },
-            "unitPriceCents": { "type": "integer", "description": "GST-exclusive, in cents." },
-            "amountCents": { "type": "integer", "description": "round-half-up(quantity x unit price), in cents." },
+            "unit": { "type": ["string", "null"], "description": "What the quantity counts, e.g. \"hrs\"." },
+            "unitPriceCents": { "type": "integer", "description": "GST-exclusive, in cents; for a DISCOUNT, the amount it takes off." },
+            "amountCents": { "type": "integer", "description": "round-half-up(quantity x unit price), in cents; negative for a DISCOUNT." },
             "gstFree": { "type": "boolean", "description": "No GST on this line." },
             "status": { "type": "string", "enum": ["UNBILLED", "DRAFT", "INVOICED"] },
             "project": { "type": "object", "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
@@ -176,7 +199,7 @@ fn invoice_schema() -> Value {
             "id": { "type": "string" },
             "status": { "type": "string", "enum": ["DRAFT", "FINALIZED"] },
             "number": { "type": ["integer", "null"], "description": "Null for a draft." },
-            "displayNumber": { "type": ["string", "null"], "description": "Zero-padded, e.g. \"008\"; null for a draft." },
+            "displayNumber": { "type": ["string", "null"], "description": "As printed, in the instance's number format when finalized, e.g. \"INV-0008\"; null for a draft." },
             "issueDate": { "type": ["string", "null"], "description": "YYYY-MM-DD; null for a draft." },
             "dueDate": { "type": ["string", "null"], "description": "YYYY-MM-DD; null for a draft." },
             "paidDate": { "type": ["string", "null"], "description": "YYYY-MM-DD the balance reached zero (payments and credit notes); null while anything is owed." },
@@ -187,7 +210,10 @@ fn invoice_schema() -> Value {
             "balanceCents": { "type": "integer", "description": "total - credited - paid." },
             "sentAt": { "type": ["integer", "null"], "description": "Unix seconds send_invoice last mailed it." },
             "title": { "type": "string" },
-            "reference": { "type": ["string", "null"] },
+            "reference": { "type": ["string", "null"], "description": "The reference printed: the invoice's own, else its project's." },
+            "ownReference": { "type": ["string", "null"], "description": "The invoice's own reference (e.g. a PO number); null when it prints its project's." },
+            "notes": { "type": ["string", "null"], "description": "Printed above the payment details." },
+            "totalsProblem": { "type": ["string", "null"], "description": "Why this draft can't be finalized as it stands (its discounts outweigh its charges), else null." },
             "subtotalCents": { "type": "integer" },
             "gstCents": { "type": "integer" },
             "totalCents": { "type": "integer" },
@@ -228,8 +254,10 @@ pub fn catalogue() -> Vec<Value> {
         "date": { "type": "string", "description": "YYYY-MM-DD." },
         "description": { "type": "string", "description": "Multi-line; lines starting `* ` or `- ` print as bullets." },
         "quantity": { "type": "string", "description": "Decimal, at most 2 decimal places, > 0 and <= 1,000,000. e.g. \"1.5\"." },
-        "unitPriceCents": { "type": "integer", "description": "GST-exclusive price in cents, 0 to 1,000,000,000. Optional: a new item takes its project's defaultUnitPriceCents; an update keeps the current price." },
-        "gstFree": { "type": "boolean", "default": false, "description": "No GST on this line even when the business is GST-registered." },
+        "unitPriceCents": { "type": "integer", "description": "GST-exclusive price in cents, 0 to 1,000,000,000. Optional for a CHARGE: a new item takes its project's defaultUnitPriceCents; an update keeps the current price. For a DISCOUNT, the amount it takes off (required, above 0)." },
+        "gstFree": { "type": "boolean", "default": false, "description": "No GST on this line even when the business is GST-registered. On a DISCOUNT: it comes off the GST-free lines rather than the taxable ones." },
+        "unit": { "type": "string", "description": "What the quantity counts, printed after it: e.g. \"hrs\", \"ea\". Optional; not on a DISCOUNT." },
+        "kind": { "type": "string", "enum": ["CHARGE", "DISCOUNT"], "default": "CHARGE", "description": "DISCOUNT is a fixed amount taken off the invoice: quantity must be \"1\" and unitPriceCents is the amount off. It prints and counts as a negative line." },
     });
     let mut update_item_props = item_input.clone();
     update_item_props["id"] = json!({ "type": "string" });
@@ -242,6 +270,8 @@ pub fn catalogue() -> Vec<Value> {
         "supplier": { "type": "string", "description": "Purchases only (required there)." },
         "amountCents": { "type": "integer", "description": "Purchases only: GST-inclusive cents paid, 1 to 1,000,000,000." },
         "gstCents": { "type": "integer", "description": "Purchases only: GST included in amountCents (usually amount / 11). Omit if GST-free." },
+        "businessUsePercent": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Purchases only: the share that was for the business; default 100." },
+        "gstNotClaimable": { "type": "boolean", "default": false, "description": "Purchases only: GST was paid but can't be claimed back (entertainment, or bought before GST registration)." },
         "distanceKm": { "type": "string", "description": "VEHICLE_KM only: km, at most 1 decimal place, up to 5000. e.g. \"12.5\"." },
     });
     let mut create_expense_props = expense_props.clone();
@@ -267,9 +297,72 @@ pub fn catalogue() -> Vec<Value> {
             "annotations": { "title": "List brands", "readOnlyHint": true, "idempotentHint": true },
         }),
         json!({
+            "name": "list_clients",
+            "title": "List clients",
+            "description": "List the clients (who the business bills: name, ABN, address, email, \
+                payment terms) of a FINANCE instance, sorted by name. Every project belongs to \
+                one client, and its invoices bill that client. Archived clients are hidden \
+                unless `includeArchived` is true. Sends no email.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "includeArchived": { "type": "boolean", "default": false },
+                },
+                "required": ["instanceId"],
+            },
+            "outputSchema": wrap("clients", json!({ "type": "array", "items": client_schema() })),
+            "annotations": { "title": "List clients", "readOnlyHint": true, "idempotentHint": true },
+        }),
+        json!({
+            "name": "create_client",
+            "title": "Create client",
+            "description": "Create a client in a FINANCE instance. `name` is required and prints \
+                as the invoice's \"Invoice to\", with `abn` and `address`; `email` is where \
+                send_invoice mails by default; `paymentTermsDays` (0-365) overrides the \
+                instance's terms. Sends no email.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "instanceId": { "type": "string" },
+                    "name": { "type": "string" },
+                    "abn": { "type": "string" },
+                    "address": { "type": "string" },
+                    "email": { "type": "string" },
+                    "paymentTermsDays": { "type": "integer" },
+                },
+                "required": ["instanceId", "name"],
+            },
+            "outputSchema": wrap("client", client_schema()),
+            "annotations": { "title": "Create client", "idempotentHint": false },
+        }),
+        json!({
+            "name": "update_client",
+            "title": "Update client",
+            "description": "Change a client. Only the fields you pass change; an empty string \
+                clears an optional one, and `paymentTermsDays: null` reverts to the instance's \
+                terms. `archived` true hides it from new projects. Draft invoices of its \
+                projects pick up the change; finalized ones were frozen and don't.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "abn": { "type": "string" },
+                    "address": { "type": "string" },
+                    "email": { "type": "string" },
+                    "paymentTermsDays": { "type": ["integer", "null"] },
+                    "archived": { "type": "boolean" },
+                },
+                "required": ["id"],
+            },
+            "outputSchema": wrap("client", client_schema()),
+            "annotations": { "title": "Update client", "idempotentHint": true },
+        }),
+        json!({
             "name": "list_projects",
             "title": "List projects",
-            "description": "List the projects (a client's billing identity) in a FINANCE \
+            "description": "List the projects (jobs, each billed to one client) in a FINANCE \
                 instance you are a member of, sorted by name. Archived projects are hidden \
                 unless `includeArchived` is true. Get `instanceId` from `whoami` (only \
                 instances of kind FINANCE apply). Finance tools send no email.",
@@ -287,24 +380,20 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "create_project",
             "title": "Create project",
-            "description": "Create a project in a FINANCE instance: the client/job that billable \
-                items and invoices are grouped under. `name` and `clientName` are required; \
-                the rest print in the invoice's \"Invoice to\" block.",
+            "description": "Create a project in a FINANCE instance: a job billable items and \
+                invoices are grouped under, billed to one client (`clientId`, from list_clients \
+                — create the client first if it's new). `name` and `clientId` are required.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "instanceId": { "type": "string" },
+                    "clientId": { "type": "string" },
                     "name": { "type": "string" },
-                    "clientName": { "type": "string" },
-                    "clientAbn": { "type": "string" },
-                    "clientAddress": { "type": "string" },
-                    "clientEmail": { "type": "string", "description": "Where send_invoice mails by default." },
-                    "reference": { "type": "string", "description": "e.g. a client PO number; prints on the invoice." },
-                    "paymentTermsDays": { "type": "integer", "description": "0-365. Overrides the instance's terms for this project's invoices." },
+                    "reference": { "type": "string", "description": "e.g. a site address; prints on its invoices unless an invoice sets its own." },
                     "defaultUnitPriceCents": { "type": "integer", "description": "GST-exclusive rate new items get when they name no price." },
                     "brandId": { "type": "string", "description": "The brand its invoices go out under (from list_brands); omit for the default brand." },
                 },
-                "required": ["instanceId", "name", "clientName"],
+                "required": ["instanceId", "clientId", "name"],
             },
             "outputSchema": wrap("project", project_schema()),
             "annotations": { "title": "Create project", "idempotentHint": false },
@@ -320,13 +409,9 @@ pub fn catalogue() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string" },
+                    "clientId": { "type": "string", "description": "Move it to another client; changes its drafts, never a finalized invoice." },
                     "name": { "type": "string" },
-                    "clientName": { "type": "string" },
-                    "clientAbn": { "type": "string", "description": "Empty string clears it." },
-                    "clientAddress": { "type": "string", "description": "Empty string clears it." },
                     "reference": { "type": "string", "description": "Empty string clears it." },
-                    "clientEmail": { "type": "string", "description": "Empty string clears it." },
-                    "paymentTermsDays": { "type": ["integer", "null"], "description": "null clears it (the instance's terms apply)." },
                     "defaultUnitPriceCents": { "type": ["integer", "null"], "description": "null clears it." },
                     "brandId": { "type": "string", "description": "Move it to this brand (from list_brands; \"default\" for the default brand). Changes its drafts, never a finalized invoice." },
                     "archived": { "type": "boolean" },
@@ -362,15 +447,18 @@ pub fn catalogue() -> Vec<Value> {
             "name": "create_billable_item",
             "title": "Create billable item",
             "description": "Record a unit of billable work against a project (it stays UNBILLED \
-                until put on an invoice). The amount is computed for you: quantity x unit price, \
-                rounded half-up to the cent. Refused for an archived project.",
+                until put on an invoice), or a fixed-amount DISCOUNT to put on an invoice with \
+                it. The amount is computed for you: quantity x unit price, rounded half-up to \
+                the cent (negative for a discount). Refused for an archived project.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "projectId": { "type": "string" },
+                    "kind": item_input["kind"].clone(),
                     "date": item_input["date"].clone(),
                     "description": item_input["description"].clone(),
                     "quantity": item_input["quantity"].clone(),
+                    "unit": item_input["unit"].clone(),
                     "unitPriceCents": item_input["unitPriceCents"].clone(),
                     "gstFree": item_input["gstFree"].clone(),
                 },
@@ -382,8 +470,9 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "update_billable_item",
             "title": "Update billable item",
-            "description": "Replace a billable item's date, description, quantity, unit price and \
-                GST-free flag (a full replace: an omitted gstFree becomes false; an omitted \
+            "description": "Replace a billable item's kind, date, description, quantity, unit, \
+                unit price and GST-free flag (a full replace: an omitted gstFree becomes false, \
+                an omitted unit is cleared, an omitted kind is CHARGE; an omitted \
                 unitPriceCents keeps the current price). Refused if the item is on a FINALIZED \
                 invoice; an item on a draft invoice can still be edited and the draft updates.",
             "inputSchema": {
@@ -542,17 +631,39 @@ pub fn catalogue() -> Vec<Value> {
             "title": "Create draft invoice",
             "description": "Start a DRAFT invoice for a project from at least one of that \
                 project's UNBILLED items (see `list_billable_items`). A draft has no number \
-                and can be freely changed or deleted; nothing is final until `finalize_invoice`.",
+                and can be freely changed or deleted; nothing is final until `finalize_invoice`. \
+                Optional `reference` (e.g. the client's PO number, printed in place of the \
+                project's) and `notes` (printed above the payment details).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "projectId": { "type": "string" },
                     "itemIds": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+                    "reference": { "type": "string" },
+                    "notes": { "type": "string" },
                 },
                 "required": ["projectId", "itemIds"],
             },
             "outputSchema": wrap("invoice", invoice_schema()),
             "annotations": { "title": "Create draft invoice", "idempotentHint": false },
+        }),
+        json!({
+            "name": "update_invoice_details",
+            "title": "Set a draft's reference and notes",
+            "description": "Set a DRAFT invoice's own `reference` (e.g. a PO number, printed in \
+                place of its project's) and `notes` (printed above the payment details). A full \
+                replace: an omitted or empty one is cleared. Refused once finalized. Sends no email.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "invoiceId": { "type": "string" },
+                    "reference": { "type": "string" },
+                    "notes": { "type": "string" },
+                },
+                "required": ["invoiceId"],
+            },
+            "outputSchema": wrap("invoice", invoice_schema()),
+            "annotations": { "title": "Set a draft's reference and notes", "idempotentHint": true },
         }),
         json!({
             "name": "add_invoice_items",
@@ -614,9 +725,12 @@ pub fn catalogue() -> Vec<Value> {
                 fine) and its original `number`. `number` is owner-only and may be any number \
                 no invoice in the instance already has, in any order; a used one is refused and \
                 leaves the invoice a draft. Automatic numbering carries on after the highest \
-                number used. Without `number`, the next number in sequence is used. The seller \
-                details and payment text printed are the instance's CURRENT finance settings. \
-                `dueDate` defaults to issueDate + the project's (else the instance's) payment \
+                number used. Without `number`, the next number in sequence is used. The number \
+                prints in the instance's CURRENT number format (prefix and padding), and the \
+                seller details, GST registration and payment text printed are the instance's \
+                CURRENT finance settings — set them to what the original invoice showed before \
+                importing it. Refused while its discounts outweigh its charges. \
+                `dueDate` defaults to issueDate + the client's (else the instance's) payment \
                 terms. A mistake is corrected afterwards with issue_credit_note. Sends no email.",
             "inputSchema": {
                 "type": "object",
@@ -626,7 +740,7 @@ pub fn catalogue() -> Vec<Value> {
                     "number": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Owner-only: use exactly this invoice number (e.g. 8 for \"008\") \
+                        "description": "Owner-only: use exactly this invoice number (e.g. 8 for \"INV-008\") \
                             instead of the next in sequence. For importing existing invoices; omit otherwise.",
                     },
                     "dueDate": { "type": "string", "description": "YYYY-MM-DD, on or after issueDate. Optional." },
@@ -730,7 +844,9 @@ pub fn catalogue() -> Vec<Value> {
             "title": "Issue credit note",
             "description": "**IRREVERSIBLE.** Issue a credit note (an \"Adjustment Note\" for a \
                 tax invoice) against a FINALIZED invoice — the only way to correct one. It gets \
-                the next CN- number and can never be edited or deleted. `lines` are GST-exclusive \
+                the next credit-note number (or, owner-only, exactly `number`, for importing an \
+                existing credit note — any number not already used) and can never be edited or \
+                deleted. `lines` are GST-exclusive \
                 amounts to credit ({description, amountCents, gstFree}); omit them to credit the \
                 whole invoice (only while nothing has been credited yet). GST is added at the \
                 invoice's own rate. The credit can't exceed what's left uncredited; it reduces \
@@ -742,6 +858,12 @@ pub fn catalogue() -> Vec<Value> {
                     "invoiceId": { "type": "string" },
                     "issueDate": { "type": "string", "description": "YYYY-MM-DD, not before the invoice's issue date." },
                     "reason": { "type": "string", "description": "Printed on the credit note." },
+                    "number": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Owner-only: use exactly this credit-note number instead of the next \
+                            in sequence. For importing existing credit notes; omit otherwise.",
+                    },
                     "lines": {
                         "type": "array",
                         "items": {
@@ -838,8 +960,9 @@ pub fn catalogue() -> Vec<Value> {
             "description": "The BAS figures for a FINANCE instance over `from`..`to` \
                 (YYYY-MM-DD, at most two years): G1 total sales and 1A GST on sales (from \
                 finalized invoices and credit notes by issue date for ACCRUAL, or from payments \
-                received for CASH, with GST apportioned per payment), and purchases and 1B GST \
-                on purchases from expenses by date. Figures are in cents. Informational — check \
+                received for CASH, with GST apportioned per payment), and G11 purchases (the \
+                business share of each purchase; vehicle trips aren't purchases) and 1B GST on \
+                purchases (only the claimable part) from expenses by date. Figures are in cents. Informational — check \
                 with an accountant before lodging.",
             "inputSchema": {
                 "type": "object",
@@ -859,8 +982,8 @@ pub fn catalogue() -> Vec<Value> {
             "name": "get_receivables",
             "title": "Aged receivables",
             "description": "What clients owe a FINANCE instance: the outstanding total, \
-                bucketed by days past due (current, 1-30, 31-60, 61-90, over 90), and every \
-                invoice with a balance, most overdue first.",
+                bucketed by days past due (current, 1-30, 31-60, 61-90, over 90), the total per \
+                client, and every invoice with a balance, most overdue first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -897,6 +1020,19 @@ pub fn catalogue() -> Vec<Value> {
 
 fn string_arg<'a>(arguments: &'a Value, name: &str) -> Option<&'a str> {
     arguments.get(name).and_then(Value::as_str)
+}
+
+/// An optional whole-number `number` argument (`finalize_invoice`,
+/// `issue_credit_note`).
+fn number_arg(arguments: &Value) -> Result<Option<i32>, ToolOutcome> {
+    match arguments.get("number") {
+        None | Some(Value::Null) => Ok(None),
+        Some(n) => n
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| ToolOutcome::error("number must be a whole number")),
+    }
 }
 
 /// A decimal quantity, accepted as a string (preferred) or a JSON number. Only
@@ -993,6 +1129,53 @@ where
                 }
             }
         }
+        "list_clients" => {
+            let Some(instance_id) = string_arg(arguments, "instanceId") else {
+                return Some(missing_argument("instanceId"));
+            };
+            let doc = format!(
+                "query McpClients($instanceId: ID!, $archived: Boolean!) {{ \
+                 clients(instanceId: $instanceId, includeArchived: $archived) {{ {CLIENT_FIELDS} }} }}"
+            );
+            rename(
+                ctx.run(
+                    &doc,
+                    json!({
+                        "instanceId": instance_id,
+                        "archived": arguments.get("includeArchived").and_then(Value::as_bool).unwrap_or(false),
+                    }),
+                )
+                .await,
+                "clients",
+                "clients",
+            )
+        }
+        "create_client" => {
+            let (Some(instance_id), Some(client_name)) = (
+                string_arg(arguments, "instanceId"),
+                string_arg(arguments, "name"),
+            ) else {
+                return Some(missing_argument("instanceId/name"));
+            };
+            let doc = format!(
+                "mutation McpCreateClient($instanceId: ID!, $input: ClientInput!) {{ \
+                 createClient(instanceId: $instanceId, input: $input) {{ {CLIENT_FIELDS} }} }}"
+            );
+            let input = json!({
+                "name": client_name,
+                "abn": string_arg(arguments, "abn"),
+                "address": string_arg(arguments, "address"),
+                "email": string_arg(arguments, "email"),
+                "paymentTermsDays": arguments.get("paymentTermsDays").and_then(Value::as_i64),
+            });
+            rename(
+                ctx.run(&doc, json!({ "instanceId": instance_id, "input": input }))
+                    .await,
+                "createClient",
+                "client",
+            )
+        }
+        "update_client" => update_client(ctx, arguments).await,
         "list_projects" => list_projects(ctx, arguments).await,
         "create_project" => create_project(ctx, arguments).await,
         "update_project" => update_project(ctx, arguments).await,
@@ -1073,16 +1256,45 @@ where
                 return Some(missing_argument("projectId/itemIds"));
             };
             let doc = format!(
-                "mutation McpCreateInvoice($projectId: ID!, $itemIds: [ID!]!) {{ \
-                 createInvoice(projectId: $projectId, itemIds: $itemIds) {{ {INVOICE_DETAIL_FIELDS} }} }}"
+                "mutation McpCreateInvoice($projectId: ID!, $itemIds: [ID!]!, $reference: String, \
+                 $notes: String) {{ createInvoice(projectId: $projectId, itemIds: $itemIds, \
+                 reference: $reference, notes: $notes) {{ {INVOICE_DETAIL_FIELDS} }} }}"
             );
             rename(
                 ctx.run(
                     &doc,
-                    json!({ "projectId": project_id, "itemIds": item_ids }),
+                    json!({
+                        "projectId": project_id,
+                        "itemIds": item_ids,
+                        "reference": string_arg(arguments, "reference"),
+                        "notes": string_arg(arguments, "notes"),
+                    }),
                 )
                 .await,
                 "createInvoice",
+                "invoice",
+            )
+        }
+        "update_invoice_details" => {
+            let Some(invoice_id) = string_arg(arguments, "invoiceId") else {
+                return Some(missing_argument("invoiceId"));
+            };
+            let doc = format!(
+                "mutation McpInvoiceDetails($id: ID!, $reference: String, $notes: String) {{ \
+                 updateInvoiceDetails(invoiceId: $id, reference: $reference, notes: $notes) \
+                 {{ {INVOICE_DETAIL_FIELDS} }} }}"
+            );
+            rename(
+                ctx.run(
+                    &doc,
+                    json!({
+                        "id": invoice_id,
+                        "reference": string_arg(arguments, "reference"),
+                        "notes": string_arg(arguments, "notes"),
+                    }),
+                )
+                .await,
+                "updateInvoiceDetails",
                 "invoice",
             )
         }
@@ -1133,12 +1345,9 @@ where
             ) else {
                 return Some(missing_argument("invoiceId/issueDate"));
             };
-            let number = match arguments.get("number") {
-                None | Some(Value::Null) => None,
-                Some(n) => match n.as_i64().and_then(|n| i32::try_from(n).ok()) {
-                    Some(n) => Some(n),
-                    None => return Some(ToolOutcome::error("number must be a whole number")),
-                },
+            let number = match number_arg(arguments) {
+                Ok(n) => n,
+                Err(e) => return Some(e),
             };
             let doc = format!(
                 "mutation McpFinalize($id: ID!, $date: String!, $number: Int, $due: String) {{ \
@@ -1275,7 +1484,12 @@ where
                  issueCreditNote(invoiceId: $id, input: $input) {{ {CREDIT_NOTE_FIELDS} }} }}"
             );
             let lines = arguments.get("lines").filter(|l| l.is_array()).cloned();
-            let input = json!({ "issueDate": date, "reason": reason, "lines": lines });
+            let number = match number_arg(arguments) {
+                Ok(n) => n,
+                Err(e) => return Some(e),
+            };
+            let input =
+                json!({ "issueDate": date, "reason": reason, "lines": lines, "number": number });
             rename(
                 ctx.run(&doc, json!({ "id": id, "input": input })).await,
                 "issueCreditNote",
@@ -1387,8 +1601,9 @@ where
                     "query McpReceivables($i: ID!, $brandId: ID) { \
                      receivables(instanceId: $i, brandId: $brandId) { asOf currency \
                      totalCents currentCents days1To30Cents days31To60Cents days61To90Cents \
-                     daysOver90Cents invoices { id displayNumber issueDate dueDate daysOverdue \
-                     totalCents balanceCents project { id name clientName } } } }",
+                     daysOver90Cents byClient { client { id name } outstandingCents \
+                     overdueCents invoiceCount } invoices { id displayNumber issueDate dueDate \
+                     daysOverdue totalCents balanceCents project { id name client { name } } } } }",
                     json!({ "i": instance_id, "brandId": string_arg(arguments, "brandId") }),
                 )
                 .await,
@@ -1454,25 +1669,21 @@ async fn create_project<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolO
 where
     A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
-    let (Some(instance_id), Some(name), Some(client_name)) = (
+    let (Some(instance_id), Some(name), Some(client_id)) = (
         string_arg(arguments, "instanceId"),
         string_arg(arguments, "name"),
-        string_arg(arguments, "clientName"),
+        string_arg(arguments, "clientId"),
     ) else {
-        return missing_argument("instanceId/name/clientName");
+        return missing_argument("instanceId/name/clientId");
     };
     let doc = format!(
         "mutation McpCreateProject($instanceId: ID!, $input: CreateProjectInput!) {{ \
          createProject(instanceId: $instanceId, input: $input) {{ {PROJECT_FIELDS} }} }}"
     );
     let input = json!({
+        "clientId": client_id,
         "name": name,
-        "clientName": client_name,
-        "clientAbn": string_arg(arguments, "clientAbn"),
-        "clientAddress": string_arg(arguments, "clientAddress"),
-        "clientEmail": string_arg(arguments, "clientEmail"),
         "reference": string_arg(arguments, "reference"),
-        "paymentTermsDays": arguments.get("paymentTermsDays").and_then(Value::as_i64),
         "defaultUnitPriceCents": arguments.get("defaultUnitPriceCents").and_then(Value::as_i64),
         "brandId": string_arg(arguments, "brandId"),
     });
@@ -1520,12 +1731,10 @@ where
     };
     let input = json!({
         "name": arguments.get("name").and_then(Value::as_str).map(Value::from).unwrap_or_else(|| current["name"].clone()),
-        "clientName": arguments.get("clientName").and_then(Value::as_str).map(Value::from).unwrap_or_else(|| current["clientName"].clone()),
-        "clientAbn": pick("clientAbn"),
-        "clientAddress": pick("clientAddress"),
+        "clientId": string_arg(arguments, "clientId")
+            .map(Value::from)
+            .unwrap_or_else(|| current["client"]["id"].clone()),
         "reference": pick("reference"),
-        "clientEmail": pick("clientEmail"),
-        "paymentTermsDays": pick_number("paymentTermsDays"),
         "defaultUnitPriceCents": pick_number("defaultUnitPriceCents"),
         "brandId": string_arg(arguments, "brandId")
             .map(Value::from)
@@ -1541,6 +1750,74 @@ where
         "updateProject",
         "project",
     )
+}
+
+/// `updateClient` is a full replace — read, merge, write, like
+/// [`update_project`].
+async fn update_client<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
+where
+    A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
+{
+    let Some(id) = string_arg(arguments, "id") else {
+        return missing_argument("id");
+    };
+    let read = format!("query McpClient($id: ID!) {{ client(id: $id) {{ {CLIENT_FIELDS} }} }}");
+    let current = match ctx.run(&read, json!({ "id": id })).await {
+        Err(e) => return ToolOutcome::Error(e),
+        Ok(data) if data["client"].is_null() => {
+            return ToolOutcome::error(
+                "Client not found (or you are not a member of its instance)",
+            );
+        }
+        Ok(data) => data["client"].clone(),
+    };
+    let pick = |field: &str| -> Value {
+        match arguments.get(field).and_then(Value::as_str) {
+            Some("") => Value::Null,
+            Some(s) => json!(s),
+            None => current[field].clone(),
+        }
+    };
+    let input = json!({
+        "name": string_arg(arguments, "name").map(Value::from).unwrap_or_else(|| current["name"].clone()),
+        "abn": pick("abn"),
+        "address": pick("address"),
+        "email": pick("email"),
+        "paymentTermsDays": match arguments.get("paymentTermsDays") {
+            Some(v) if v.is_null() || v.is_i64() => v.clone(),
+            _ => current["paymentTermsDays"].clone(),
+        },
+    });
+    let archived = arguments
+        .get("archived")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| current["archived"].as_bool().unwrap_or(false));
+    let doc = format!(
+        "mutation McpUpdateClient($id: ID!, $input: ClientInput!, $archived: Boolean!) {{ \
+         updateClient(id: $id, input: $input, archived: $archived) {{ {CLIENT_FIELDS} }} }}"
+    );
+    rename(
+        ctx.run(
+            &doc,
+            json!({ "id": id, "input": input, "archived": archived }),
+        )
+        .await,
+        "updateClient",
+        "client",
+    )
+}
+
+/// `BillableItemInput` from a tool's arguments; the server validates it.
+fn item_input(arguments: &Value, quantity: String) -> Value {
+    json!({
+        "kind": string_arg(arguments, "kind").unwrap_or("CHARGE"),
+        "date": string_arg(arguments, "date"),
+        "description": string_arg(arguments, "description"),
+        "quantity": quantity,
+        "unit": string_arg(arguments, "unit"),
+        "unitPriceCents": arguments.get("unitPriceCents").and_then(Value::as_i64),
+        "gstFree": arguments.get("gstFree").and_then(Value::as_bool).unwrap_or(false),
+    })
 }
 
 async fn list_items<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutcome
@@ -1577,7 +1854,7 @@ async fn create_item<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutc
 where
     A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
-    let (Some(project_id), Some(date), Some(description), Some(quantity)) = (
+    let (Some(project_id), Some(_), Some(_), Some(quantity)) = (
         string_arg(arguments, "projectId"),
         string_arg(arguments, "date"),
         string_arg(arguments, "description"),
@@ -1585,15 +1862,11 @@ where
     ) else {
         return missing_argument("projectId/date/description/quantity");
     };
-    let price = arguments.get("unitPriceCents").and_then(Value::as_i64);
     let doc = format!(
         "mutation McpCreateItem($projectId: ID!, $input: BillableItemInput!) {{ \
          createBillableItem(projectId: $projectId, input: $input) {{ {ITEM_FIELDS} }} }}"
     );
-    let input = json!({
-        "date": date, "description": description, "quantity": quantity, "unitPriceCents": price,
-        "gstFree": arguments.get("gstFree").and_then(Value::as_bool).unwrap_or(false),
-    });
+    let input = item_input(arguments, quantity);
     rename(
         ctx.run(&doc, json!({ "projectId": project_id, "input": input }))
             .await,
@@ -1606,7 +1879,7 @@ async fn update_item<A>(ctx: &ToolContext<'_, A>, arguments: &Value) -> ToolOutc
 where
     A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static,
 {
-    let (Some(id), Some(date), Some(description), Some(quantity)) = (
+    let (Some(id), Some(_), Some(_), Some(quantity)) = (
         string_arg(arguments, "id"),
         string_arg(arguments, "date"),
         string_arg(arguments, "description"),
@@ -1614,15 +1887,11 @@ where
     ) else {
         return missing_argument("id/date/description/quantity");
     };
-    let price = arguments.get("unitPriceCents").and_then(Value::as_i64);
     let doc = format!(
         "mutation McpUpdateItem($id: ID!, $input: BillableItemInput!) {{ \
          updateBillableItem(id: $id, input: $input) {{ {ITEM_FIELDS} }} }}"
     );
-    let input = json!({
-        "date": date, "description": description, "quantity": quantity, "unitPriceCents": price,
-        "gstFree": arguments.get("gstFree").and_then(Value::as_bool).unwrap_or(false),
-    });
+    let input = item_input(arguments, quantity);
     rename(
         ctx.run(&doc, json!({ "id": id, "input": input })).await,
         "updateBillableItem",
@@ -1673,12 +1942,15 @@ fn expense_schema() -> Value {
             "supplier": { "type": ["string", "null"], "description": "Null for a vehicle trip." },
             "amountCents": { "type": "integer", "description": "GST-inclusive cents paid; for a trip, distance x rate." },
             "gstCents": { "type": ["integer", "null"], "description": "GST included in amountCents; null when GST-free or a trip." },
+            "businessUsePercent": { "type": "integer", "description": "The share that was for the business, 1-100." },
+            "gstNotClaimable": { "type": "boolean" },
+            "claimableGstCents": { "type": "integer", "description": "The GST the GST report claims for it." },
             "distanceKm": { "type": ["string", "null"], "description": "A trip's km, e.g. \"12.5\"; null for a purchase." },
             "rateCentsPerKm": { "type": ["integer", "null"], "description": "The ATO rate the trip was claimed at." },
             "project": { "type": ["object", "null"], "properties": { "id": { "type": "string" }, "name": { "type": "string" } } },
             "brand": { "type": "object", "description": "The brand it counts toward." },
             "rebilledItem": { "type": ["object", "null"], "description": "The billable item rebill_expense made from it." },
-            "receipt": { "type": ["object", "null"], "description": "The uploaded receipt's filename/contentType/size." },
+            "receipts": { "type": "array", "description": "Uploaded receipt files (id, filename, contentType, size, uploadedAt)." },
         },
     })
 }
@@ -1719,6 +1991,8 @@ fn expense_input(arguments: &Value) -> Value {
         "supplier": string_arg(arguments, "supplier"),
         "amountCents": arguments.get("amountCents").and_then(Value::as_i64),
         "gstCents": arguments.get("gstCents").and_then(Value::as_i64),
+        "businessUsePercent": arguments.get("businessUsePercent").and_then(Value::as_i64),
+        "gstNotClaimable": arguments.get("gstNotClaimable").and_then(Value::as_bool).unwrap_or(false),
         "distanceKm": distance_km,
     })
 }

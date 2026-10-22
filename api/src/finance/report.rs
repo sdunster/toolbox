@@ -5,7 +5,8 @@
 //! - [`gst_summary`]: the figures a BAS asks for (G1 total sales, 1A GST on
 //!   sales, 1B GST on purchases) over a date range, on a cash or accrual
 //!   basis.
-//! - [`aging`]: unpaid invoices bucketed by how far past due they are.
+//! - [`aging`]: unpaid invoices bucketed by how far past due they are, and
+//!   [`balances_by_client`]: the same balances totalled per client.
 //! - [`project_financials`]: what one project has invoiced, been paid,
 //!   and cost.
 //!
@@ -14,7 +15,6 @@
 use chrono::NaiveDate;
 
 use crate::db;
-use crate::finance::money;
 
 /// Which date makes a sale count in a period.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,14 +32,17 @@ pub struct GstSummary {
     pub sales_cents: i64,
     /// 1A: GST on those sales.
     pub gst_on_sales_cents: i64,
-    /// Every expense in the period, GST-inclusive (vehicle trips included —
-    /// they carry no GST).
+    /// G11: the business share of every purchase in the period,
+    /// GST-inclusive. Vehicle trips are left out: a cents-per-km claim is an
+    /// income-tax deduction, not something bought.
     pub purchases_cents: i64,
-    /// 1B: GST included in those expenses.
+    /// 1B: the GST in those purchases that can be claimed back — none where
+    /// it's marked not claimable, and only the business share otherwise.
     pub gst_on_purchases_cents: i64,
     pub invoice_count: usize,
     pub credit_note_count: usize,
     pub payment_count: usize,
+    /// Purchases counted in `purchases_cents`.
     pub expense_count: usize,
 }
 
@@ -133,10 +136,10 @@ pub fn gst_summary(
     }
     for e in expenses
         .iter()
-        .filter(|e| in_range(&e.fields.date, from, to))
+        .filter(|e| !e.is_vehicle_trip() && in_range(&e.fields.date, from, to))
     {
-        out.purchases_cents += e.amount_cents();
-        out.gst_on_purchases_cents += e.gst_cents();
+        out.purchases_cents += e.business_total_cents();
+        out.gst_on_purchases_cents += e.claimable_gst_cents();
         out.expense_count += 1;
     }
     out
@@ -208,6 +211,51 @@ pub fn aging<'a>(invoices: &'a [db::Invoice], today: &str) -> (Aging, Vec<&'a db
     (out, outstanding)
 }
 
+/// What one client owes, across every project of theirs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientBalance {
+    pub client_id: String,
+    pub outstanding_cents: i64,
+    /// The part of `outstanding_cents` past its due date.
+    pub overdue_cents: i64,
+    pub invoice_count: usize,
+}
+
+/// Total the outstanding invoices [`aging`] returns per client, largest
+/// balance first. `client_of` maps a project id to its client's id; an
+/// invoice whose project it doesn't know is left out.
+pub fn balances_by_client(
+    outstanding: &[&db::Invoice],
+    client_of: &std::collections::HashMap<String, String>,
+    today: &str,
+) -> Vec<ClientBalance> {
+    let mut by_client: std::collections::BTreeMap<&str, ClientBalance> = Default::default();
+    for inv in outstanding {
+        let Some(client_id) = client_of.get(&inv.project_id) else {
+            continue;
+        };
+        let entry = by_client
+            .entry(client_id.as_str())
+            .or_insert_with(|| ClientBalance {
+                client_id: client_id.clone(),
+                ..Default::default()
+            });
+        let balance = inv.balance_cents();
+        entry.outstanding_cents += balance;
+        if inv.is_overdue(today) {
+            entry.overdue_cents += balance;
+        }
+        entry.invoice_count += 1;
+    }
+    let mut out: Vec<ClientBalance> = by_client.into_values().collect();
+    out.sort_by(|a, b| {
+        b.outstanding_cents
+            .cmp(&a.outstanding_cents)
+            .then_with(|| a.client_id.cmp(&b.client_id))
+    });
+    out
+}
+
 /// One project's money, all GST-exclusive except where named.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectFinancials {
@@ -246,7 +294,7 @@ pub fn project_financials(
     out.expenses_cents = expenses.iter().map(db::Expense::amount_ex_gst_cents).sum();
     out.unbilled_cents = unbilled_items
         .iter()
-        .map(|i| money::line_amount_cents(i.quantity_hundredths, i.unit_price_cents))
+        .map(db::BillableItem::amount_cents)
         .sum();
     out.profit_cents = out.invoiced_cents - out.expenses_cents;
     out
@@ -267,13 +315,17 @@ mod tests {
             created_by_user_id: "u".into(),
             created_at: 0,
             updated_at: 0,
+            list_key: db::issued_list_key(issue, 1),
+            reference: None,
+            notes: None,
             number: Some(1),
+            display_number: Some("001".into()),
             issue_date: Some(issue.into()),
             snapshot: None,
             total_cents: Some(total),
             finalized_at: None,
             finalized_by_user_id: None,
-            paid_date: None,
+            settled_date: None,
             pdf_s3_key: None,
             due_date: Some(due.into()),
             gst_cents: Some(gst),
@@ -304,7 +356,9 @@ mod tests {
             invoice_id: "inv".into(),
             project_id: "p".into(),
             number: 1,
+            display_number: "CN-001".into(),
             issue_date: issue.into(),
+            list_key: db::issued_list_key(issue, 1),
             reason: "r".into(),
             snapshot: "{}".into(),
             subtotal_cents: total - gst,
@@ -331,12 +385,14 @@ mod tests {
                 description: None,
                 detail: db::ExpenseDetail::Purchase {
                     supplier: "S".into(),
-                    amount_cents: amount,
+                    total_cents: amount,
                     gst_cents: gst,
+                    business_use_percent: None,
+                    gst_not_claimable: false,
                 },
             },
             billable_item_id: None,
-            receipt: None,
+            receipts: vec![],
             created_by_user_id: "u".into(),
             created_at: 0,
             updated_at: 0,
@@ -437,5 +493,84 @@ mod tests {
         assert_eq!(apportion(5_500, 1_000, 11_000), 500);
         assert_eq!(apportion(1, 1, 2), 1);
         assert_eq!(apportion(100, 10, 0), 0);
+    }
+
+    #[test]
+    fn purchases_count_their_business_share_and_claimable_gst_only() {
+        let mut half = purchase("2026-07-10", 11_000, Some(1_000));
+        if let db::ExpenseDetail::Purchase {
+            business_use_percent,
+            ..
+        } = &mut half.fields.detail
+        {
+            *business_use_percent = Some(50);
+        }
+        let mut lunch = purchase("2026-07-11", 2_200, Some(200));
+        lunch.fields.category = db::ExpenseCategory::MealsEntertainment;
+        if let db::ExpenseDetail::Purchase {
+            gst_not_claimable, ..
+        } = &mut lunch.fields.detail
+        {
+            *gst_not_claimable = true;
+        }
+        let trip = db::Expense {
+            fields: db::ExpenseFields {
+                category: db::ExpenseCategory::VehicleKm,
+                detail: db::ExpenseDetail::VehicleKm {
+                    distance_tenths_km: 1_000,
+                    rate_cents_per_km: 88,
+                },
+                ..purchase("2026-07-12", 0, None).fields
+            },
+            ..purchase("2026-07-12", 0, None)
+        };
+        let s = gst_summary(
+            Basis::Accrual,
+            "2026-07-01",
+            "2026-09-30",
+            &[],
+            &[],
+            &[half, lunch, trip],
+        );
+        assert_eq!(s.purchases_cents, 5_500 + 2_200);
+        assert_eq!(s.gst_on_purchases_cents, 500);
+        assert_eq!(s.expense_count, 2);
+    }
+
+    #[test]
+    fn balances_total_per_client_largest_first() {
+        let mut a1 = invoice("2026-07-01", "2026-07-15", 1_000, 0);
+        a1.project_id = "pa".into();
+        let mut a2 = invoice("2026-08-01", "2026-09-15", 2_000, 0);
+        a2.project_id = "pa2".into();
+        let mut b = invoice("2026-07-01", "2026-07-15", 5_000, 0);
+        b.project_id = "pb".into();
+        let mut unknown = invoice("2026-07-01", "2026-07-15", 9_000, 0);
+        unknown.project_id = "gone".into();
+        let client_of: std::collections::HashMap<String, String> = [
+            ("pa".to_string(), "ca".to_string()),
+            ("pa2".to_string(), "ca".to_string()),
+            ("pb".to_string(), "cb".to_string()),
+        ]
+        .into();
+        let outstanding = [&a1, &a2, &b, &unknown];
+        let balances = balances_by_client(&outstanding, &client_of, "2026-08-10");
+        assert_eq!(
+            balances,
+            vec![
+                ClientBalance {
+                    client_id: "cb".into(),
+                    outstanding_cents: 5_000,
+                    overdue_cents: 5_000,
+                    invoice_count: 1,
+                },
+                ClientBalance {
+                    client_id: "ca".into(),
+                    outstanding_cents: 3_000,
+                    overdue_cents: 1_000,
+                    invoice_count: 2,
+                },
+            ]
+        );
     }
 }

@@ -471,26 +471,34 @@ fn draw_table_row(
     }
 
     let first_line_y = y - ROW_V_PAD / 2.0 - BODY_FONT_SIZE * 0.36;
-    draw_right(
-        layer,
-        ctx.metrics,
-        &ctx.fonts.regular,
-        false,
-        &line.quantity,
-        BODY_FONT_SIZE,
-        COL_QTY_X1 - CELL_PAD,
-        first_line_y,
-    );
-    draw_right(
-        layer,
-        ctx.metrics,
-        &ctx.fonts.regular,
-        false,
-        &money::format_cents(line.unit_price_cents),
-        BODY_FONT_SIZE,
-        COL_PRICE_X1 - CELL_PAD,
-        first_line_y,
-    );
+    // A discount prints its amount only: its quantity (always 1) and unit
+    // price say nothing the amount doesn't.
+    if !line.discount {
+        let quantity = match line.unit.as_deref() {
+            Some(unit) => format!("{} {unit}", line.quantity),
+            None => line.quantity.clone(),
+        };
+        draw_right(
+            layer,
+            ctx.metrics,
+            &ctx.fonts.regular,
+            false,
+            &quantity,
+            BODY_FONT_SIZE,
+            COL_QTY_X1 - CELL_PAD,
+            first_line_y,
+        );
+        draw_right(
+            layer,
+            ctx.metrics,
+            &ctx.fonts.regular,
+            false,
+            &money::format_cents(line.unit_price_cents),
+            BODY_FONT_SIZE,
+            COL_PRICE_X1 - CELL_PAD,
+            first_line_y,
+        );
+    }
     draw_right(
         layer,
         ctx.metrics,
@@ -790,12 +798,13 @@ fn draw_totals(
     y
 }
 
-/// Draw the "No GST has been charged." note (when applicable) and the
-/// payment-details block, returning the final y. `payment_details` is
-/// word-wrapped to the full content width ([`PAYMENT_CONTENT_WIDTH`]) and
-/// then drawn line by line through the same bottom-margin-aware cursor as
-/// everything else, so a multi-thousand-character payment block spans as
-/// many extra pages as it needs rather than running off the bottom of one.
+/// Draw the "No GST has been charged." note (when applicable), the
+/// invoice's own notes, and the payment-details block, returning the final
+/// y. The notes and `payment_details` are word-wrapped to the full content
+/// width ([`PAYMENT_CONTENT_WIDTH`]) and then drawn line by line through the
+/// same bottom-margin-aware cursor as everything else, so a
+/// multi-thousand-character block spans as many extra pages as it needs
+/// rather than running off the bottom of one.
 fn draw_notes_and_payment(
     doc: &PdfDocumentReference,
     layer: &mut PdfLayerReference,
@@ -805,7 +814,7 @@ fn draw_notes_and_payment(
 ) -> f32 {
     let mut y = y;
     layer.set_fill_color(black());
-    if snap.no_gst_note {
+    if !snap.gst_registered {
         y -= 8.0;
         if y - COLUMN_LINE_HEIGHT < BOTTOM_MARGIN {
             let (new_layer, new_y) = add_page(doc);
@@ -823,14 +832,10 @@ fn draw_notes_and_payment(
         );
         y -= COLUMN_LINE_HEIGHT;
     }
-    if let Some(details) = snap.payment_details.as_deref().filter(|s| !s.is_empty()) {
+    let blocks = [snap.notes.as_deref(), snap.payment_details.as_deref()];
+    for block in blocks.into_iter().flatten().filter(|s| !s.is_empty()) {
         y -= 12.0;
-        for line in wrap_text_lines(
-            ctx.metrics,
-            details,
-            PAYMENT_CONTENT_WIDTH,
-            PAYMENT_FONT_SIZE,
-        ) {
+        for line in wrap_text_lines(ctx.metrics, block, PAYMENT_CONTENT_WIDTH, PAYMENT_FONT_SIZE) {
             if y - PAYMENT_LINE_HEIGHT < BOTTOM_MARGIN {
                 let (new_layer, new_y) = add_page(doc);
                 *layer = new_layer;
@@ -1004,6 +1009,8 @@ mod tests {
             quantity_hundredths: qty_hundredths,
             unit_price_cents: price_cents,
             amount_cents: money::line_amount_cents(qty_hundredths, price_cents),
+            unit: None,
+            discount: false,
             gst_free: false,
         }
     }
@@ -1034,13 +1041,13 @@ mod tests {
             subtotal_cents,
             gst_cents,
             total_cents: subtotal_cents + gst_cents,
+            notes: None,
             payment_details: Some(
                 "Please make all payments to the below account details:\nBSB 000-000\nAcc 00000000"
                     .into(),
             ),
             due_date: Some("2026-09-02".into()),
             credit_note: None,
-            no_gst_note: !gst_registered,
         }
     }
 
@@ -1408,6 +1415,18 @@ mod tests {
             invoice_issue_date: "2026-08-19".into(),
             reason: "Work not completed".into(),
         });
+        let bytes = render_invoice_pdf(&snap).expect("renders");
+        assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn renders_a_discount_a_unit_and_notes() {
+        let mut hours = line("Labour", 250, 9_000);
+        hours.unit = Some("hrs".into());
+        let mut discount = line("Loyalty discount", 100, -2_000);
+        discount.discount = true;
+        let mut snap = base_snapshot(true, vec![hours, discount]);
+        snap.notes = Some("Thanks for your business.\nQuote PO 1234 when paying.".into());
         let bytes = render_invoice_pdf(&snap).expect("renders");
         assert!(bytes.starts_with(b"%PDF"));
     }

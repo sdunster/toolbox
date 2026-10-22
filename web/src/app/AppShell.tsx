@@ -33,6 +33,7 @@ const ADMIN_NAV_ITEM = { to: "/app/admin", label: "Admin" };
 // Finance instances get their own nav.
 const FINANCE_NAV_ITEMS = [
   { to: "/app/invoices", label: "Invoices" },
+  { to: "/app/clients", label: "Clients" },
   { to: "/app/projects", label: "Projects" },
   { to: "/app/billable-items", label: "Billable items" },
   { to: "/app/expenses", label: "Expenses" },

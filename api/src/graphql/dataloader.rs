@@ -20,7 +20,7 @@ use crate::app::{App, HasDb};
 use crate::db;
 use crate::db::Handler as _;
 
-use super::{InstanceId, InvoiceId, ProjectId, TicketDeliveriesKey, UserId};
+use super::{ClientId, InstanceId, InvoiceId, ProjectId, TicketDeliveriesKey, UserId};
 
 pub struct DatabaseLoader<A: App + HasDb + Send + Sync> {
     app: Arc<A>,
@@ -92,6 +92,28 @@ impl<A: App + HasDb + Send + Sync + 'static> Loader<ProjectId> for DatabaseLoade
             .app
             .db()
             .get_projects(&str_keys)
+            .await
+            .map_err(|e| Arc::new(anyhow!("DB error: {:?}", e)))?;
+        let map = zip(keys.iter().cloned(), recs)
+            .filter_map(|(key, rec)| rec.map(|r| (key, r)))
+            .collect();
+        Ok(map)
+    }
+}
+
+impl<A: App + HasDb + Send + Sync + 'static> Loader<ClientId> for DatabaseLoader<A> {
+    type Value = db::Client;
+    type Error = Arc<anyhow::Error>;
+
+    async fn load(
+        &self,
+        keys: &[ClientId],
+    ) -> std::result::Result<HashMap<ClientId, db::Client>, Arc<anyhow::Error>> {
+        let str_keys = keys.iter().map(|k| k.0.as_str()).collect::<Vec<&str>>();
+        let recs = self
+            .app
+            .db()
+            .get_clients(&str_keys)
             .await
             .map_err(|e| Arc::new(anyhow!("DB error: {:?}", e)))?;
         let map = zip(keys.iter().cloned(), recs)

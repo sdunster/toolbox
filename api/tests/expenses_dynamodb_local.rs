@@ -217,8 +217,9 @@ async fn setup(db: &dynamodb::Handler, label: &str) -> (String, String, String) 
         .create_project(
             &instance.id,
             &db::ProjectFields {
+                client_id: fictional_client(db, &instance.id, "Fictional Client Pty Ltd", None)
+                    .await,
                 name: "Fictional Job".into(),
-                client_name: "Fictional Client Pty Ltd".into(),
                 ..Default::default()
             },
         )
@@ -627,8 +628,14 @@ async fn a_foreign_or_archived_project_is_refused() {
             &project_id,
             db::ProjectUpdateShape::Fields {
                 fields: &db::ProjectFields {
+                    client_id: fictional_client(
+                        schema.app.db(),
+                        &instance_id,
+                        "Fictional Client Pty Ltd",
+                        None,
+                    )
+                    .await,
                     name: "Fictional Job".into(),
-                    client_name: "Fictional Client Pty Ltd".into(),
                     ..Default::default()
                 },
                 archived: true,
@@ -808,4 +815,24 @@ async fn field_rules_follow_the_category() {
             "expected {needle:?}: {response:?}"
         );
     }
+}
+
+/// A fictional client of `instance_id` for a project to bill; its id.
+async fn fictional_client(
+    db: &impl db::Handler,
+    instance_id: &str,
+    name: &str,
+    email: Option<&str>,
+) -> String {
+    db.create_client(
+        instance_id,
+        &db::ClientFields {
+            name: name.into(),
+            email: email.map(str::to_string),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("create_client")
+    .id
 }

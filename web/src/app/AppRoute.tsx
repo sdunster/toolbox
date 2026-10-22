@@ -11,6 +11,7 @@ import { TicketListPage } from "./tickets/TicketListPage";
 import { TicketThreadPage } from "./tickets/TicketThreadPage";
 import { BroadcastPage } from "./broadcast/BroadcastPage";
 import { ProjectListPage } from "./finance/ProjectListPage";
+import { ClientListPage } from "./finance/ClientListPage";
 import { ProjectDetailPage } from "./finance/ProjectDetailPage";
 import { BillableItemListPage } from "./finance/BillableItemListPage";
 import { ExpenseListPage } from "./finance/ExpenseListPage";
@@ -124,6 +125,7 @@ export default function AppRoute() {
           <Route path="broadcast" element={<BroadcastPage />} />
           <Route path="invoices" element={<InvoiceListPage />} />
           <Route path="invoices/:id" element={<InvoiceDetailPage />} />
+          <Route path="clients" element={<ClientListPage />} />
           <Route path="projects" element={<ProjectListPage />} />
           <Route path="projects/:id" element={<ProjectDetailPage />} />
           <Route path="billable-items" element={<BillableItemListPage />} />

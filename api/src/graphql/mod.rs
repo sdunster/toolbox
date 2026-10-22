@@ -50,6 +50,10 @@ pub struct InstanceId(pub async_graphql::ID);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProjectId(pub async_graphql::ID);
 
+/// `Project.client` — a project list resolves its client per row.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ClientId(pub async_graphql::ID);
+
 /// `BillableItem.status`/`BillableItem.invoice` — telling `DRAFT` from
 /// `INVOICED` (and resolving `invoice` itself) needs the invoice's current
 /// `status`, batched the same way.

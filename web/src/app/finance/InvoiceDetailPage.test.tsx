@@ -50,6 +50,8 @@ const item1 = {
   unitPriceCents: 15000,
   amountCents: 45000,
   gstFree: false,
+  kind: "CHARGE",
+  unit: null,
   status: "DRAFT",
   invoice: { __typename: "Invoice", id: "inv-1" },
   project: { __typename: "Project", id: "proj-1", name: "Website Redesign" },
@@ -88,20 +90,30 @@ function invoiceResponse(
           __typename: "Project",
           id: "proj-1",
           name: "Website Redesign",
-          clientEmail: "accounts@retail.example",
-          effectivePaymentTermsDays: 30,
+          reference: "Shopfront site",
+          client: {
+            __typename: "Client",
+            id: "client-1",
+            email: "accounts@retail.example",
+            effectivePaymentTermsDays: 30,
+          },
           instance: { __typename: "Instance", id: "inst-ledger" },
         },
         title: gstRegistered ? "Tax Invoice" : "Invoice",
         issueDate: overrides.issueDate ?? null,
         billTo,
         reference: "Shopfront site",
+        ownReference: null,
+        notes: null,
+        totalsProblem: null,
         seller,
         lines: items.map((item) => ({
           description: (item as typeof item1).description,
           quantity: (item as typeof item1).quantity,
           unitPriceCents: (item as typeof item1).unitPriceCents,
           amountCents: (item as typeof item1).amountCents,
+          unit: null,
+          discount: false,
           gstFree: false,
         })),
         subtotalCents,
@@ -197,6 +209,7 @@ describe("InvoiceDetailPage — draft", () => {
         issueDate: "2026-08-19",
         // The default follows the issue date: 30 days' terms.
         dueDate: "2026-09-18",
+        number: null,
       }),
     );
   });
@@ -392,7 +405,12 @@ describe("InvoiceDetailPage — finalized", () => {
     await waitFor(() =>
       expect(creditVariables).toEqual({
         invoiceId: "inv-1",
-        input: { issueDate: localToday(), reason: "Cancelled", lines: null },
+        input: {
+          issueDate: localToday(),
+          reason: "Cancelled",
+          lines: null,
+          number: null,
+        },
       }),
     );
   });

@@ -70,9 +70,28 @@ pub fn validate_description(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+/// Longest unit label (`hrs`, `m²`), in characters.
+pub const MAX_UNIT_LEN: usize = 20;
+
+/// Trim and length-check a billable item's unit; blank means none.
+pub fn validate_unit(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(unit) = raw.map(str::trim).filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    if unit.chars().count() > MAX_UNIT_LEN {
+        return Err(format!(
+            "Unit cannot be longer than {MAX_UNIT_LEN} characters"
+        ));
+    }
+    if unit.contains(['\n', '\r']) {
+        return Err("Unit must be on one line".to_string());
+    }
+    Ok(Some(unit.to_string()))
+}
+
 /// Range-check a unit price in cents: `0 ≤ p ≤` [`money::MAX_UNIT_PRICE_CENTS`].
-/// Zero is allowed (a no-charge line); negatives are not (discounts/credit
-/// lines are out of scope for v1).
+/// Zero is allowed (a no-charge line); negatives are not — a discount is a
+/// positive amount on a `discount` line, which counts it negative.
 pub fn validate_unit_price_cents(cents: i64) -> Result<i64, String> {
     if cents < 0 {
         return Err("Unit price cannot be negative".to_string());
@@ -247,5 +266,14 @@ mod tests {
         );
         assert!(validate_unit_price_cents(-1).is_err());
         assert!(validate_unit_price_cents(money::MAX_UNIT_PRICE_CENTS + 1).is_err());
+    }
+
+    #[test]
+    fn validate_unit_trims_and_bounds() {
+        assert_eq!(validate_unit(None), Ok(None));
+        assert_eq!(validate_unit(Some("  ")), Ok(None));
+        assert_eq!(validate_unit(Some(" hrs ")), Ok(Some("hrs".to_string())));
+        assert!(validate_unit(Some(&"x".repeat(MAX_UNIT_LEN + 1))).is_err());
+        assert!(validate_unit(Some("a\nb")).is_err());
     }
 }
