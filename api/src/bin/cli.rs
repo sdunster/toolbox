@@ -72,6 +72,38 @@ enum Object {
         #[command(subcommand)]
         cmd: SuppressionCmd,
     },
+    /// Finalized invoices (finance instances).
+    Invoice {
+        #[command(subcommand)]
+        cmd: DocumentCmd,
+    },
+    /// Issued credit notes (finance instances).
+    CreditNote {
+        #[command(subcommand)]
+        cmd: DocumentCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DocumentCmd {
+    /// Re-render cached PDFs from their frozen snapshots — after a change to
+    /// `finance::pdf` — and overwrite them in place at the same S3 key, so
+    /// the next download (or send) gets the new rendering. What the
+    /// document says can't change (it comes from the snapshot alone); a
+    /// copy already emailed to a client stays as it was. A document whose
+    /// PDF was never rendered is skipped: its first download renders it
+    /// with the current renderer anyway. Needs S3 (`MAIL_BUCKET`), except
+    /// against a local DynamoDB (`AWS_ENDPOINT_URL_DYNAMODB`), where it uses
+    /// `poem-local`'s mock storage directory (`MOCK_STORAGE_DIR`).
+    /// `--dry-run` renders everything but uploads nothing.
+    RegeneratePdf {
+        /// Document ids. Mutually exclusive with `--instance`.
+        #[arg(required_unless_present = "instance", conflicts_with = "instance")]
+        ids: Vec<String>,
+        /// Every cached PDF in this instance (id or slug).
+        #[arg(long)]
+        instance: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -771,6 +803,159 @@ async fn run_suppression(db: &impl Handler, cmd: SuppressionCmd, dry_run: bool) 
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DocKind {
+    Invoice,
+    CreditNote,
+}
+
+/// A document whose PDF `regenerate-pdf` may re-render: its label, its
+/// cached key (`None` = never rendered), and its frozen snapshot JSON.
+struct PdfDoc {
+    id: String,
+    label: String,
+    pdf_s3_key: Option<String>,
+    snapshot: Option<String>,
+}
+
+impl From<db::Invoice> for PdfDoc {
+    fn from(i: db::Invoice) -> Self {
+        let finalized = i.status == db::InvoiceStatus::Finalized;
+        Self {
+            label: format!(
+                "invoice {}",
+                i.display_number.as_deref().unwrap_or("(draft)")
+            ),
+            id: i.id,
+            pdf_s3_key: i.pdf_s3_key,
+            snapshot: i.snapshot.filter(|_| finalized),
+        }
+    }
+}
+
+impl From<db::CreditNote> for PdfDoc {
+    fn from(n: db::CreditNote) -> Self {
+        Self {
+            label: format!("credit note {}", n.display_number),
+            id: n.id,
+            pdf_s3_key: n.pdf_s3_key,
+            snapshot: Some(n.snapshot),
+        }
+    }
+}
+
+async fn load_documents(
+    db: &impl Handler,
+    kind: DocKind,
+    ids: &[String],
+    instance: Option<&str>,
+) -> Result<Vec<PdfDoc>> {
+    if let Some(instance) = instance {
+        let instance = db::resolve_instance_id(db, instance).await?;
+        return Ok(match kind {
+            DocKind::Invoice => db
+                .list_all_finalized_invoices(db::InvoiceScope::Instance(&instance))
+                .await?
+                .into_iter()
+                .map(PdfDoc::from)
+                .collect(),
+            DocKind::CreditNote => db
+                .list_all_credit_notes(db::CreditNoteScope::Instance(&instance))
+                .await?
+                .into_iter()
+                .map(PdfDoc::from)
+                .collect(),
+        });
+    }
+    let mut docs = Vec::with_capacity(ids.len());
+    for id in ids {
+        let doc = match kind {
+            DocKind::Invoice => db.get_invoice_consistent(id).await?.map(PdfDoc::from),
+            DocKind::CreditNote => db.get_credit_note_consistent(id).await?.map(PdfDoc::from),
+        };
+        let noun = match kind {
+            DocKind::Invoice => "invoice",
+            DocKind::CreditNote => "credit note",
+        };
+        docs.push(doc.ok_or_else(|| anyhow!("no {noun} with id {id}"))?);
+    }
+    Ok(docs)
+}
+
+async fn run_document(
+    db: &impl Handler,
+    kind: DocKind,
+    cmd: DocumentCmd,
+    dry_run: bool,
+) -> Result<()> {
+    match cmd {
+        DocumentCmd::RegeneratePdf { ids, instance } => {
+            let use_s3 = std::env::var("MAIL_BUCKET").is_ok_and(|b| !b.trim().is_empty());
+            // A real database with no bucket would "regenerate" into a local
+            // directory and leave S3 untouched — refuse instead.
+            if !use_s3 && std::env::var("AWS_ENDPOINT_URL_DYNAMODB").is_err() {
+                bail!("MAIL_BUCKET is required (the bucket the PDFs are cached in)");
+            }
+            let docs = load_documents(db, kind, &ids, instance.as_deref()).await?;
+            if use_s3 {
+                let storage = toolbox::s3storage::Storage::new().await?;
+                regenerate_pdfs(&storage, docs, dry_run).await
+            } else {
+                println!("MAIL_BUCKET is unset — using local mock storage");
+                let storage = toolbox::mockstorage::Storage::from_env();
+                regenerate_pdfs(&storage, docs, dry_run).await
+            }
+        }
+    }
+}
+
+/// Render each document's snapshot and overwrite its cached PDF at the key
+/// already on its row — no DB write, so the row (and the filename the
+/// download is served under) is untouched. Carries on past a failure and
+/// reports every one at the end.
+async fn regenerate_pdfs(
+    storage: &impl toolbox::storage::Handler,
+    docs: Vec<PdfDoc>,
+    dry_run: bool,
+) -> Result<()> {
+    let (mut done, mut skipped, mut failed) = (0, 0, 0);
+    for doc in docs {
+        let (Some(key), Some(snapshot)) = (&doc.pdf_s3_key, &doc.snapshot) else {
+            println!("skip {} ({}): no cached PDF", doc.label, doc.id);
+            skipped += 1;
+            continue;
+        };
+        let rendered = serde_json::from_str(snapshot)
+            .context("parsing snapshot")
+            .and_then(|s| toolbox::finance::pdf::render_invoice_pdf(&s));
+        let result = match rendered {
+            Ok(_) if dry_run => Ok(()),
+            Ok(bytes) => storage.put_bytes(key, &bytes, "application/pdf").await,
+            Err(e) => Err(e),
+        };
+        match result {
+            Ok(()) => {
+                let verb = if dry_run {
+                    "[dry-run] would write"
+                } else {
+                    "wrote"
+                };
+                println!("{verb} {} ({}): {key}", doc.label, doc.id);
+                done += 1;
+            }
+            Err(e) => {
+                eprintln!("FAILED {} ({}): {e:#}", doc.label, doc.id);
+                failed += 1;
+            }
+        }
+    }
+    println!("{done} regenerated, {skipped} skipped, {failed} failed");
+    if failed > 0 {
+        bail!("{failed} PDF(s) failed to regenerate");
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -795,5 +980,9 @@ async fn main() -> Result<()> {
         Object::Member { cmd } => run_member(&db, cmd, cli.dry_run).await,
         Object::Mail { cmd } => run_mail(db, cmd, cli.dry_run).await,
         Object::Suppression { cmd } => run_suppression(&db, cmd, cli.dry_run).await,
+        Object::Invoice { cmd } => run_document(&db, DocKind::Invoice, cmd, cli.dry_run).await,
+        Object::CreditNote { cmd } => {
+            run_document(&db, DocKind::CreditNote, cmd, cli.dry_run).await
+        }
     }
 }

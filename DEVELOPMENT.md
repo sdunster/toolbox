@@ -173,6 +173,18 @@ cargo run --bin cli -- address add --instance <instance_id> support@yourdomain.c
 cargo run --bin cli -- user set-superuser owner@yourdomain.com true
 ```
 
+After changing the invoice PDF renderer (`api/src/finance/pdf.rs`), already-downloaded PDFs stay
+cached as they were. Re-render them from their frozen snapshots, in place at the same S3 key (needs
+`MAIL_BUCKET`; `--dry-run` renders without uploading, which also proves every old snapshot still
+renders):
+
+```bash
+cargo run --bin cli -- invoice regenerate-pdf --instance <instance>   # or: <invoice_id>...
+cargo run --bin cli -- credit-note regenerate-pdf --instance <instance>
+```
+
+A PDF already emailed to a client is not recalled; only later downloads and sends get the new one.
+
 Against the local stack, export `local/local.env` first (`set -a && . ../local/local.env && set
 +a`, from `api/`) so the CLI points at DynamoDB Local instead of a real account — or just run `make
 local-seed`, which does the local-stack equivalent of this whole sequence for you, twice over, from

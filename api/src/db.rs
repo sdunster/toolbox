@@ -1349,7 +1349,8 @@ pub struct Invoice {
     /// downloaded. Set exactly once, by [`Handler::set_invoice_pdf_key`] —
     /// rendering is deterministic from the frozen `snapshot`, so a
     /// concurrent double-render just overwrites this with the same key and
-    /// identical bytes, never a real race.
+    /// identical bytes, never a real race. After a renderer change, `cli
+    /// invoice regenerate-pdf` re-renders the object at this key in place.
     pub pdf_s3_key: Option<String>,
     /// `YYYY-MM-DD`. Absent for a draft; set once, at finalization (from
     /// `finalizeInvoice`'s `dueDate`, else issue date + the project's or
