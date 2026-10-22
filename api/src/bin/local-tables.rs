@@ -252,7 +252,6 @@ const TABLES: &[Table] = &[
             Attr("id", S),
             Attr("instance_id", S),
             Attr("project_id", S),
-            Attr("created_at", N),
             Attr("list_key", S),
         ],
         gsis: &[
@@ -262,17 +261,6 @@ const TABLES: &[Table] = &[
                 Some("list_key"),
             ),
             all("project_id-list_key-index", "project_id", Some("list_key")),
-            // Superseded, kept in step with infra/dynamodb.tf until dropped.
-            all(
-                "instance_id-created_at-index",
-                "instance_id",
-                Some("created_at"),
-            ),
-            all(
-                "project_id-created_at-index",
-                "project_id",
-                Some("created_at"),
-            ),
         ],
         ttl: None,
     },
@@ -283,7 +271,6 @@ const TABLES: &[Table] = &[
             Attr("id", S),
             Attr("instance_id", S),
             Attr("invoice_id", S),
-            Attr("created_at", N),
             Attr("list_key", S),
         ],
         gsis: &[
@@ -293,17 +280,6 @@ const TABLES: &[Table] = &[
                 Some("list_key"),
             ),
             all("invoice_id-list_key-index", "invoice_id", Some("list_key")),
-            // Superseded, kept in step with infra/dynamodb.tf until dropped.
-            all(
-                "instance_id-created_at-index",
-                "instance_id",
-                Some("created_at"),
-            ),
-            all(
-                "invoice_id-created_at-index",
-                "invoice_id",
-                Some("created_at"),
-            ),
         ],
         ttl: None,
     },

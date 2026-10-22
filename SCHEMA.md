@@ -686,8 +686,7 @@ belongs rather than at the top: `{issue_date}#{number:010}` once finalized
 (`db::issued_list_key`), and `{created YYYY-MM-DD}#draft#{created_at:012}` for a draft
 (`db::draft_list_key`), rewritten by the finalize write. Both read newest first
 (`ScanIndexForward = false`), keyset-paginated with a `{list_key}:{id}` cursor (`list_key` holds no
-`:`). The old `*-created_at-index` GSIs are still defined in Terraform but nothing reads them; a
-follow-up drops them. `ALL`: the list's
+`:`). `ALL`: the list's
 DRAFT/UNPAID/PAID filter (below) runs as a `FilterExpression` over the projected rows, and
 `list_invoices` follows `list_billable_items`'s "no `Limit` on a filtered query, keep querying
 until the page is full or the index is exhausted" rule for the same reason.
@@ -815,8 +814,7 @@ send; never deleted.
 | `instance_id-list_key-index` | `instance_id` | `list_key` | ALL        | The instance-wide list; reports and CSV export |
 | `invoice_id-list_key-index`  | `invoice_id`  | `list_key` | ALL        | One invoice's credit notes (the invoice page)   |
 
-`list_key` is `{issue_date}#{number:010}`, as for a finalized invoice. The old
-`*-created_at-index` GSIs are unused and dropped in a follow-up.
+`list_key` is `{issue_date}#{number:010}`, as for a finalized invoice.
 
 **Non-obvious attributes:**
 
