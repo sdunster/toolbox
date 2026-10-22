@@ -5,12 +5,19 @@ import { Button } from "../../components/ui/Button";
 import { relayMutationErrorMessage } from "../../lib/relayMutationError";
 
 /**
- * A finalized invoice's "Download PDF" button. `downloadInvoicePdf` hands
- * back a presigned, `Content-Disposition: attachment` S3 URL — landing on it
- * in the same tab (rather than `window.open`) downloads the file without
- * leaving the page and without tripping a popup blocker.
+ * An invoice's "Download PDF" button. `downloadInvoicePdf` hands back a
+ * presigned, `Content-Disposition: attachment` S3 URL — landing on it in the
+ * same tab (rather than `window.open`) downloads the file without leaving the
+ * page and without tripping a popup blocker. On a draft (`draft`), the server
+ * renders the current content with "DRAFT" stamped across every page.
  */
-export function InvoiceDownloadButton({ invoiceId }: { invoiceId: string }) {
+export function InvoiceDownloadButton({
+  invoiceId,
+  draft = false,
+}: {
+  invoiceId: string;
+  draft?: boolean;
+}) {
   const [error, setError] = useState<string | null>(null);
   const [commit, isPending] = useMutation<InvoiceDownloadButtonMutation>(
     graphql`
@@ -35,7 +42,11 @@ export function InvoiceDownloadButton({ invoiceId }: { invoiceId: string }) {
   return (
     <div className="flex flex-col gap-2">
       <Button variant="secondary" disabled={isPending} onClick={download}>
-        {isPending ? "Preparing PDF…" : "Download PDF"}
+        {isPending
+          ? "Preparing PDF…"
+          : draft
+            ? "Download draft PDF"
+            : "Download PDF"}
       </Button>
       {error && (
         <p role="alert" className="text-sm text-red-600 dark:text-red-400">

@@ -460,8 +460,7 @@ local setup, and `SCHEMA.md` for the data model.
     `InstanceOwnerOrSuperuser`, not `Member`. Don't add any other superuser carve-out here without a
     matching, explicit reason — see the "Superuser boundary" entry above.
   - **The PDF is rendered from the frozen `snapshot`, nothing else.** `downloadInvoicePdf`
-    (`Member`, `NOT_FOUND` posture like every other invoice mutation, `CONFLICT` on a draft — there
-    is nothing frozen yet to print) parses `invoice.snapshot` and calls `finance::pdf::render_invoice_pdf`,
+    (`Member`, `NOT_FOUND` posture like every other invoice mutation) parses `invoice.snapshot` and calls `finance::pdf::render_invoice_pdf`,
     a pure function (`api/src/finance/pdf.rs`) that reads no project/instance state of its own —
     the same "can't diverge from what was frozen" guarantee finalization gives the web preview
     extends to the PDF. The rendered bytes are cached once, at
@@ -481,6 +480,14 @@ local setup, and `SCHEMA.md` for the data model.
     Font License 1.1 (`api/assets/fonts/OFL.txt`) — chosen because `printpdf` needs a real embedded
     TTF for Unicode text and both the crate and the font are pure Rust/no native deps, so the
     renderer builds standalone for `cargo lambda`.
+  - **A draft's PDF is watermarked "DRAFT" and never cached.** `downloadInvoicePdf` on a draft
+    renders the live snapshot (the same `build_snapshot` the preview shows, via
+    `query::draft_invoice_snapshot`) with `finance::pdf::render_draft_invoice_pdf`, which stamps
+    "DRAFT" diagonally across every page so a copy forwarded to a client can't pass for an issued
+    invoice. It is rendered afresh on every call, stored under `invoice-drafts/` (expired after a
+    day by `infra/s3_mail.tf`), downloads as `Invoice-DRAFT.pdf`, and writes nothing to the row —
+    `pdf_s3_key` stays a finalized invoice's alone. Never send or attach one: `sendInvoice` still
+    requires a finalized invoice.
 
 - **Expenses (`{prefix}_expense`): what a finance instance spends, never invoiced.** Optionally
   linked to one of the instance's projects (`project_id` omitted when unset, so the sparse

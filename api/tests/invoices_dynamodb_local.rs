@@ -1548,8 +1548,10 @@ async fn download_invoice_pdf_renders_caches_and_presigns_twice() {
     assert_eq!(after_second.pdf_s3_key, Some(key));
 }
 
+/// A draft downloads too: rendered fresh with the "DRAFT" watermark under
+/// `invoice-drafts/`, never cached on the row (the draft keeps changing).
 #[tokio::test]
-async fn download_invoice_pdf_rejects_a_draft() {
+async fn download_invoice_pdf_renders_a_watermarked_draft_without_caching() {
     let prefix = require_local_db!();
     let db = dynamodb::Handler::new(&prefix, false).await;
     let (instance_id, _owner_id, agent_id, project_id) = setup(&db, "pdfdraft").await;
@@ -1563,8 +1565,39 @@ async fn download_invoice_pdf_rejects_a_draft() {
         .unwrap()
         .to_string();
 
-    let attempt = download_invoice_pdf(&schema, &invoice_id, auth()).await;
-    assert_eq!(expect_error_code(&attempt), "CONFLICT");
+    let mut paths = Vec::new();
+    for _ in 0..2 {
+        let attempt = download_invoice_pdf(&schema, &invoice_id, auth()).await;
+        assert!(attempt.errors.is_empty(), "{:?}", attempt.errors);
+        let url = expect_data(&attempt, "downloadInvoicePdf")
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = url.strip_prefix("file://").expect("mock storage URL");
+        assert!(
+            path.contains(&format!("invoice-drafts/{instance_id}/{invoice_id}/"))
+                && path.ends_with("/Invoice-DRAFT.pdf"),
+            "unexpected draft key: {path}"
+        );
+        let bytes = std::fs::read(path).expect("stored draft PDF");
+        assert!(bytes.starts_with(b"%PDF"));
+        assert!(
+            bytes
+                .windows(b"(Watermark)".len())
+                .any(|w| w == b"(Watermark)"),
+            "expected the draft's watermark layer"
+        );
+        paths.push(path.to_string());
+    }
+    assert_ne!(paths[0], paths[1], "each draft download is a fresh render");
+
+    let after = db
+        .get_invoice_consistent(&invoice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.status, db::InvoiceStatus::Draft);
+    assert_eq!(after.pdf_s3_key, None);
 }
 
 #[tokio::test]

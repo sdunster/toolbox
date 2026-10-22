@@ -2491,33 +2491,43 @@ impl<A: App + HasDb + Send + Sync + 'static> Invoice<A> {
             }
             db::InvoiceStatus::Draft => {
                 let app = ctx.data_unchecked::<Arc<A>>();
-                let (instance, project, client) = load_invoice_parties(&**app, &self.rec).await?;
-                let items: Vec<db::BillableItem> = if self.rec.item_ids.is_empty() {
-                    vec![]
-                } else {
-                    app.db()
-                        .get_billable_items(&self.rec.item_ids)
-                        .await?
-                        .into_iter()
-                        .flatten()
-                        .collect()
-                };
-                Ok(finance::snapshot::build_snapshot(
-                    &finance::snapshot::SnapshotSource {
-                        instance: &instance,
-                        client: &client,
-                        project: &project,
-                        reference: self.rec.reference.as_deref(),
-                        notes: self.rec.notes.as_deref(),
-                        items: &items,
-                    },
-                    None,
-                    None,
-                    None,
-                ))
+                draft_invoice_snapshot(&**app, &self.rec).await
             }
         }
     }
+}
+
+/// A draft invoice's live snapshot (no number, issue or due date), built
+/// from its project, instance, client and current items — what the web
+/// preview shows and `downloadInvoicePdf` renders for a draft.
+pub(crate) async fn draft_invoice_snapshot<A: App + HasDb + Send + Sync>(
+    app: &A,
+    invoice: &db::Invoice,
+) -> Result<finance::snapshot::InvoiceSnapshot> {
+    let (instance, project, client) = load_invoice_parties(app, invoice).await?;
+    let items: Vec<db::BillableItem> = if invoice.item_ids.is_empty() {
+        vec![]
+    } else {
+        app.db()
+            .get_billable_items(&invoice.item_ids)
+            .await?
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    Ok(finance::snapshot::build_snapshot(
+        &finance::snapshot::SnapshotSource {
+            instance: &instance,
+            client: &client,
+            project: &project,
+            reference: invoice.reference.as_deref(),
+            notes: invoice.notes.as_deref(),
+            items: &items,
+        },
+        None,
+        None,
+        None,
+    ))
 }
 
 /// The instance, project and client an invoice is built from — what a

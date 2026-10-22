@@ -26,6 +26,10 @@
 //!   bucket, nothing expires this key: `infra/s3_mail.tf`'s lifecycle rule
 //!   deliberately excludes `invoices/` because a finalized invoice's PDF is
 //!   a permanent financial record, not transient mail.
+//! - `invoice-drafts/{instance_id}/{invoice_id}/{nanoid}/Invoice-DRAFT.pdf` —
+//!   a draft invoice's "DRAFT"-watermarked PDF, rendered afresh by each
+//!   `downloadInvoicePdf` on a draft and never cached; `infra/s3_mail.tf`
+//!   expires it after a day.
 //! - `credit-notes/{instance_id}/{credit_note_id}/Credit-Note-{displayNumber}.pdf` —
 //!   a credit note's PDF, cached the same way (`db::CreditNote.pdf_s3_key`).
 //! - `receipts/{instance_id}/{expense_id}/{nanoid}/{filename}` — an

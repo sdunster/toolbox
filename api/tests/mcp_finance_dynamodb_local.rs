@@ -2,7 +2,8 @@
 //! through the real schema and `mcp::handle_post` with real `mtoa_` tokens:
 //!
 //!   - the whole lifecycle: project -> billable items -> draft invoice -> finalize
-//!     (needs a business name; strictly final afterwards) -> paid -> PDF link;
+//!     (needs a business name; strictly final afterwards) -> paid -> PDF link,
+//!     with a draft's PDF link the watermarked review copy;
 //!   - draft editing (add/remove/delete) and `update_project`'s merge semantics,
 //!     including keeping a project's brand; `list_brands`;
 //!   - expenses: a purchase and a cents-per-km trip, update/delete, and the
@@ -161,11 +162,16 @@ async fn full_lifecycle_from_project_to_pdf() {
     assert_eq!(inv["status"], "DRAFT");
     assert!(inv["number"].is_null() && inv["displayNumber"].is_null());
     let inv_id = id(&inv);
+    // A draft's PDF is the watermarked review copy.
+    let draft_pdf = call_tool(&w.f, t, "get_invoice_pdf_url", json!({"invoiceId": inv_id}))
+        .await
+        .unwrap();
     assert!(
-        call_tool(&w.f, t, "get_invoice_pdf_url", json!({"invoiceId": inv_id}))
-            .await
-            .is_err(),
-        "no PDF for a draft"
+        draft_pdf["url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/Invoice-DRAFT.pdf"),
+        "{draft_pdf}"
     );
     let billed = call_tool(
         &w.f,

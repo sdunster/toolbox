@@ -2085,12 +2085,17 @@ type MutationRoot {
 	"""
 	sendInvoice(invoiceId: ID!, input: SendDocumentInput! = {to: [], cc: [], message: null}): Invoice!
 	"""
-	Download a finalized invoice's PDF: a presigned URL with
+	Download an invoice's PDF: a presigned URL with
 	`Content-Disposition: attachment; filename="Invoice-{displayNumber}.pdf"`
 	(`storage::Handler::presign_get_download`, filename sanitised there).
-	`CONFLICT` on a draft — finalization is what freezes the content a
-	PDF prints (CLAUDE.md's "Finance" house rule), so there's nothing
-	yet to render.
+	
+	A draft gets `Invoice-DRAFT.pdf` instead: its live content (what the
+	preview shows), rendered with "DRAFT" stamped across every page
+	(`finance::pdf::render_draft_invoice_pdf`) so a copy forwarded to a
+	client can't pass for an issued invoice. It's rendered afresh on
+	every call — a draft keeps changing — and stored under
+	`invoice-drafts/`, which the bucket expires after a day; nothing is
+	written to the invoice row.
 	
 	This is a mutation, not a query, because the *first* call for a
 	given invoice writes: it renders the frozen `snapshot` (the only input
