@@ -19,6 +19,13 @@
 #                                                   PDF is a permanent
 #                                                   financial record, not
 #                                                   transient mail.
+#   invoice-drafts/{instance_id}/{invoice_id}/{nanoid}/Invoice-DRAFT.pdf
+#                                                   a draft invoice's
+#                                                   watermarked PDF, rendered
+#                                                   afresh by every
+#                                                   downloadInvoicePdf on a
+#                                                   draft — throwaway,
+#                                                   expired below.
 #   credit-notes/{instance_id}/{credit_note_id}/Credit-Note-CN-{n}.pdf
 #                                                   the same, for a credit
 #                                                   note — also permanent.
@@ -73,6 +80,22 @@ resource "aws_s3_bucket_lifecycle_configuration" "mail" {
 
     filter {
       prefix = "pending/"
+    }
+
+    expiration {
+      days = 1
+    }
+  }
+
+  # invoice-drafts/ holds a draft invoice's watermarked PDF, needed only
+  # long enough for the presigned download (15 minutes) to be followed. The
+  # draft itself can always be rendered again.
+  rule {
+    id     = "expire-invoice-drafts"
+    status = "Enabled"
+
+    filter {
+      prefix = "invoice-drafts/"
     }
 
     expiration {

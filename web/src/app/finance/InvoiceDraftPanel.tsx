@@ -19,6 +19,7 @@ import { relayMutationErrorMessage } from "../../lib/relayMutationError";
 import { addDays, formatDate, localToday } from "../../lib/dates";
 import { formatCents } from "../../lib/money";
 import { BillableItemRow } from "./BillableItemRow";
+import { InvoiceDownloadButton } from "./InvoiceDownloadButton";
 
 // `billableItems` is a connection; a project could in principle have more
 // unbilled items than this, but an invoice takes at most 50 anyway
@@ -499,6 +500,7 @@ export function InvoiceDraftPanel({
             </Button>
           </>
         )}
+        <InvoiceDownloadButton invoiceId={data.id} draft />
         <Button
           onClick={() => setShowFinalize((v) => !v)}
           disabled={data.items.length === 0 || data.totalsProblem != null}

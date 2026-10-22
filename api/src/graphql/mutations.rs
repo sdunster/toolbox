@@ -38,7 +38,7 @@ use super::query::{
     FinanceSettingsInput, InboundAddressInfo, Instance, InstanceKindType, Invoice, MembershipInfo,
     MembershipRoleType, NotificationSettingsInput, PasskeyInfo, Project, SaveBroadcastDraftInput,
     SendBroadcastInput, Ticket, TicketMessage, TicketStatusType, UpdateProjectInput, User,
-    load_invoice_parties,
+    draft_invoice_snapshot, load_invoice_parties,
 };
 
 /// One code per address per this many seconds — cheap anti-spam for
@@ -849,6 +849,9 @@ fn invoice_pdf_filename(invoice: &db::Invoice) -> String {
     let display_number = invoice.display_number.as_deref().unwrap_or("unknown");
     crate::storage::sanitize_download_filename(&format!("Invoice-{display_number}.pdf"))
 }
+
+/// What a draft invoice's watermarked PDF downloads as — it has no number.
+const DRAFT_INVOICE_PDF_FILENAME: &str = "Invoice-DRAFT.pdf";
 
 /// `Credit-Note-CN-001.pdf`.
 fn credit_note_pdf_filename(note: &db::CreditNote) -> String {
@@ -5499,12 +5502,17 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
         }))
     }
 
-    /// Download a finalized invoice's PDF: a presigned URL with
+    /// Download an invoice's PDF: a presigned URL with
     /// `Content-Disposition: attachment; filename="Invoice-{displayNumber}.pdf"`
     /// (`storage::Handler::presign_get_download`, filename sanitised there).
-    /// `CONFLICT` on a draft — finalization is what freezes the content a
-    /// PDF prints (CLAUDE.md's "Finance" house rule), so there's nothing
-    /// yet to render.
+    ///
+    /// A draft gets `Invoice-DRAFT.pdf` instead: its live content (what the
+    /// preview shows), rendered with "DRAFT" stamped across every page
+    /// (`finance::pdf::render_draft_invoice_pdf`) so a copy forwarded to a
+    /// client can't pass for an issued invoice. It's rendered afresh on
+    /// every call — a draft keeps changing — and stored under
+    /// `invoice-drafts/`, which the bucket expires after a day; nothing is
+    /// written to the invoice row.
     ///
     /// This is a mutation, not a query, because the *first* call for a
     /// given invoice writes: it renders the frozen `snapshot` (the only input
@@ -5515,8 +5523,25 @@ impl<A: App + HasDb + HasMail + HasStorage + HasQueue + Send + Sync + 'static> M
     /// the same invoice — see `finance::pdf`'s doc comment.
     async fn download_invoice_pdf(&self, ctx: &Context<'_>, invoice_id: ID) -> Result<String> {
         let invoice = require_invoice_member(ctx, &*self.app, invoice_id.as_str()).await?;
-        if invoice.status != db::InvoiceStatus::Finalized {
-            return Err(ApiError::conflict("Only a finalized invoice can be downloaded").into());
+        if invoice.status == db::InvoiceStatus::Draft {
+            let snapshot = draft_invoice_snapshot(&*self.app, &invoice).await?;
+            let bytes = finance::pdf::render_draft_invoice_pdf(&snapshot)?;
+            let filename = DRAFT_INVOICE_PDF_FILENAME;
+            let key = format!(
+                "invoice-drafts/{}/{}/{}/{filename}",
+                invoice.instance_id,
+                invoice.id,
+                nanoid::nanoid!()
+            );
+            self.app
+                .storage()
+                .put_bytes(&key, &bytes, "application/pdf")
+                .await?;
+            return self
+                .app
+                .storage()
+                .presign_get_download(&key, filename)
+                .await;
         }
         let filename = invoice_pdf_filename(&invoice);
         let key = match invoice.pdf_s3_key.clone() {

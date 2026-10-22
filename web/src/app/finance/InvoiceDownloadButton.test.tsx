@@ -143,18 +143,47 @@ function renderPage() {
 }
 
 describe("InvoiceDownloadButton", () => {
-  it("is absent on a draft invoice", async () => {
+  it("offers a draft PDF on a draft invoice", async () => {
+    let receivedVariables: Record<string, unknown> | undefined;
     server.use(
       relayEndpoint.query("InvoiceDetailPageQuery", () =>
         HttpResponse.json(invoiceResponse("DRAFT")),
       ),
+      relayEndpoint.mutation(
+        "InvoiceDownloadButtonMutation",
+        ({ variables }) => {
+          receivedVariables = variables;
+          return HttpResponse.json({
+            data: {
+              downloadInvoicePdf:
+                "https://s3.example/invoice-drafts/inv-1/Invoice-DRAFT.pdf",
+            },
+          });
+        },
+      ),
     );
+    const assign = vi.fn();
+    vi.spyOn(window, "location", "get").mockReturnValue({
+      ...window.location,
+      assign,
+    } as unknown as Location);
     renderPage();
 
     await screen.findByText("Draft invoice");
     expect(
       screen.queryByRole("button", { name: "Download PDF" }),
     ).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Download draft PDF" }));
+
+    await waitFor(() =>
+      expect(receivedVariables).toEqual({ invoiceId: "inv-1" }),
+    );
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith(
+        "https://s3.example/invoice-drafts/inv-1/Invoice-DRAFT.pdf",
+      ),
+    );
+    vi.restoreAllMocks();
   });
 
   it("sends the invoice id and navigates to the returned URL on success", async () => {

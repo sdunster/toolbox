@@ -60,8 +60,8 @@ use anyhow::{Result, anyhow};
 use owned_ttf_parser::{AsFaceRef as _, Face, OwnedFace};
 use printpdf::path::PaintMode;
 use printpdf::{
-    Color, IndirectFontRef, Mm, OffsetDateTime, PdfDocument, PdfDocumentReference,
-    PdfLayerReference, Pt, Rect, Rgb,
+    BlendMode, Color, IndirectFontRef, Mm, OffsetDateTime, PdfDocument, PdfDocumentReference,
+    PdfLayerReference, PdfPageIndex, Pt, Rect, Rgb, SeperableBlendMode, TextMatrix,
 };
 
 use crate::finance::money;
@@ -146,6 +146,13 @@ const NOTE_FONT_SIZE: f32 = 14.0;
 const PAYMENT_FONT_SIZE: f32 = 12.0;
 const PAYMENT_LINE_HEIGHT: f32 = 14.0;
 
+/// A draft's diagonal watermark (see [`draw_watermark`]).
+const WATERMARK_TEXT: &str = "DRAFT";
+const WATERMARK_FONT_SIZE: f32 = 160.0;
+/// Counter-clockwise from horizontal: bottom-left to top-right.
+const WATERMARK_ANGLE_DEG: f32 = 45.0;
+const WATERMARK_FILL: (f32, f32, f32) = (0.97, 0.72, 0.72);
+
 const HEADER_FILL: (f32, f32, f32) = (0.74, 0.75, 0.75);
 const BODY_FILL: (f32, f32, f32) = (0.86, 0.86, 0.86);
 const GRID_COLOR: (f32, f32, f32) = (0.45, 0.45, 0.45);
@@ -189,6 +196,15 @@ impl Metrics {
         } else {
             self.regular.as_face_ref()
         }
+    }
+
+    /// The height, in pt, of a capital letter at `size`pt (the font's own
+    /// figure, else a typical 0.7 em).
+    fn cap_height(&self, size: f32, bold: bool) -> f32 {
+        let face = self.face(bold);
+        face.capital_height()
+            .map(|h| f32::from(h) / f32::from(face.units_per_em()) * size)
+            .unwrap_or(size * 0.7)
     }
 
     /// The width, in pt, `text` would occupy at `size`pt. A character
@@ -405,12 +421,51 @@ struct Fonts {
 struct Ctx<'a> {
     metrics: &'a Metrics,
     fonts: &'a Fonts,
+    /// Whether every page carries the "DRAFT" watermark.
+    draft: bool,
 }
 
 /// Start a new page, returning its layer and the y (pt) to begin drawing at.
-fn add_page(doc: &PdfDocumentReference) -> (PdfLayerReference, f32) {
+/// A draft's page gets its watermark at once — see [`draw_watermark`].
+fn add_page(doc: &PdfDocumentReference, ctx: &Ctx<'_>) -> (PdfLayerReference, f32) {
     let (page, layer) = doc.add_page(mm(PAGE_W_PT), mm(PAGE_H_PT), "Layer 1");
+    if ctx.draft {
+        draw_watermark(doc, page, ctx);
+    }
     (doc.get_page(page).get_layer(layer), CONTINUATION_TOP)
+}
+
+/// Stamp [`WATERMARK_TEXT`] diagonally across the middle of `page`, on a
+/// layer of its own. It's drawn when the page is created, but printpdf
+/// paints a page's layers in the order they were added, so this layer still
+/// lands *on top of* everything later drawn on "Layer 1" — table shading
+/// included, which would hide a watermark drawn underneath. The Multiply
+/// blend keeps whatever it covers legible (black stays black; only the
+/// white and grey around it turn pink): printpdf 0.7 has no public fill
+/// alpha, and an opaque stamp would blank out the lines it crosses.
+fn draw_watermark(doc: &PdfDocumentReference, page: PdfPageIndex, ctx: &Ctx<'_>) {
+    let layer = doc.get_page(page).add_layer("Watermark");
+    let width = ctx.metrics.width(WATERMARK_TEXT, WATERMARK_FONT_SIZE, true);
+    // The text's baseline start, chosen so the middle of its cap height sits
+    // on the page's centre once rotated by `WATERMARK_ANGLE_DEG`.
+    let (sin, cos) = WATERMARK_ANGLE_DEG.to_radians().sin_cos();
+    let half_w = width / 2.0;
+    let half_cap = ctx.metrics.cap_height(WATERMARK_FONT_SIZE, true) / 2.0;
+    let x = PAGE_W_PT / 2.0 - half_w * cos + half_cap * sin;
+    let y = PAGE_H_PT / 2.0 - half_w * sin - half_cap * cos;
+    layer.save_graphics_state();
+    layer.set_blend_mode(BlendMode::Seperable(SeperableBlendMode::Multiply));
+    layer.set_fill_color(grey(WATERMARK_FILL));
+    layer.begin_text_section();
+    layer.set_font(&ctx.fonts.bold, WATERMARK_FONT_SIZE);
+    layer.set_text_matrix(TextMatrix::TranslateRotate(
+        Pt(x),
+        Pt(y),
+        WATERMARK_ANGLE_DEG,
+    ));
+    layer.write_text(WATERMARK_TEXT, &ctx.fonts.bold);
+    layer.end_text_section();
+    layer.restore_graphics_state();
 }
 
 /// Draw the table's header row (column labels on a grey background, in the
@@ -719,7 +774,7 @@ fn draw_header_block(
     let mut y = COLUMNS_TOP;
     for i in 0..row_count {
         if y - COLUMN_LINE_HEIGHT < BOTTOM_MARGIN {
-            let (new_layer, new_y) = add_page(doc);
+            let (new_layer, new_y) = add_page(doc, ctx);
             *layer = new_layer;
             y = new_y;
         }
@@ -776,7 +831,7 @@ fn draw_totals(
     let mut y = y;
     let mut draw_row = |layer: &mut PdfLayerReference, bold: bool, label: &str, cents: i64| {
         if y - TOTALS_ROW_HEIGHT < BOTTOM_MARGIN {
-            let (new_layer, new_y) = add_page(doc);
+            let (new_layer, new_y) = add_page(doc, ctx);
             *layer = new_layer;
             y = draw_table_header(layer, ctx, &snap.currency, new_y);
         }
@@ -850,7 +905,7 @@ fn draw_notes_and_payment(
     if !snap.gst_registered {
         y -= 8.0;
         if y - COLUMN_LINE_HEIGHT < BOTTOM_MARGIN {
-            let (new_layer, new_y) = add_page(doc);
+            let (new_layer, new_y) = add_page(doc, ctx);
             *layer = new_layer;
             y = new_y;
         }
@@ -870,7 +925,7 @@ fn draw_notes_and_payment(
         y -= 12.0;
         for line in wrap_text_lines(ctx.metrics, block, PAYMENT_CONTENT_WIDTH, PAYMENT_FONT_SIZE) {
             if y - PAYMENT_LINE_HEIGHT < BOTTOM_MARGIN {
-                let (new_layer, new_y) = add_page(doc);
+                let (new_layer, new_y) = add_page(doc, ctx);
                 *layer = new_layer;
                 y = new_y;
             }
@@ -889,12 +944,28 @@ fn draw_notes_and_payment(
     y
 }
 
-/// Render an invoice's PDF from its frozen (or draft-preview) snapshot. No
-/// I/O: everything needed to draw the document is already in `snapshot`.
+/// Render an invoice's PDF from its frozen snapshot. No I/O: everything
+/// needed to draw the document is already in `snapshot`.
 pub fn render_invoice_pdf(snapshot: &InvoiceSnapshot) -> Result<Vec<u8>> {
+    render(snapshot, false)
+}
+
+/// Render a draft invoice's live snapshot, with "DRAFT" stamped diagonally
+/// across every page so it can't pass for an issued invoice if it's
+/// forwarded to a client. Same layout as [`render_invoice_pdf`] otherwise.
+pub fn render_draft_invoice_pdf(snapshot: &InvoiceSnapshot) -> Result<Vec<u8>> {
+    render(snapshot, true)
+}
+
+fn render(snapshot: &InvoiceSnapshot, draft: bool) -> Result<Vec<u8>> {
     let metrics = Metrics::new()?;
+    let doc_title = if draft {
+        format!("DRAFT {}", snapshot.title)
+    } else {
+        snapshot.title.clone()
+    };
     let (doc, page1, layer1) =
-        PdfDocument::new(&snapshot.title, mm(PAGE_W_PT), mm(PAGE_H_PT), "Layer 1");
+        PdfDocument::new(&doc_title, mm(PAGE_W_PT), mm(PAGE_H_PT), "Layer 1");
     // Fix the timestamps printpdf would otherwise default to `now()` (the
     // one part of this module's "current time" nondeterminism it *can*
     // eliminate — see this module's doc comment for what it can't) to the
@@ -918,12 +989,16 @@ pub fn render_invoice_pdf(snapshot: &InvoiceSnapshot) -> Result<Vec<u8>> {
     let ctx = Ctx {
         metrics: &metrics,
         fonts: &fonts,
+        draft,
     };
+    if draft {
+        draw_watermark(&doc, page1, &ctx);
+    }
 
     let mut layer = doc.get_page(page1).get_layer(layer1);
     let mut y = draw_header_block(&doc, &mut layer, &ctx, snapshot);
     if y - HEADER_ROW_HEIGHT < BOTTOM_MARGIN {
-        let (new_layer, new_y) = add_page(&doc);
+        let (new_layer, new_y) = add_page(&doc, &ctx);
         layer = new_layer;
         y = new_y;
     }
@@ -943,7 +1018,7 @@ pub fn render_invoice_pdf(snapshot: &InvoiceSnapshot) -> Result<Vec<u8>> {
         );
         let needed = row_height(desc_lines.len());
         if y - needed < BOTTOM_MARGIN {
-            let (new_layer, new_y) = add_page(&doc);
+            let (new_layer, new_y) = add_page(&doc, &ctx);
             layer = new_layer;
             y = draw_table_header(&layer, &ctx, &snapshot.currency, new_y);
         }
@@ -1465,5 +1540,24 @@ mod tests {
         snap.notes = Some("Thanks for your business.\nQuote PO 1234 when paying.".into());
         let bytes = render_invoice_pdf(&snap).expect("renders");
         assert!(bytes.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn a_draft_carries_the_watermark_on_every_page_and_a_final_render_none() {
+        let lines = (0..60)
+            .map(|i| line(&format!("Line {i}"), 100, 1_000))
+            .collect();
+        let mut snap = base_snapshot(true, lines);
+        snap.display_number = None;
+        snap.issue_date = None;
+        let draft = render_draft_invoice_pdf(&snap).expect("draft renders");
+        assert!(draft.starts_with(b"%PDF"));
+        // See `a_long_invoice_spans_multiple_pages` for the page marker.
+        let pages = count_occurrences(&draft, b"/Type/Page/");
+        assert!(pages >= 2, "expected >=2 pages, counted {pages}");
+        assert_eq!(count_occurrences(&draft, b"(Watermark)"), pages);
+
+        let final_render = render_invoice_pdf(&snap).expect("renders");
+        assert_eq!(count_occurrences(&final_render, b"(Watermark)"), 0);
     }
 }

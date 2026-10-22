@@ -771,8 +771,10 @@ pub fn catalogue() -> Vec<Value> {
         json!({
             "name": "get_invoice_pdf_url",
             "title": "Get invoice PDF link",
-            "description": "Get a time-limited download link for a FINALIZED invoice's PDF, \
-                rendered from exactly what was frozen at finalization. Refused on a draft. \
+            "description": "Get a time-limited download link for an invoice's PDF. A finalized \
+                invoice's is rendered from exactly what was frozen at finalization; a draft's \
+                shows its current content with DRAFT stamped across every page, for review \
+                only — it is not an invoice to send. \
                 The link is a presigned URL: hand it to the user, don't try to fetch it.",
             "inputSchema": {
                 "type": "object",
