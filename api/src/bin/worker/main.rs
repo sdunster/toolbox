@@ -12,9 +12,13 @@
 //! Wiring for inbound mail, per the build plan:
 //! ```text
 //! MX → SES receipt rule set
-//!       ├─ S3 action  → s3://{mail bucket}/inbound/{ses_message_id}
-//!       └─ SNS action → SNS topic → worker SQS queue (+ DLQ, 3 retries) → this Lambda
+//!       └─ S3 action → s3://{mail bucket}/inbound/{ses_message_id}
+//!            └─ its notification → SNS topic → worker SQS queue (+ DLQ, 3 retries) → this Lambda
 //! ```
+//!
+//! The notification is the S3 action's own (`topic_arn`), not a separate SNS
+//! action: an SNS action carries the message content and so bounces any mail
+//! over 150 KB (see `infra/ses.tf`).
 //!
 //! An SQS record whose body is a job (a JSON object with a `job` field —
 //! [`toolbox::queue::Job::parse`]) is run as one. Anything else is inbound
@@ -272,6 +276,52 @@ mod tests {
         assert_eq!(Job::parse(&envelope).unwrap(), None);
         let parsed: SnsEnvelope = serde_json::from_str(&envelope).unwrap();
         assert!(parsed.message.contains("abc"));
+    }
+
+    /// The receipt notification an S3 action publishes (AWS's "notification
+    /// for S3 action" example, trimmed): no `content`, `receipt.action` of
+    /// type `S3`. `handle_inbound_mail` needs only `mail.messageId` from it.
+    #[test]
+    fn an_s3_action_notification_yields_the_message_id() {
+        let ses = serde_json::json!({
+            "notificationType": "Received",
+            "receipt": {
+                "timestamp": "2015-09-11T20:32:33.936Z",
+                "processingTimeMillis": 222,
+                "recipients": ["support@example.com"],
+                "spamVerdict": {"status": "PASS"},
+                "virusVerdict": {"status": "PASS"},
+                "spfVerdict": {"status": "PASS"},
+                "dkimVerdict": {"status": "PASS"},
+                "dmarcVerdict": {"status": "PASS"},
+                "action": {
+                    "type": "S3",
+                    "topicArn": "arn:aws:sns:ap-southeast-2:123456789012:toolbox-inbound",
+                    "bucketName": "toolbox-mail",
+                    "objectKey": "inbound/o3vrnil0e2ic28trm7dfhrc2v0clambda4nbp0g1"
+                }
+            },
+            "mail": {
+                "timestamp": "2015-09-11T20:32:33.936Z",
+                "source": "customer@example.com",
+                "messageId": "o3vrnil0e2ic28trm7dfhrc2v0clambda4nbp0g1",
+                "destination": ["support@example.com"],
+                "headersTruncated": false,
+                "headers": [{"name": "Subject", "value": "Re: [#acme-1] Help"}],
+                "commonHeaders": {
+                    "from": ["customer@example.com"],
+                    "to": ["support@example.com"],
+                    "messageId": "<abc@example.com>",
+                    "subject": "Re: [#acme-1] Help"
+                }
+            }
+        })
+        .to_string();
+        let parsed: SimpleEmailService = serde_json::from_str(&ses).unwrap();
+        assert_eq!(
+            parsed.mail.message_id.as_deref(),
+            Some("o3vrnil0e2ic28trm7dfhrc2v0clambda4nbp0g1")
+        );
     }
 
     #[test]

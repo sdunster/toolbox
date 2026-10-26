@@ -96,6 +96,15 @@ resource "aws_ses_active_receipt_rule_set" "main" {
 # the "*@domain" wildcard inbound_address kind work; routing.rs resolves the
 # actual address -> instance mapping downstream, this rule just accepts
 # everything and hands it to S3 + SNS.
+#
+# The SNS topic is the S3 action's own notification (`topic_arn`), not a
+# separate `sns_action`: an SNS action embeds the whole message in the
+# notification, so SES bounces anything over 150 KB with "552 5.3.4 Message
+# length exceeds limit set by recipient" — which a reply quoting an HTML
+# thread or carrying a screenshot easily is. The worker only reads
+# `mail.messageId` from the notification and fetches the raw MIME from S3, so
+# it never needed the content; and the S3 action publishes only after the
+# object is written, so the worker can't race it.
 resource "aws_ses_receipt_rule" "inbound" {
   name          = "inbound"
   rule_set_name = aws_ses_receipt_rule_set.main.rule_set_name
@@ -107,11 +116,7 @@ resource "aws_ses_receipt_rule" "inbound" {
     position          = 1
     bucket_name       = aws_s3_bucket.mail.id
     object_key_prefix = "inbound/"
-  }
-
-  sns_action {
-    position  = 2
-    topic_arn = aws_sns_topic.inbound_mail.arn
+    topic_arn         = aws_sns_topic.inbound_mail.arn
   }
 
   # SES must be able to write to the bucket before this rule can reference
